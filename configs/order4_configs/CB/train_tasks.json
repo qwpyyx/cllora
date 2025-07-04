@@ -1,0 +1,15 @@
+{
+    "SC": [],
+    "TC": [],
+    "NLI": [
+        {
+            "sampling strategy": "full",
+            "dataset name": "CB"
+        }
+    ],
+    "QQP": [],
+    "WiC": [],
+    "MultiRC": [],
+    "COPA": [],
+    "BoolQA": []
+}
