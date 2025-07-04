@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="qiuwenqi@172.31.233.163:22 key (2)" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="qiuwenqi@172.31.233.163:22 key">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/cl_lora" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.163:22 key (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/cllora" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
