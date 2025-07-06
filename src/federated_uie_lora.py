@@ -258,6 +258,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
 
+    client_rng = random.Random(training_args.seed)
+
     def compute_rouge_metrics(dataset, preds, save_prefix=None):
         # 对生成式模型的输出进行后处理
         decoded_preds = skip_instructions(model, preds, tokenizer)
@@ -320,7 +322,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     for rnd in range(fed_args.global_rounds):
         logger.info(f"Global round {rnd + 1}/{fed_args.global_rounds}")
-        selected = random.sample(range(fed_args.num_clients), min(fed_args.clients_per_round, fed_args.num_clients))
+        selected = client_rng.sample(range(fed_args.num_clients), min(fed_args.clients_per_round, fed_args.num_clients))
 
         # 获取要聚合的 lora 参数名
         lora_keys = get_lora_trainable_keys(global_model)
