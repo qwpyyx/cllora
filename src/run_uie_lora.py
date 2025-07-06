@@ -272,6 +272,11 @@ class FederatedArguments:
         default=1,
         metadata={"help": "Dirichlet alpha controlling data heterogeneity."},
     )
+    # 新增：联邦采样专用的随机种子
+    federated_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Seed for client sampling in federated rounds (independent of training_args.seed)."}
+    )
 
 
 def main():

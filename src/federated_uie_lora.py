@@ -250,7 +250,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
 
-    client_rng = random.Random(training_args.seed)
+    client_rng = random.Random(fed_args.federated_seed)
 
     def compute_rouge_metrics(dataset, preds, save_prefix=None):
         # 对生成式模型的输出进行后处理
