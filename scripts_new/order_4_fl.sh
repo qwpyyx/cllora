@@ -11,7 +11,7 @@ lamda_1=0
  # Order 4
 # bash scripts/long.sh> logs_and_outputs/long/logs/train_and_infer.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -44,12 +44,13 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 42
 
 # evaluation_strategy-No mean No evaluation is done during training.
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -82,11 +83,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 43
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -119,11 +121,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 44
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -156,11 +159,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 45
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -193,11 +197,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 46
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -230,11 +235,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 47
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -267,11 +273,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 48
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -304,11 +311,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 49
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -341,11 +349,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 50
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -378,11 +387,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 51
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -415,11 +425,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 52
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -452,11 +463,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 53
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -489,11 +501,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 54
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -526,11 +539,12 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 55
 
 sleep 20
 
-CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
@@ -563,4 +577,5 @@ CUDA_VISIBLE_DEVICES=1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --save_strategy no \
    --save_steps 1500 \
    --lamda_1 $lamda_1 \
-   --lamda_2 $lamda_2
+   --lamda_2 $lamda_2 \
+   --federated_seed 56
