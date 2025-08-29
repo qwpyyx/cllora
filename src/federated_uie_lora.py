@@ -12,6 +12,7 @@ import json
 import datasets
 import numpy as np
 import torch
+import math
 from datasets import load_dataset, concatenate_datasets
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -26,10 +27,14 @@ from peft import get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
 from uie_dataset_lora import gen_cache_path
 #from plot.data_distribution import compare
 from run_uie_lora import ModelArguments, DataTrainingArguments, UIETrainingArguments, FederatedArguments
+from torch.utils.data import DataLoader
+from continual_fisher_client import ContinualFisherClient, ClientState
+
 
 logger = logging.getLogger(__name__)
 CURRENT_DIR = os.path.dirname(__file__)
 
+PACKET_BYTES = 1500
 
 def partition_dataset(dataset, num_clients: int, alpha: float):
     label_key = "Dataset"
@@ -303,72 +308,66 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # -----Begin Training------
     training_args.remove_unused_columns = False
-    base_args = copy.deepcopy(training_args)
-    base_args.do_train = True
-    base_args.do_eval = False
-    base_args.do_predict = False
 
     global_model = model
 
     device = next(global_model.parameters()).device
+    client_states = [ClientState() for _ in range(fed_args.num_clients)]
 
     for rnd in range(fed_args.global_rounds):
         logger.info(f"Global round {rnd + 1}/{fed_args.global_rounds}")
-        selected = client_rng.sample(range(fed_args.num_clients), min(fed_args.clients_per_round, fed_args.num_clients))
 
-        # 获取要聚合的 lora 参数名
+        selected = client_rng.sample(
+            range(fed_args.num_clients),
+            min(fed_args.clients_per_round, fed_args.num_clients),
+        )
+
         lora_keys = get_lora_trainable_keys(global_model)
+        layer_costs = {k: 1 for k in lora_keys} #这里应该是上传lora层的消耗
 
-        global_state_cpu = {
-            k: v.detach().cpu()
-            for k, v in global_model.state_dict().items()
-        }
-
-        # 初始化 LoRA 聚合容器
-        aggregated = {
-            k: torch.zeros_like(global_state_cpu[k])
-            for k in lora_keys
-        }
-
-        total = 0
-
+        updates = []
         for cid in selected:
             local_model = copy.deepcopy(global_model)
-            local_args = copy.deepcopy(base_args)
-            # local_args.output_dir = os.path.join(training_args.output_dir, f"client_{cid}")  # 或者一个临时目录
-            local_args.resume_from_checkpoint = None
-            local_args.num_train_epochs = fed_args.local_epochs
-            local_args.save_strategy = "no"
-            local_args.logging_strategy = "no"
-            local_args.evaluation_strategy = "no"
 
-            trainer = UIETrainer(
-                model=local_model,
-                args=local_args,
-                train_dataset=client_datasets[cid],
-                tokenizer=tokenizer,
-                data_collator=collator_for(local_model),
-                compute_metrics=None,
-                callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
+            loader = DataLoader(
+                client_datasets[cid],
+                batch_size=training_args.per_device_train_batch_size,
+                shuffle=True,
+                collate_fn=collator_for(local_model),
             )
-            trainer.train()
+            cf_client = ContinualFisherClient(
+                local_model,
+                state=client_states[cid],
+                lr=training_args.learning_rate,
+                alpha=fed_args.fisher_alpha,
+                radius=fed_args.fisher_radius,
+                beta=fed_args.fisher_beta,
+                sigma=fed_args.fisher_sigma,
+                tau=fed_args.fisher_tau,
+                lam=fed_args.fisher_lambda,
+                comm_budget=fed_args.comm_budget if fed_args.comm_budget is not None else len(lora_keys),
+                layer_costs=layer_costs,
+            )
+            mu, stats = cf_client.client_update(loader, epochs=fed_args.local_epochs)
+            cf_client.accumulate_fisher({k: st["F_curr"] for k, st in stats.items()})
+            updates.append(mu)
 
-            weight = len(client_datasets[cid])
-            state_dict = local_model.state_dict()
+        if updates:
+            agg = {k: torch.zeros_like(next(iter(updates))[k]) for k in lora_keys}
+            for mu in updates:
+                for k in lora_keys:
+                    agg[k] += mu[k].detach()
+
             for k in lora_keys:
-                aggregated[k] += state_dict[k].detach().cpu() * weight
-            total += weight
+                delta = agg[k] / len(updates)
+                param = dict(global_model.named_parameters())[k]
+                param.data -= delta.to(device)
 
-        for k in lora_keys:
-            aggregated[k] /= max(total, 1)
-
-        # 更新 global model 的 LoRA 权重
-        update_dict = {
-            k: aggregated[k].to(device)
-            for k in lora_keys
-        }
-        # strict=False 会忽略掉 state_dict 里没给到的其他 key
-        global_model.load_state_dict(update_dict, strict=False)
+    # ---------- finalize task-level Fisher statistics ----------
+    final_lora_keys = get_lora_trainable_keys(global_model)
+    theta_star = {k: dict(global_model.named_parameters())[k].detach().clone() for k in final_lora_keys}
+    for state in client_states:
+        state.finalize_task(theta_star, num_rounds=fed_args.global_rounds, gamma=fed_args.fisher_gamma)
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")
@@ -387,7 +386,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             tokenizer=tokenizer,
             data_collator=collator_for(global_model),
             compute_metrics=compute_rouge_metrics,
-            callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
+            callbacks=None,
         )
         predict_results = eval_trainer.predict(
             predict_dataset,

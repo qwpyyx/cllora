@@ -277,7 +277,41 @@ class FederatedArguments:
         default=None,
         metadata={"help": "Seed for client sampling in federated rounds (independent of training_args.seed)."}
     )
-
+# ---------- Continual FL hyperparameters ----------
+    comm_budget: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Maximum upload cost per round. None means all LoRA layers are sent."
+        },
+    )
+    fisher_alpha: float = field(
+        default=0.9,
+        metadata={"help": "EMA factor for online Fisher information."},
+    )
+    fisher_radius: float = field(
+        default=1.0,
+        metadata={"help": "Trust-region radius controlling parameter deviation."},
+    )
+    fisher_beta: float = field(
+        default=1.0,
+        metadata={"help": "Beta constant for safe step size computation."},
+    )
+    fisher_sigma: float = field(
+        default=0.0,
+        metadata={"help": "Sigma constant for safe step size computation."},
+    )
+    fisher_tau: float = field(
+        default=0.0,
+        metadata={"help": "Tau constant for safe step size computation."},
+    )
+    fisher_lambda: float = field(
+        default=1.0,
+        metadata={"help": "Penalty weight for forgetting in knapsack selection."},
+    )
+    fisher_gamma: float = field(
+        default=1.0,
+        metadata={"help": "Forgetting factor when updating historical Fisher information."},
+    )
 
 def main():
     # sys.modules['mpi4py'] = None

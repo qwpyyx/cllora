@@ -2,9 +2,9 @@ import os
 import json
 import matplotlib.pyplot as plt
 
-BASE_DIR = os.path.join(os.path.dirname(__file__), '..', 'new_order_1')
+BASE_DIR = os.path.join('D:\\CodeLife\\CL\\FCL\\NewLLM\\results\\new_order_4')
 METRICS = ['predict_exact_match', 'predict_rouge1', 'predict_rougeL']
-TASK_ORDER = ['dbpedia', 'amazon', 'yahoo', 'agnews']
+TASK_ORDER = ['MNLI', 'CB', 'WiC', 'COPA','QQP','BoolQA','RTE','IMDB','yelp','amazon','SST-2','dbpedia','agnews','MultiRC','yahoo']
 
 
 def find_algorithm_dirs(base_dir):
@@ -14,7 +14,7 @@ def find_algorithm_dirs(base_dir):
         if not os.path.isdir(path):
             continue
         tasks = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)) and d[0].isdigit()]
-        if len(tasks) == 4:
+        if len(tasks) == 15:
             algs.append((name, path))
         else:
             for sub in os.listdir(path):
@@ -22,7 +22,7 @@ def find_algorithm_dirs(base_dir):
                 if not os.path.isdir(sub_path):
                     continue
                 sub_tasks = [d for d in os.listdir(sub_path) if os.path.isdir(os.path.join(sub_path, d)) and d[0].isdigit()]
-                if len(sub_tasks) == 4:
+                if len(sub_tasks) == 15:
                     algs.append((f"{name}_{sub}", sub_path))
     return algs
 
@@ -71,13 +71,13 @@ def main():
                 step_metrics[m].append(res.get(m, 0))
 
         # collect final metric values from the last task (4-agnews)
-        final_res = load_json(os.path.join(alg_path, '4-agnews', 'predict_results.json'))
+        final_res = load_json(os.path.join(alg_path, '15-yahoo', 'predict_results.json'))
         for m in METRICS:
             final_values[m][alg_name] = final_res.get(m, 0)
             per_task_values[m][alg_name] = step_metrics[m]
 
     # plot results for each metric
-    plots_dir = os.path.join(os.path.dirname(__file__), 'test1')
+    plots_dir = os.path.join(os.path.dirname(__file__), 'order_4')
     os.makedirs(plots_dir, exist_ok=True)
     x = range(1, len(TASK_ORDER) + 1)
     for m in METRICS:
