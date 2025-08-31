@@ -230,6 +230,8 @@ class DataTrainingArguments:
         default=False,
         metadata={"help": "whether to preappend dataset name before the task input."}
     )
+    task: int = field(default=1, metadata={
+        "help": "Current task index starting from 1; first task runs without continual constraints."})
 
 @dataclass
 class UIETrainingArguments(Seq2SeqTrainingArguments):
@@ -261,11 +263,11 @@ class FederatedArguments:
         metadata={"help": "Number of clients sampled in each round."},
     )
     global_rounds: int = field(
-        default=3,
+        default=1,
         metadata={"help": "Total number of global federated rounds."},
     )
     local_epochs: int = field(
-        default=3,
+        default=1,
         metadata={"help": "Local training epochs for each selected client."},
     )
     dirichlet_alpha: float = field(
@@ -279,7 +281,7 @@ class FederatedArguments:
     )
 # ---------- Continual FL hyperparameters ----------
     comm_budget: Optional[int] = field(
-        default=None,
+        default=1440,
         metadata={
             "help": "Maximum upload cost per round. None means all LoRA layers are sent."
         },
