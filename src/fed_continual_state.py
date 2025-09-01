@@ -9,6 +9,7 @@ class ContinualState:
     """State object to store Fisher information and optimal parameters for past tasks."""
     bar_F: Dict[str, torch.Tensor] = field(default_factory=dict)
     bar_B: Dict[str, torch.Tensor] = field(default_factory=dict)
+    gamma: float = 1.0
 
     def save(self, path: str) -> None:
         torch.save({'bar_F': self.bar_F, 'bar_B': self.bar_B}, path)

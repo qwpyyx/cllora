@@ -426,13 +426,18 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
                 )
                 trainer.train(task_id=data_args.task)
+
+                deepspeed_engine = trainer.deepspeed if trainer.deepspeed is not None else None
+
                 state_dict = local_model.state_dict()
                 delta = {
                     k: global_state_cpu[k] - state_dict[k].detach().cpu()
                     for k in lora_keys
                 }
                 F_full = compute_fisher(
-                    local_model, trainer.get_train_dataloader()
+                    local_model,
+                    trainer.get_train_dataloader(),
+                    engine=deepspeed_engine  # 关键：传入DeepSpeed引擎
                 )
                 F_client = {
                     k: F_full.get(k, torch.zeros_like(global_state_cpu[k]))
@@ -452,7 +457,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     comm_budget=fed_args.comm_budget,
                     layer_costs=layer_costs,
                 )
-                # TODO 这里要考虑第一次被选中的节点，她没办法返回两个值
                 delta, F_client = trainer.train(
                     task_id=data_args.task,
                     base_params={k: global_state_cpu[k] for k in lora_keys},

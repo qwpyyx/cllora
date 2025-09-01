@@ -8,7 +8,8 @@ from transformers.trainer_callback import TrainerCallback
 from fed_continual_state import ContinualState
 from uie_collator import SUPPORTED_DECODER_MODELS, check_model
 from uie_dataset_lora import ANSWER_PREFIX
-
+from collections import deque
+from tqdm.auto import tqdm
 
 def _knapsack(values: List[float], costs: List[int], budget: int) -> List[bool]:
     """0/1 knapsack dynamic programming."""
@@ -121,6 +122,35 @@ class UIETrainer(Seq2SeqTrainer):
         self.alpha = alpha
         self.comm_budget = comm_budget
         self.layer_costs = layer_costs or {}
+        self.deepspeed = None  # 明确禁用 DS 句柄，避免 Base 类分支误判
+        self.deepspeed_engine = None
+        self.lambda_conf = 1.0  # 可选：背包里的 λ
+
+    def _init_deepspeed(self):
+        """初始化DeepSpeed引擎（修复属性名+配置格式转换）"""
+        if self.args.deepspeed and not self.deepspeed:  # 先判断是否启用DeepSpeed
+            from deepspeed import initialize
+
+            # 1. 获取模型可训练参数
+            model_parameters = [p for p in self.model.parameters() if p.requires_grad]
+
+            # 2. 修复属性名：用 hf_deepspeed_config 替代 deepspeed_config，且转为字典
+            deepspeed_config = self.args.hf_deepspeed_config.to_dict() if self.args.hf_deepspeed_config else None
+
+            # 3. 初始化DeepSpeed引擎
+            self.deepspeed_engine, optimizer, _, _ = initialize(
+                model=self.model,
+                model_parameters=model_parameters,
+                config_params=deepspeed_config,  # 传入转换后的字典配置
+                dist_init_required=False  # 联邦学习中已提前初始化分布式（若未初始化则设为True）
+            )
+
+            # 4. 对齐Trainer的优化器和DeepSpeed属性
+            self.optimizer = optimizer
+            self.deepspeed = self.deepspeed_engine  # 让Trainer识别已启用DeepSpeed
+
+
+
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
@@ -214,33 +244,36 @@ class UIETrainer(Seq2SeqTrainer):
 
         state_has_history = self.continual_state.has_valid_history() if self.continual_state is not None else False
 
-        if task_id == 1 or self.continual_state is None or base_params is None or (
+        # 任务1逻辑：仅调用父类训练，不计算delta和F_client（由federated_uie_lora.py处理）
+        if task_id == 1:
+            return super().train(**kwargs)
+
+        if task_id > 1 and self.args.deepspeed:
+            self._init_deepspeed()  # 初始化DeepSpeed引擎
+
+        # 后续任务逻辑（保持不变）
+        if self.continual_state is None or base_params is None or (
                 self.continual_state is not None and not state_has_history):
             super().train(**kwargs)
 
-            # 补充计算 delta 和 F_client（与第一个任务逻辑对齐）
-            # 1. 计算 delta：本地模型与 base_params 的差异
+            # 补充计算delta和F_client（仅用于后续任务中首次被选中的节点）
             state_dict = self.model.state_dict()
             delta = {
                 k: base_params[k] - state_dict[k].detach().cpu()
-                for k in base_params  # base_params 是 LoRA 可训练参数的键
+                for k in base_params
             }
 
-            # 2. 计算 F_client（Fisher 信息，复用已有的 compute_fisher 函数）
-            from federated_uie_lora import compute_fisher  # 确保能导入该函数
-            F_client = compute_fisher(
-                self.model, self.get_train_dataloader()
-            )
-            # 只保留 base_params 中的键对应的 Fisher 信息
+            from federated_uie_lora import compute_fisher
+            F_client = compute_fisher(self.model, self.get_train_dataloader())
             F_client = {k: F_client.get(k, torch.zeros_like(base_params[k])) for k in base_params}
 
-            return delta, F_client  # 确保返回两个值
+            return delta, F_client
 
         model = self.model
         dataloader = self.get_train_dataloader()
-        self.create_optimizer_and_scheduler(
-            num_training_steps=len(dataloader) * int(self.args.num_train_epochs)
-        )
+        # self.create_optimizer_and_scheduler(
+        #     num_training_steps=len(dataloader) * int(self.args.num_train_epochs)
+        # )
         device = next(model.parameters()).device
         model.train()
 
@@ -253,11 +286,15 @@ class UIETrainer(Seq2SeqTrainer):
 
         bar_F = {k: v.to(device) for k, v in self.continual_state.bar_F.items()}  # 转移到 device（如 cuda:0）
         bar_B = {k: v.to(device) for k, v in self.continual_state.bar_B.items()}
-        bar_theta = {
-            k: (bar_B[k] / bar_F[k]) if k in bar_F else torch.zeros_like(p, device=device)
-            for k, p in model.named_parameters()
-            if p.requires_grad
-        }
+        bar_theta = {}
+        for k, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if k in bar_F and k in bar_B:
+                bar_theta[k] = bar_B[k] / (bar_F[k] + 1e-8)
+            else:
+                bar_theta[k] = torch.zeros_like(p, device=device)
+
         r2 = {}
         r2_start = {}
         B_round = {}
@@ -271,89 +308,140 @@ class UIETrainer(Seq2SeqTrainer):
             B_round[name] = torch.tensor(0.0, device=device)
             conf[name] = 0
 
+        # ====== 进度条与平滑指标设置（新增）======
+        num_epochs = int(self.args.num_train_epochs)
+        steps_per_epoch = len(dataloader)
+        tqdm_total = num_epochs * steps_per_epoch  # 仅用于显示
+        show_bar = getattr(self, "is_world_process_zero", lambda: True)()
+
+        pbar = tqdm(
+            total=tqdm_total,
+            disable=not show_bar,
+            dynamic_ncols=True,
+            leave=True,
+            desc=f"Task {task_id} | training",
+        )
+
+        ema_loss = None
+        ema_beta = 0.98
+        window = deque(maxlen=50)
+        log_every = max(1, int(getattr(self.args, "logging_steps", 10)))
+        actual_steps = 0  # 真实已处理的 mini-batch 数（用于 p_round 分母）
+
         for epoch in range(int(self.args.num_train_epochs)):
             for step, batch in enumerate(dataloader):
+                actual_steps += 1
                 batch = {
                     k: v.to(device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()
                 }
-                if self.deepspeed:
-                    self.deepspeed.zero_grad()
-                else:
-                    self.optimizer.zero_grad()
-                outputs = model(**batch)
-                loss = (
-                    outputs[0]
-                    if isinstance(outputs, (list, tuple))
-                    else outputs["loss"]
-                )
-                if self.deepspeed:
-                    self.deepspeed.backward(loss)
-                else:
-                    loss.backward()
-                for name, p in model.named_parameters():
-                    if not p.requires_grad or p.grad is None:
-                        continue
-                    g = p.grad
-                    F_batch = g * g
-                    F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
 
-                    # Natural-gradient style preconditioning
-                    v = g / (F_curr[name] + 1e-8)
-                    # if name in bar_F:
-                    #     # Normalise in the metric induced by bar_F to prevent
-                    #     # very large steps that would explode ``a``.
-                    #     v_norm = torch.sqrt((v * bar_F[name] * v).sum())
-                    # else:
-                    #     v_norm = v.norm()
-                    # if torch.isfinite(v_norm) and v_norm > 0:
-                    #     v = v / v_norm
+                # 清梯度
+                model.zero_grad(set_to_none=True)
 
-                    a = (
-                        (v * bar_F[name] * v).sum()
-                        if name in bar_F
-                        else torch.tensor(0.0, device=device)
-                    )
-                    diff = p - bar_theta.get(name, 0)
-                    b_val = (
-                        (v * bar_F[name] * diff).sum()
-                        if name in bar_F
-                        else torch.tensor(0.0, device=device)
-                    )
-                    delta = self.radius ** 2 - r2[name]
-                    if b_val.item() < 0:
-                        eta = b_val - self.sigma
-                        disc = (b_val - self.sigma) ** 2 + self.beta * a * (delta - self.tau)
-                        disc = torch.clamp(disc, min=0)
-                        eta = (eta + torch.sqrt(disc)) / (self.beta * a + 1e-8)
-                        eta = min(eta.item(), self.args.learning_rate)
-                        conf[name] += 1
-                    else:
-                        eta = self.args.learning_rate
-                    Q = (g * g / (F_curr[name] + 1e-8)).sum()
-                    B_round[name] = B_round[name] + max(0, (eta - 0.5 * eta ** 2) * Q)
-                    r2[name] = r2[name] - 2 * eta * b_val + (eta ** 2) * a
-                    p.data = p.data - eta * v
-                if self.deepspeed:
-                    self.deepspeed.step()
-                else:
-                    self.optimizer.step()
+                with self.compute_loss_context_manager():
+                    outputs = model(**batch)
+                    loss = outputs[0] if isinstance(outputs, (list, tuple)) else outputs["loss"]
 
-        F_round = {n: torch.clamp(0.5 * (r2[n] - r2_start[n]), min=0) for n in r2}
-        p_round = {n: conf[n] / max(len(dataloader), 1) for n in conf}
+                if self.args.gradient_accumulation_steps > 1:
+                    loss = loss / self.args.gradient_accumulation_steps
+
+                # 反向传播
+                loss.backward()
+
+                with torch.no_grad():
+                    for name, p in model.named_parameters():
+                        if not p.requires_grad or p.grad is None:
+                            continue
+                        g = p.grad
+                        F_batch = g * g
+                        F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
+
+                        # Natural-gradient style preconditioning
+                        v = g / (F_curr[name] + 1e-8)
+
+                        a = (v * bar_F[name] * v).sum() if name in bar_F else torch.tensor(0.0, device=device)
+                        diff = p - bar_theta[name]
+                        b_val = (v * bar_F[name] * diff).sum() if name in bar_F else torch.tensor(0.0, device=device)
+                        Delta = (self.radius ** 2) - r2[name]
+
+                        if b_val.item() < 0.0:
+                            term = (b_val - self.sigma)
+                            disc = term * term + self.beta * a * (Delta - self.tau)
+                            disc = torch.clamp(disc, min=0.0)
+                            eta = (term + torch.sqrt(disc)) / (self.beta * a + 1e-8)
+                            eta = torch.clamp(eta, max=self.args.learning_rate)
+                            conf[name] += 1  # ←← 新增：冲突计数
+                        else:
+                            eta = torch.as_tensor(self.args.learning_rate, device=device)
+
+                        # 新任务收益（二阶）
+                        Q = torch.sum((g * g) / (F_curr[name] + 1e-8))
+                        gain = (eta - 0.5 * eta * eta) * Q
+                        gain = torch.clamp(gain, min=0.0)
+                        B_round[name] = B_round[name] + gain
+
+                        # 半径更新：r^2 = r^2 - 2η b + η^2 a
+                        r2[name] = r2[name] - 2.0 * eta * b_val + (eta * eta) * a
+
+                        # 参数更新
+                        p.add_(-eta * v)
+
+                if show_bar:
+                    # 显示“未缩放”的loss更直观：若用了梯度累积，把显示值乘回去
+                    display_loss = loss.detach()
+                    if self.args.gradient_accumulation_steps > 1:
+                        display_loss = display_loss * self.args.gradient_accumulation_steps
+                    loss_val = float(display_loss)
+
+                    # EMA + 滑窗
+                    ema_loss = loss_val if ema_loss is None else (ema_beta * ema_loss + (1 - ema_beta) * loss_val)
+                    window.append(loss_val)
+                    mean_last = sum(window) / len(window)
+
+                    # 控制刷新频率
+                    if (actual_steps % log_every) == 0 or actual_steps == 1:
+                        pbar.set_postfix_str(
+                            f"epoch={epoch + 1}/{num_epochs}  loss={loss_val:.4f}  ema={ema_loss:.4f}  last{len(window)}={mean_last:.4f}"
+                        )
+                    pbar.update(1)
+
+            # # （可选）回传到 HF 的日志/回调体系，便于 TensorBoard
+            # if (actual_steps % log_every) == 0 or actual_steps == 1:
+            #     try:
+            #         fractional_epoch = epoch + (step + 1) / max(1, steps_per_epoch)
+            #         self.log({"loss": float(loss.detach() * (self.args.gradient_accumulation_steps if self.args.gradient_accumulation_steps > 1 else 1)),
+            #                   "ema_loss": float(ema_loss) if ema_loss is not None else None,
+            #                   "epoch": fractional_epoch})
+            #         if hasattr(self, "callback_handler"):
+            #             self.control = self.callback_handler.on_log(self.args, self.state, getattr(self, "control", None))
+            #         if hasattr(self, "state"):
+            #             # 给 HF 的 global_step 也累计一下（可选）
+            #             self.state.global_step = (self.state.global_step or 0) + 1
+            #     except Exception:
+            #         pass
+
+        # 训练循环结束后
+        if show_bar:
+            pbar.close()
+
+        # ====== 轮末统计 ======
+        F_round = {n: 0.5 * torch.clamp(r2[n] - r2_start[n], min=0.0) for n in r2}
+        p_round = {n: conf[n] / max(actual_steps, 1) for n in conf}  # ←← 用真实步数
         values, costs, names = [], [], []
         for name in B_round:
-            values.append((B_round[name] - p_round[name] * F_round[name]).item())
-            costs.append(self.layer_costs.get(name, 1))
+            val = (B_round[name] - self.lambda_conf * p_round[name] * F_round[name]).item()
+            values.append(val)
+            costs.append(int(self.layer_costs.get(name, 1)))
             names.append(name)
         selected = _knapsack(values, costs, self.comm_budget)
+
+        # 增量
         delta = {}
         state_dict = model.state_dict()
         for name, sel in zip(names, selected):
             local_param = state_dict[name].detach().cpu()
-            delta[name] = (
-                base_params[name] - local_param if sel else torch.zeros_like(local_param)
-            )
+            delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
         return delta, {k: v.detach().cpu() for k, v in F_curr.items()}
 
     #TODO 测试有问题，没结果，是否是训练参数也没更新
