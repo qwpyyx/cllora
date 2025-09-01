@@ -31,3 +31,7 @@ class ContinualState:
             state.bar_B = data.get('bar_B', {})
             return state
         return cls()
+
+    def has_valid_history(self):
+        """判断是否包含有效的历史信息（如 Fisher 矩阵）"""
+        return hasattr(self, 'bar_F') and self.bar_F is not None and len(self.bar_F) > 0

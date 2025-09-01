@@ -20,7 +20,7 @@ import transformers
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 from uie_collator import DataCollatorForUIE
-from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
+from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions, compute_fisher
 from compute_metrics import compute_metrics, compute_grouped_metrics
 from model.llama import LlamaForCausalLM_with_lossmask
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
@@ -29,7 +29,6 @@ from uie_dataset_lora import gen_cache_path
 from run_uie_lora import ModelArguments, DataTrainingArguments, UIETrainingArguments, FederatedArguments
 from torch.utils.data import DataLoader
 from continual_fisher_client import ContinualFisherClient, ClientState
-from fed_continual_client import ContinualTrainer,compute_fisher
 from fed_continual_state import ContinualState
 
 logger = logging.getLogger("federated_training")
@@ -181,7 +180,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
-
     set_seed(training_args.seed)
 
     data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
@@ -322,6 +320,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     current_output_dir = training_args.output_dir
     # 解析当前任务序号（假设task_id已通过参数传入）
     current_task_id = data_args.task  # 例如：2
+    prev_task_dir = None
 
     # 构造上一个任务的输出目录路径
     if current_task_id > 1:
@@ -331,26 +330,13 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         # 上一个任务的序号
         prev_task_id = current_task_id - 1
         # 查找上一个任务的文件夹（匹配以f"{prev_task_id}-"开头的目录）
-        prev_task_dir = None
         for dir_name in os.listdir(parent_dir):
             if dir_name.startswith(f"{prev_task_id}-"):
                 prev_task_dir = os.path.join(parent_dir, dir_name)
                 break
-        if prev_task_dir and os.path.isdir(prev_task_dir):
-            # 上一个任务的continual_state.pt路径
-            state_path = os.path.join(prev_task_dir, "continual_state.pt")
-        else:
-            # 若未找到上一个任务的目录，使用当前目录（首次任务逻辑）
-            logger.warning(f"未找到上一个任务({prev_task_id})的目录，将初始化空状态")
-            state_path = os.path.join(current_output_dir, "continual_state.pt")
-    else:
-        # 第一个任务，直接使用当前目录
-        state_path = os.path.join(current_output_dir, "continual_state.pt")
+        if prev_task_dir and not os.path.isdir(prev_task_dir):
+            prev_task_dir = None
 
-    # 加载历史状态（上一个任务的bar_F和bar_B）
-    state = ContinualState.load(state_path)
-
-    F_rounds = []
     lora_params = {k: p for k, p in global_model.named_parameters() if "lora" in k}
 
     def get_param_bit_width(param):
@@ -380,6 +366,16 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     }
     logger.info(f"预计算的LoRA层通信成本: {layer_costs}")
 
+    # 新增：跟踪客户端被选中的次数和最后选中轮次
+    client_selection_tracker = {
+        cid: {'count': 0, 'last_round': -1}
+        for cid in range(fed_args.num_clients)
+    }
+
+    # 新增：记录当前任务中被选中的客户端
+    current_task_selected_clients = set()
+
+
     for rnd in range(fed_args.global_rounds):
         logger.info(f"Global round {rnd + 1}/{fed_args.global_rounds}")
 
@@ -391,10 +387,14 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         lora_keys = get_lora_trainable_keys(global_model)
         global_state_cpu = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
         aggregated = {k: torch.zeros_like(global_state_cpu[k]) for k in lora_keys}
-        F_accum = {k: torch.zeros_like(global_state_cpu[k]) for k in lora_keys}
         total = 0
 
         for cid in selected:
+            # 更新客户端选择跟踪
+            client_selection_tracker[cid]['count'] += 1
+            client_selection_tracker[cid]['last_round'] = rnd
+            current_task_selected_clients.add(cid)
+
             local_model = copy.deepcopy(global_model)
             local_args = copy.deepcopy(base_args)
             local_args.resume_from_checkpoint = None
@@ -403,6 +403,17 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             local_args.logging_strategy = "no"
             local_args.evaluation_strategy = "no"
 
+            client_state = ContinualState()
+            if prev_task_dir is not None:
+                prev_state_path = os.path.join(
+                    prev_task_dir, "client_states", f"client_{cid}_state.pt"
+                )
+                if os.path.exists(prev_state_path):
+                    client_state = ContinualState.load(prev_state_path)
+
+            client_state_dir = os.path.join(current_output_dir, "client_states")
+            os.makedirs(client_state_dir, exist_ok=True)
+            # TODO 考虑如何把deepspeed兼容进来
             if data_args.task == 1:
                 local_args.deepspeed = None
                 trainer = UIETrainer(
@@ -414,20 +425,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     compute_metrics=None,
                     callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
                 )
-                trainer.train()
+                trainer.train(task_id=data_args.task)
                 state_dict = local_model.state_dict()
-                delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
-
-                # # 从trainer中获取累积的Fisher信息（替代compute_fisher）
-                # F_client = trainer.get_fisher()
-                # # 确保Fisher信息包含所有必要的键
-                # # 在获取F_client后，添加设备转移
-                # F_client = {k: F_client.get(k, torch.zeros_like(global_state_cpu[k])).to(F_accum[k].device) for k in
-                #             lora_keys}
-                F_full = compute_fisher(local_model, trainer.get_train_dataloader())
-                F_client = {k: F_full.get(k, torch.zeros_like(global_state_cpu[k])) for k in lora_keys}
+                delta = {
+                    k: global_state_cpu[k] - state_dict[k].detach().cpu()
+                    for k in lora_keys
+                }
+                F_full = compute_fisher(
+                    local_model, trainer.get_train_dataloader()
+                )
+                F_client = {
+                    k: F_full.get(k, torch.zeros_like(global_state_cpu[k]))
+                    for k in lora_keys
+                }
             else:
-                trainer = ContinualTrainer(
+                local_args.deepspeed = None
+                trainer = UIETrainer(
                     model=local_model,
                     args=local_args,
                     train_dataset=client_datasets[cid],
@@ -435,26 +448,85 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     data_collator=collator_for(local_model),
                     compute_metrics=None,
                     callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-                    state=state,
+                    state=client_state,
                     comm_budget=fed_args.comm_budget,
                     layer_costs=layer_costs,
                 )
-                delta, F_client = trainer.train(base_params={k: global_state_cpu[k] for k in lora_keys})
+                # TODO 这里要考虑第一次被选中的节点，她没办法返回两个值
+                delta, F_client = trainer.train(
+                    task_id=data_args.task,
+                    base_params={k: global_state_cpu[k] for k in lora_keys},
+                )
+
+            # update per-client fisher state
+            theta_star = {
+                k: local_model.state_dict()[k].detach().cpu() for k in F_client
+            }
+            client_state.update(F_client, theta_star)
+            client_state.save(
+                os.path.join(client_state_dir, f"client_{cid}_state.pt")
+            )
 
             weight = len(client_datasets[cid])
             for k in lora_keys:
                 aggregated[k] += delta[k] * weight
-                F_accum[k] += F_client[k] * weight
             total += weight
 
         for k in lora_keys:
             mu = aggregated[k] / max(total, 1)
             global_state_cpu[k] = global_state_cpu[k] - mu
-            F_accum[k] = F_accum[k] / max(total, 1)
 
-        F_rounds.append({k: F_accum[k] for k in lora_keys})
         update_dict = {k: global_state_cpu[k].to(device) for k in lora_keys}
         global_model.load_state_dict(update_dict, strict=False)
+
+        # ========== 任务结束后处理 ==========
+        # 1. 计算每个LoRA层在当前任务中的平均Fisher信息
+        task_fisher = None
+        total_rounds = fed_args.global_rounds
+
+        if total_rounds > 0 and data_args.task > 1:
+            # 收集所有客户端最后一轮的Fisher信息
+            client_fishers = []
+            for cid in current_task_selected_clients:
+                client_state_path = os.path.join(client_state_dir, f"client_{cid}_state.pt")
+                if os.path.exists(client_state_path):
+                    client_state = ContinualState.load(client_state_path)
+                    client_fishers.append(client_state.bar_F)
+
+            # 计算任务平均Fisher
+            if client_fishers:
+                task_fisher = {}
+                for layer in client_fishers[0].keys():
+                    task_fisher[layer] = torch.mean(torch.stack([f[layer] for f in client_fishers]), dim=0)
+
+        # 2. 只保留最后一次被选中的客户端信息，删除其他客户端的状态
+        for cid in range(fed_args.num_clients):
+            client_state_path = os.path.join(client_state_dir, f"client_{cid}_state.pt")
+            # 检查是否是最后一轮被选中的客户端
+            if cid in current_task_selected_clients and client_selection_tracker[cid][
+                'last_round'] == fed_args.global_rounds - 1:
+                # 如果是第一个任务，需要初始化全局状态
+                if data_args.task == 1:
+                    if task_fisher is None:
+                        # 从客户端状态计算任务Fisher
+                        if os.path.exists(client_state_path):
+                            client_state = ContinualState.load(client_state_path)
+                            theta_star = {k: v for k, v in global_model.state_dict().items() if k in client_state.bar_F}
+                            # 对于第一个任务，直接将当前任务Fisher作为初始历史Fisher
+                            new_state = ContinualState()
+                            new_state.update(client_state.bar_F, theta_star, gamma=fed_args.fisher_gamma)
+                            new_state.save(client_state_path)
+                else:
+                    # 非第一个任务，更新历史信息
+                    if os.path.exists(client_state_path) and task_fisher is not None:
+                        client_state = ContinualState.load(client_state_path)
+                        theta_star = {k: v for k, v in global_model.state_dict().items() if k in task_fisher}
+                        client_state.update(task_fisher, theta_star, gamma=fed_args.fisher_gamma)
+                        client_state.save(client_state_path)
+            else:
+                # 删除非最后一次被选中的客户端状态
+                if os.path.exists(client_state_path):
+                    os.remove(client_state_path)
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")
@@ -473,7 +545,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             tokenizer=tokenizer,
             data_collator=collator_for(global_model),
             compute_metrics=compute_rouge_metrics,
-            callbacks=None,
+            callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
         )
         predict_results = eval_trainer.predict(
             predict_dataset,
@@ -491,12 +563,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         all_metrics.update(metrics)
         logger.info(f"Final federated evaluation metrics: {metrics}")
 
-    # ========== Update Continual State ==========
-    if data_args.task >= 1 and F_rounds:
-        F_task = {k: sum(F_r[k] for F_r in F_rounds) / max(len(F_rounds), 1) for k in F_rounds[0]}
-        theta_star = {k: global_model.state_dict()[k].detach().cpu() for k in F_task}
-        state.update(F_task, theta_star)
-        state.save(state_path)
+
 
     import torch.distributed as dist
     if dist.is_initialized():
