@@ -199,14 +199,14 @@ class DataTrainingArguments:
         },
     )
     max_eval_samples: Optional[int] = field(
-        default=None,
+        default=500,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
                     "value if set."
         },
     )
     max_predict_samples: Optional[int] = field(
-        default=None,
+        default=500,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
                     "value if set."
@@ -246,6 +246,7 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     do_demo: bool = field(default=False, metadata={"help": "Whether to run the model as a demo in the terminal."})
     lamda_1: float = field(default=0.5)
     lamda_2: float = field(default=0)
+    method: str = field(default="lora_origin", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
 
 @dataclass
 class FederatedArguments:
@@ -267,7 +268,7 @@ class FederatedArguments:
         metadata={"help": "Total number of global federated rounds."},
     )
     local_epochs: int = field(
-        default=1,
+        default=5,
         metadata={"help": "Local training epochs for each selected client."},
     )
     dirichlet_alpha: float = field(
@@ -286,34 +287,7 @@ class FederatedArguments:
             "help": "Maximum upload cost per round. None means all LoRA layers are sent."
         },
     )
-    fisher_alpha: float = field(
-        default=0.9,
-        metadata={"help": "EMA factor for online Fisher information."},
-    )
-    fisher_radius: float = field(
-        default=1.0,
-        metadata={"help": "Trust-region radius controlling parameter deviation."},
-    )
-    fisher_beta: float = field(
-        default=1.0,
-        metadata={"help": "Beta constant for safe step size computation."},
-    )
-    fisher_sigma: float = field(
-        default=0.0,
-        metadata={"help": "Sigma constant for safe step size computation."},
-    )
-    fisher_tau: float = field(
-        default=0.0,
-        metadata={"help": "Tau constant for safe step size computation."},
-    )
-    fisher_lambda: float = field(
-        default=1.0,
-        metadata={"help": "Penalty weight for forgetting in knapsack selection."},
-    )
-    fisher_gamma: float = field(
-        default=1.0,
-        metadata={"help": "Forgetting factor when updating historical Fisher information."},
-    )
+
 
 def main():
     # sys.modules['mpi4py'] = None

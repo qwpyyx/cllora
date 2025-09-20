@@ -10,6 +10,7 @@ from uie_collator import SUPPORTED_DECODER_MODELS, check_model
 from uie_dataset_lora import ANSWER_PREFIX
 from collections import deque
 from tqdm.auto import tqdm
+import torch.nn.utils as utils
 
 def _knapsack(values: List[float], costs: List[int], budget: int) -> List[bool]:
     """0/1 knapsack dynamic programming."""
@@ -105,11 +106,11 @@ class UIETrainer(Seq2SeqTrainer):
     def __init__(
         self,
         *args,
-        radius: float = 1.0,
+        radius: float = 0.5,
         sigma: float = 0.0,
         tau: float = 0.0,
         beta: float = 1.0,
-        alpha: float = 0.9,
+        alpha: float = 0.5,
         comm_budget: int = 0,
         layer_costs: Dict[str, int] = None,** kwargs,
     ):
@@ -125,6 +126,7 @@ class UIETrainer(Seq2SeqTrainer):
         self.deepspeed = None  # 明确禁用 DS 句柄，避免 Base 类分支误判
         self.deepspeed_engine = None
         self.lambda_conf = 1.0  # 可选：背包里的 λ
+        self.method = self.args.method
 
     def _init_deepspeed(self):
         """初始化DeepSpeed引擎（修复属性名+配置格式转换）"""
@@ -232,220 +234,419 @@ class UIETrainer(Seq2SeqTrainer):
         self,
         task_id: int = 1,
         base_params: Dict[str, torch.Tensor] = None,
+        cid: int = -1,
         **kwargs,
     ):  # type: ignore[override]
-        """Train the model.
 
-        When ``task_id`` is 1, this simply falls back to ``Seq2SeqTrainer.train``
-        and acts as normal fine-tuning. For later tasks (``task_id`` > 1) the
-        continual-learning optimisation with communication-budget aware
-        parameter selection is executed.
-        """
+        if not hasattr(self, "_eta_scale"):
+            self._eta_scale = {}  # per-parameter EMA 的 s
+        self._eta_scale_rho = getattr(self, "eta_scale_rho", 0.1)  # EMA 系数，0.05~0.2
+        self._eta_smin = getattr(self, "eta_smin", 0.1)  # 缩放下界
+        self._eta_smax = getattr(self, "eta_smax", 10.0)  # 缩放上界
 
-        state_has_history = self.continual_state.has_valid_history() if self.continual_state is not None else False
-
-        # 任务1逻辑：仅调用父类训练，不计算delta和F_client（由federated_uie_lora.py处理）
-        if task_id == 1:
+        if self.method == "lora_origin":
             return super().train(**kwargs)
 
-        if task_id > 1 and self.args.deepspeed:
-            self._init_deepspeed()  # 初始化DeepSpeed引擎
 
-        # 后续任务逻辑（保持不变）
-        if self.continual_state is None or base_params is None or (
-                self.continual_state is not None and not state_has_history):
-            super().train(**kwargs)
+        if self.method == "adaptive" and task_id == 1:
+            return super().train(**kwargs)
 
-            # 补充计算delta和F_client（仅用于后续任务中首次被选中的节点）
-            state_dict = self.model.state_dict()
-            delta = {
-                k: base_params[k] - state_dict[k].detach().cpu()
-                for k in base_params
+        elif self.method == "adaptive" and task_id > 1:
+            state_has_history = self.continual_state.has_valid_history() if self.continual_state is not None else False
+            # 如果该节点之前从未被训练过（无历史）：走一次普通训练 + Fisher
+            if self.continual_state is None or base_params is None or (
+                    self.continual_state is not None and not state_has_history
+            ):
+                super().train(**kwargs)
+                state_dict = self.model.state_dict()
+                delta = {k: base_params[k] - state_dict[k].detach().cpu() for k in base_params}
+                F_client = compute_fisher(self.model, self.get_train_dataloader())
+                F_client = {k: F_client.get(k, torch.zeros_like(base_params[k])) for k in base_params}
+                theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+                return delta, F_client, theta_last
+
+            # --------------Train---------------
+            model = self.model
+            dataloader = self.get_train_dataloader()
+            device = next(model.parameters()).device
+            model.train()
+
+            # 初始化F_curr为小正值，提升稳定性
+            F_curr = {
+                n: 1e-3 * torch.ones_like(p, device=device)  # 初始化为1e-6，而非0
+                for n, p in model.named_parameters()
+                if p.requires_grad
             }
 
-            from federated_uie_lora import compute_fisher
-            F_client = compute_fisher(self.model, self.get_train_dataloader())
-            F_client = {k: F_client.get(k, torch.zeros_like(base_params[k])) for k in base_params}
+            # Load old task
+            bar_F_raw  = {k: v.to(device) for k, v in self.continual_state.bar_F.items()}
+            bar_B_raw  = {k: v.to(device) for k, v in self.continual_state.bar_B.items()}
+            bar_theta = {}
+            for k, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if (k in bar_F_raw) and (k in bar_B_raw):
+                    bar_theta[k] = bar_B_raw[k] / (bar_F_raw[k] + 1e-8)
+                else:
+                    bar_theta[k] = torch.zeros_like(p, device=device)
 
-            return delta, F_client
+            # 工程
+            bar_F_eff, bar_B_eff = {}, {}
+            scale_s, calibrated = {}, False
+            S_MIN, S_MAX, EPS_S = 0.1, 1000.0, 1e-12  # 放缩上/下界
 
-        model = self.model
-        dataloader = self.get_train_dataloader()
-        # self.create_optimizer_and_scheduler(
-        #     num_training_steps=len(dataloader) * int(self.args.num_train_epochs)
-        # )
-        device = next(model.parameters()).device
-        model.train()
+            r2, r2_start = {}, {}
+            B_round, conf = {}, {}
+            num_epochs = int(self.args.num_train_epochs)
+            steps_per_epoch = len(dataloader)
+            actual_steps = 0  # 真实已处理的 mini-batch 数（用于 p_round 分母）
 
-        # TODO 是否需要考虑归一化的问题
-        F_curr = {
-            n: torch.zeros_like(p, device=device)
-            for n, p in model.named_parameters()
-            if p.requires_grad
-        }
+            # for name, p in model.named_parameters():
+            #     if not p.requires_grad:
+            #         continue
+            #     f = bar_F.get(name, torch.zeros_like(p, device=device))
+            #     r2[name] = ((p - bar_theta.get(name, torch.zeros_like(p))).pow(2) * f).sum()
+            #     r2_start[name] = r2[name].clone()
+            #     B_round[name] = torch.tensor(0.0, device=device)
+            #     conf[name] = 0
 
-        bar_F = {k: v.to(device) for k, v in self.continual_state.bar_F.items()}  # 转移到 device（如 cuda:0）
-        bar_B = {k: v.to(device) for k, v in self.continual_state.bar_B.items()}
-        bar_theta = {}
-        for k, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if k in bar_F and k in bar_B:
-                bar_theta[k] = bar_B[k] / (bar_F[k] + 1e-8)
-            else:
-                bar_theta[k] = torch.zeros_like(p, device=device)
 
-        r2 = {}
-        r2_start = {}
-        B_round = {}
-        conf = {}
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            f = bar_F.get(name, torch.zeros_like(p, device=device))
-            r2[name] = ((p - bar_theta.get(name, torch.zeros_like(p))).pow(2) * f).sum()
-            r2_start[name] = r2[name].clone()
-            B_round[name] = torch.tensor(0.0, device=device)
-            conf[name] = 0
 
-        # ====== 进度条与平滑指标设置（新增）======
-        num_epochs = int(self.args.num_train_epochs)
-        steps_per_epoch = len(dataloader)
-        tqdm_total = num_epochs * steps_per_epoch  # 仅用于显示
-        show_bar = getattr(self, "is_world_process_zero", lambda: True)()
+            # /*-------------Begin train------------
+            for epoch in range(num_epochs):
+                for step, batch in enumerate(dataloader):
+                    actual_steps += 1
+                    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        pbar = tqdm(
-            total=tqdm_total,
-            disable=not show_bar,
-            dynamic_ncols=True,
-            leave=True,
-            desc=f"Task {task_id} | training",
-        )
+                    # 清梯度
+                    model.zero_grad(set_to_none=True)
 
-        ema_loss = None
-        ema_beta = 0.98
-        window = deque(maxlen=50)
-        log_every = max(1, int(getattr(self.args, "logging_steps", 10)))
-        actual_steps = 0  # 真实已处理的 mini-batch 数（用于 p_round 分母）
+                    # 前向
+                    with self.compute_loss_context_manager():
+                        outputs = model(**batch)
+                        loss = outputs[0] if isinstance(outputs, (list, tuple)) else outputs["loss"]
 
-        for epoch in range(int(self.args.num_train_epochs)):
-            for step, batch in enumerate(dataloader):
-                actual_steps += 1
-                batch = {
-                    k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
-
-                # 清梯度
-                model.zero_grad(set_to_none=True)
-
-                with self.compute_loss_context_manager():
-                    outputs = model(**batch)
-                    loss = outputs[0] if isinstance(outputs, (list, tuple)) else outputs["loss"]
-
-                if self.args.gradient_accumulation_steps > 1:
-                    loss = loss / self.args.gradient_accumulation_steps
-
-                # 反向传播
-                loss.backward()
-
-                with torch.no_grad():
-                    for name, p in model.named_parameters():
-                        if not p.requires_grad or p.grad is None:
-                            continue
-                        g = p.grad
-                        F_batch = g * g
-                        F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
-
-                        # Natural-gradient style preconditioning
-                        v = g / (F_curr[name] + 1e-8)
-
-                        a = (v * bar_F[name] * v).sum() if name in bar_F else torch.tensor(0.0, device=device)
-                        diff = p - bar_theta[name]
-                        b_val = (v * bar_F[name] * diff).sum() if name in bar_F else torch.tensor(0.0, device=device)
-                        Delta = (self.radius ** 2) - r2[name]
-
-                        if b_val.item() < 0.0:
-                            term = (b_val - self.sigma)
-                            disc = term * term + self.beta * a * (Delta - self.tau)
-                            disc = torch.clamp(disc, min=0.0)
-                            eta = (term + torch.sqrt(disc)) / (self.beta * a + 1e-8)
-                            eta = torch.clamp(eta, max=self.args.learning_rate)
-                            conf[name] += 1  # ←← 新增：冲突计数
-                        else:
-                            eta = torch.as_tensor(self.args.learning_rate, device=device)
-
-                        # 新任务收益（二阶）
-                        Q = torch.sum((g * g) / (F_curr[name] + 1e-8))
-                        gain = (eta - 0.5 * eta * eta) * Q
-                        gain = torch.clamp(gain, min=0.0)
-                        B_round[name] = B_round[name] + gain
-
-                        # 半径更新：r^2 = r^2 - 2η b + η^2 a
-                        r2[name] = r2[name] - 2.0 * eta * b_val + (eta * eta) * a
-
-                        # 参数更新
-                        p.add_(-eta * v)
-
-                if show_bar:
-                    # 显示“未缩放”的loss更直观：若用了梯度累积，把显示值乘回去
-                    display_loss = loss.detach()
                     if self.args.gradient_accumulation_steps > 1:
-                        display_loss = display_loss * self.args.gradient_accumulation_steps
-                    loss_val = float(display_loss)
+                        loss = loss / self.args.gradient_accumulation_steps
 
-                    # EMA + 滑窗
-                    ema_loss = loss_val if ema_loss is None else (ema_beta * ema_loss + (1 - ema_beta) * loss_val)
-                    window.append(loss_val)
-                    mean_last = sum(window) / len(window)
+                    # 反向传播
+                    loss.backward()
 
-                    # 控制刷新频率
-                    if (actual_steps % log_every) == 0 or actual_steps == 1:
-                        pbar.set_postfix_str(
-                            f"epoch={epoch + 1}/{num_epochs}  loss={loss_val:.4f}  ema={ema_loss:.4f}  last{len(window)}={mean_last:.4f}"
-                        )
-                    pbar.update(1)
+                    # 打印loss结果
+                    raw_loss = loss.detach().item() * self.args.gradient_accumulation_steps
+                    # 输出日志：包含epoch、step、当前batch的loss
+                    logger.info(
+                        f"Task {task_id} | Epoch [{epoch + 1}/{num_epochs}] | Batch [{step + 1}/{steps_per_epoch}] | "
+                        f"Batch Loss: {raw_loss:.6f}"
+                    )
 
-            # # （可选）回传到 HF 的日志/回调体系，便于 TensorBoard
-            # if (actual_steps % log_every) == 0 or actual_steps == 1:
-            #     try:
-            #         fractional_epoch = epoch + (step + 1) / max(1, steps_per_epoch)
-            #         self.log({"loss": float(loss.detach() * (self.args.gradient_accumulation_steps if self.args.gradient_accumulation_steps > 1 else 1)),
-            #                   "ema_loss": float(ema_loss) if ema_loss is not None else None,
-            #                   "epoch": fractional_epoch})
-            #         if hasattr(self, "callback_handler"):
-            #             self.control = self.callback_handler.on_log(self.args, self.state, getattr(self, "control", None))
-            #         if hasattr(self, "state"):
-            #             # 给 HF 的 global_step 也累计一下（可选）
-            #             self.state.global_step = (self.state.global_step or 0) + 1
-            #     except Exception:
-            #         pass
+                    # 自适应学习率
+                    with torch.no_grad():
+                        F_norm_per_param = {}
+                        for name, p in model.named_parameters():
+                            if not p.requires_grad or p.grad is None:
+                                continue
+                            g = p.grad
+                            F_batch = g * g
+                            F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
 
-        # 训练循环结束后
-        if show_bar:
-            pbar.close()
+                            # 对F归一化
+                            F_min = torch.min(F_curr[name])
+                            F_max = torch.max(F_curr[name])
+                            epsilon = 1e-3  # 避免除零，同时接近0以保留[0,1]的相对比例特性
+                            if (F_max - F_min) <= 1e-12:
+                                F_norm = torch.full_like(F_curr[name], epsilon)
+                            else:
+                                # 1. 缩放到[0, 1]：保留原始F_curr的相对比例
+                                F_scaled = (F_curr[name] - F_min) / (F_max - F_min + 1e-12)
+                                # 2. 偏移到[ε, 1]：确保最小值为ε，最大值为1，既安全又接近0-1
+                                F_norm = F_scaled * (1 - epsilon) + epsilon
+                            F_norm_per_param[name] = F_norm
 
-        # ====== 轮末统计 ======
-        F_round = {n: 0.5 * torch.clamp(r2[n] - r2_start[n], min=0.0) for n in r2}
-        p_round = {n: conf[n] / max(actual_steps, 1) for n in conf}  # ←← 用真实步数
-        values, costs, names = [], [], []
-        for name in B_round:
-            val = (B_round[name] - self.lambda_conf * p_round[name] * F_round[name]).item()
-            values.append(val)
-            costs.append(int(self.layer_costs.get(name, 1)))
-            names.append(name)
-        selected = _knapsack(values, costs, self.comm_budget)
+                        if not calibrated:
+                            for name, p in model.named_parameters():
+                                if not p.requires_grad:
+                                    continue
+                                if name in bar_F_raw:
+                                    m_curr = float(F_norm_per_param[name].mean().detach().cpu())
+                                    m_hist = float(bar_F_raw[name].mean().detach().cpu())
+                                    if m_hist > 0.0:
+                                        s = m_curr / (m_hist + EPS_S)
+                                        s = max(S_MIN, min(s, S_MAX))
+                                    else:
+                                        s = 1.0
+                                    scale_s[name] = s
+                                    bar_F_eff[name] = bar_F_raw[name] * s
+                                    bar_B_eff[name] = bar_B_raw[name] * s
+                                    # === 新增：把半径/σ/τ同步到同一尺度（单位对齐）===
+                                    if "R2_eff" not in locals():
+                                        R2_eff = {}
+                                        sigma_eff_map = {}
+                                        tau_eff_map = {}
 
-        # 增量
-        delta = {}
-        state_dict = model.state_dict()
-        for name, sel in zip(names, selected):
-            local_param = state_dict[name].detach().cpu()
-            delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
-        return delta, {k: v.detach().cpu() for k, v in F_curr.items()}
+                                    R2_eff[name] = (self.radius ** 2) * s
+                                    sigma_eff_map[name] = torch.as_tensor(self.sigma, device=device) * s
+                                    tau_eff_map[name] = torch.as_tensor(self.tau, device=device) * s
+                                else:
+                                    # 没有历史，就视为 0 惩罚
+                                    bar_F_eff[name] = torch.zeros_like(p, device=device)
 
-    #TODO 测试有问题，没结果，是否是训练参数也没更新
-    # prediction_step
+                                # 用“生效的历史 Fisher”初始化半径与统计量
+                                f_eff = bar_F_eff[name]
+                                theta_ref = bar_theta.get(name, torch.zeros_like(p))
+                                r2[name] = ((p - theta_ref).pow(2) * f_eff).sum()
+                                r2_start[name] = r2[name].clone()
+                                B_round[name] = torch.tensor(0.0, device=device)
+                                conf[name] = 0
+                            calibrated = True  # 仅做一次
+
+
+                        damping_factor = 1e-5
+                        for name, p in model.named_parameters():
+                            if not p.requires_grad or p.grad is None:
+                                continue
+
+                            g = p.grad
+                            F_norm = F_norm_per_param[name]
+                            v = g / (F_norm + damping_factor)
+
+                            f_eff = bar_F_eff.get(name, torch.zeros_like(p))
+                            diff = p - bar_theta[name]
+                            a_raw = (v * f_eff * v).sum()  # v^T \bar F_eff v
+                            b_raw = (v * f_eff * diff).sum()  # v^T \bar F_eff (θ-θ̄)
+                            Delta = (self.radius ** 2) - r2[name]  # 或者你用的 R2_eff[name] - r2[name]
+
+                            a_curr = (v * F_norm * v).sum()
+
+                            # 2) 每层维护一个 a 的 EMA 作为基线
+                            if not hasattr(self, "_a_ema"):
+                                self._a_ema = {}
+                            rho = getattr(self, "a_ema_rho", 0.1)  # EMA 系数（0.05~0.2）
+                            a_prev = self._a_ema.get(name, a_curr.detach())
+                            a_ema = (1 - rho) * a_prev + rho * a_curr.detach()
+                            self._a_ema[name] = a_ema
+
+                            # 3) 只在“步长计算”里给 a 一个动态下界
+                            mu = getattr(self, "a_curr_floor_mu", 0.05)  # 0.02~0.2
+                            kappa = getattr(self, "a_ema_floor_kappa", 0.1)  # 0.05~0.3
+                            a_eta = torch.maximum(a_raw, torch.maximum(mu * a_curr,
+                                                                       kappa * a_ema.to(a_raw.dtype).to(a_raw.device)))
+
+                            # # ======= ★ 关键：把“步长用的 Δ”压到目标尺度 ★ =======
+                            # # 目标：eta_closed 不超过 eta_goal（通常取你想要的上限量级，比如 1e-3 或 0.5*1e-3）
+                            # eta_goal = torch.as_tensor(getattr(self, "eta_goal", self.args.learning_rate),
+                            #                            device=device)
+                            # beta_t = torch.as_tensor(self.beta, device=device)
+                            # # 近似反推：Δ_goal ≈ eta_goal^2 * β * a_eta
+                            # Delta_goal = (eta_goal * eta_goal) * beta_t * a_eta
+                            # Delta_step = torch.clamp_min(torch.minimum(Delta, Delta_goal), 0.0)  # 仅用于闭式步长
+                            #
+                            # EPS = 1e-8
+                            # LR_T = torch.as_tensor(self.args.learning_rate, device=device)
+                            #
+                            # if b_raw.item() < 0.0:
+                            #     term = (b_raw - self.sigma)  # 若你做了 σ 的尺度对齐，替换为 sigma_eff_map[name]
+                            #     # 用 Δ_step 进入闭式公式（只改这一处 Δ）
+                            #     disc = term * term + beta_t * a_eta * (
+                            #                 Delta_step - self.tau)  # τ 同理，可用 tau_eff_map[name]
+                            #     disc = torch.clamp(disc, min=0.0)
+                            #     eta_closed = (term + torch.sqrt(disc)) / (beta_t * a_eta + EPS)
+                            #
+                            #     # 信赖域（严格几何）仍用原始 Δ 与 a_raw，保持你的遗忘定义
+                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #
+                            #     # 最终步长：闭式 ∩ 信赖域 ∩ 全局 lr
+                            #     eta = torch.minimum(torch.minimum(eta_closed, eta_tr), LR_T)
+                            #     conf[name] += 1
+                            #     logger.info(f"eta is {eta} when conflict")
+                            # else:
+                            #     # 非冲突：你原来的策略（也可加上信赖域）
+                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #     eta = torch.minimum(LR_T, eta_tr)
+
+                            beta_t = torch.as_tensor(self.beta, device=device)
+                            lr_cap = torch.as_tensor(self.args.learning_rate, device=device)
+
+                            # 冲突项（与闭式一致）：term_u = (b - σ)
+                            term_u = b_raw - self.sigma
+
+                            # —— 用“冲突强度”决定目标步长是 lr 的几分之几 —— #
+                            # 归一尺度：√(β a_eta · Δ) ；冲突越强，目标越接近 lr，反之越小
+                            scale = torch.sqrt(
+                                torch.clamp(beta_t * a_eta * torch.clamp(Delta, min=0.0) + 1e-12, min=1e-12))
+                            b_norm = torch.abs(term_u) / scale  # 无量纲冲突强度
+
+                            conf_k = getattr(self, "conf_k", 1.0)  # 0.5~2.0：对冲突强度的敏感度
+                            eta_min_frac = getattr(self, "eta_min_frac", 0.01)  # 0.05~0.3：最小占比，给很弱冲突一个小步长
+                            # 映射到 (eta_min_frac, 1)：平滑且有界
+                            w_conf = eta_min_frac + (1.0 - eta_min_frac) * (b_norm * conf_k / (1.0 + b_norm * conf_k))
+
+                            eta_goal_dyn = lr_cap * w_conf  # 动态目标步长（≤ lr）
+
+                            # —— 精确反推 Δ_goal（包含 b 项；比 “η^2 β a” 更精确）—— #
+                            # 由闭式反解：η* = ((b-σ)+√((b-σ)^2 + β a (Δ-τ)))/(β a)
+                            # 推得：Δ_goal = β a η*^2 - 2 (b-σ) η* + τ
+                            Delta_goal_exact = beta_t * a_eta * (
+                                        eta_goal_dyn ** 2) - 2.0 * term_u * eta_goal_dyn + self.tau
+
+                            # 仅用于“求步长”的 Δ（不改你的遗忘几何）
+                            Delta_step = torch.clamp_min(torch.minimum(Delta, Delta_goal_exact), 0.0)
+
+                            EPS = 1e-8
+                            if b_raw.item() < 0.0:
+                                disc = term_u * term_u + beta_t * a_eta * (Delta_step - self.tau)
+                                disc = torch.clamp(disc, min=0.0)
+                                eta_closed = (term_u + torch.sqrt(disc)) / (beta_t * a_eta + EPS)
+
+                                # 信赖域上界仍用原 Δ 与 a_raw（保持几何）
+                                eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+
+                                eta = torch.minimum(torch.minimum(eta_closed, eta_tr), lr_cap)
+                                conf[name] += 1
+                                logger.info(f"[{name}] eta={float(eta):.6g} w_conf={float(w_conf):.3f} "
+                                            f"goal={float(eta_goal_dyn):.3g} b_norm={float(b_norm):.3g}")
+                            else:
+                                eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                                eta = torch.minimum(lr_cap, eta_tr)
+
+
+
+
+
+
+
+
+
+
+
+
+
+                            # # 4) 冲突闭式步长 + 温和信赖域上界（半径上界仍用 a_raw，几何不变）
+                            # LR_T = torch.as_tensor(self.args.learning_rate, device=device)
+                            # EPS = 1e-8
+                            #
+                            # if b_raw.item() < 0.0:
+                            #     term = (b_raw - self.sigma)  # 若你已做 σ 对齐，可替换为 sigma_eff_map[name]
+                            #     disc = term * term + self.beta * a_eta * (Delta - self.tau)  # τ 同理；不想动就保留原样
+                            #     disc = torch.clamp(disc, min=0.0)
+                            #     eta_closed = (term + torch.sqrt(disc)) / (self.beta * a_eta + EPS)
+                            #
+                            #     # 信赖域上限（仍以历史几何衡量半径，保持你的遗忘定义）
+                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #
+                            #     eta = torch.minimum(torch.minimum(eta_closed, eta_tr), LR_T)
+                            #     conf[name] += 1
+                            # else:
+                            #     # 非冲突：用基础 lr，也可与 eta_tr 取 min 防越半径
+                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #     eta = torch.minimum(LR_T, eta_tr)
+
+
+
+                            # /* -----------step-2----------------
+                            # a = (v * bar_F[name] * v).sum() if name in bar_F else torch.tensor(0.0, device=device)
+                            # diff = p - bar_theta[name]
+                            # b_val = (v * bar_F[name] * diff).sum() if name in bar_F else torch.tensor(0.0, device=device)
+                            # Delta = (self.radius ** 2) - r2[name]
+
+                            # if b_val.item() < 0.0:
+                            #     term = (b_val - self.sigma)
+                            #     disc = term * term + self.beta * a * (Delta - self.tau)
+                            #     disc = torch.clamp(disc, min=0.0)
+                            #     eta = (term + torch.sqrt(disc)) / (self.beta * a + 1e-8)
+                            #     eta = torch.clamp(eta, max=self.args.learning_rate)
+                            #     conf[name] += 1
+                            # else:
+                            #     eta = torch.as_tensor(self.args.learning_rate, device=device)
+
+                            # 新任务收益（二阶）
+                            Q = torch.sum(g * v)
+                            gain = (eta - 0.5 * eta * eta) * Q
+                            gain = torch.clamp(gain, min=0.0)
+
+                            # C = a  # 自然梯度等价：C = v^T f_eff v == a
+                            # gain_2 = torch.clamp(eta * Q - 0.5 * eta * eta * C, min=0.0)
+                            #
+                            # if gain == gain_2:
+                            #     pass
+
+                            B_round[name] = B_round[name] + gain
+
+                            # 半径更新：r^2 = r^2 - 2η b + η^2 a
+                            # r2[name] = r2[name] - 2.0 * eta * b_val + (eta * eta) * a
+
+                            r2[name] = r2[name] - 2.0 * eta * b_raw + (eta * eta) * a_raw
+
+                            # 参数更新
+                            p.add_(-eta * v)
+
+
+            # ====== Step-3 ======
+            F_round = {n: 0.5 * torch.clamp(r2[n] - r2_start[n], min=0.0) for n in r2}
+            p_round = {n: conf[n] / max(actual_steps, 1) for n in conf}  # ←← 用真实步数
+
+            # --- 轮内稳健归一 + 自适应 λ ---
+
+            # eps = 1e-8
+            # names = list(B_round.keys())
+            # b_vals = torch.tensor([B_round[n].item() for n in names])
+            # c_vals = torch.tensor([(p_round[n] * F_round[n]).item() for n in names])
+            #
+            # # 分位数归一
+            # med_b = torch.quantile(b_vals, 0.5)
+            # med_c = torch.quantile(c_vals, 0.5) if (c_vals > 0).any() else torch.tensor(1.0)
+            #
+            # def norm_b(x):
+            #     return x / (med_b + eps)
+            #
+            # def norm_c(x):
+            #     return x / (med_c + eps)
+            #
+            # # 自适应 λ
+            # lambda_base = getattr(self, "lambda_conf", 1.0)
+            # lambda_eff = float(lambda_base) * float(med_b / (med_c + eps))
+            #
+            # # B 的 p95 截断，抑制异常层
+            # b_cap = torch.quantile(b_vals, 0.95).item()
+            # for n in names:
+            #     B_round[n] = torch.clamp(B_round[n], max=b_cap)
+            #
+            # # 构建背包价值与成本
+            # values, costs = [], []
+            # for n in names:
+            #     b = norm_b(B_round[n])
+            #     c = norm_c(p_round[n] * F_round[n])
+            #     v = float(b - lambda_eff * c)
+            #     values.append(v)
+            #     costs.append(int(self.layer_costs.get(n, 1)))
+            #
+            # selected = _knapsack(values, costs, self.comm_budget)
+
+
+            # select layer update
+            values, costs, names = [], [], []
+            for name in B_round:
+                val = (B_round[name] - self.lambda_conf * p_round[name] * F_round[name]).item()
+                values.append(val)
+                costs.append(int(self.layer_costs.get(name, 1)))
+                names.append(name)
+            selected = _knapsack(values, costs, self.comm_budget)
+
+            # 1) 选层打包（你现有的）
+            delta = {}
+            state_dict = model.state_dict()
+            for name, sel in zip(names, selected):
+                local_param = state_dict[name].detach().cpu()
+                delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
+
+            # 2) 本轮 Fisher（保持你现有的）
+            F_client = {k: v.detach().cpu() for k, v in F_curr.items()}
+
+            # 3) 本轮结束时该客户端的 θ*（只取可训练/LoRA keys）
+            theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+
+            return delta, F_client, theta_last
+
     def evaluation_loop(
         self,
         dataloader: DataLoader,
@@ -644,7 +845,6 @@ class UIETrainer(Seq2SeqTrainer):
             Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
             labels (each being optional).
         """
-#
         if not self.args.predict_with_generate or prediction_loss_only:
             return super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
