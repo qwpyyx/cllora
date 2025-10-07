@@ -254,7 +254,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     def compute_rouge_metrics(dataset, preds, save_prefix=None):
         # 对生成式模型的输出进行后处理
         print(type(preds), np.asarray(preds).dtype, np.asarray(preds).shape)
-        # TODO 会不会是skip_instructions的问题
         decoded_preds = skip_instructions(model, preds, tokenizer)
         references = [e["Instance"]["label"] for e in dataset]
         result = compute_metrics(predictions=decoded_preds, references=references)
@@ -301,6 +300,40 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         """
         return [name for name, param in model.named_parameters() if param.requires_grad and 'lora' in name]
 
+    def get_param_bit_width(param):
+        """根据参数数据类型自动获取比特宽度"""
+        dtype = param.dtype
+        if dtype == torch.float32 or dtype == torch.int32:
+            return 32
+        elif dtype == torch.float16 or dtype == torch.int16 or dtype == torch.bfloat16:
+            return 16
+        elif dtype == torch.int8 or dtype == torch.uint8:
+            return 8
+        else:
+            logger.warning(f"未知数据类型 {dtype}，默认使用32位计算")
+            return 32
+
+    lora_params = {k: p for k, p in global_model.named_parameters() if "lora" in k}
+
+    def calculate_layer_packet_cost(param, packet_size=1500):
+        """计算单个LoRA层所需的数据包数量"""
+        num_elements = param.numel()
+        bit_width = get_param_bit_width(param)
+        total_bytes = (num_elements * bit_width) // 8  # 总字节数
+        return (total_bytes + packet_size - 1) // packet_size  # 向上取整
+
+    # 预计算所有LoRA层的成本（只需要计算一次，全局共享）
+    layer_costs = {
+        k: calculate_layer_packet_cost(p)
+        for k, p in lora_params.items()
+    }
+    logger.info(f"预计算的LoRA层通信成本: {layer_costs['base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
+
+    # 新增：跟踪客户端被选中的次数和最后选中轮次
+    client_selection_tracker = {
+        cid: {'count': 0, 'last_round': -1}
+        for cid in range(fed_args.num_clients)
+    }
 
     # -----Begin Training------
     training_args.remove_unused_columns = False
@@ -334,45 +367,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         if prev_task_dir and not os.path.isdir(prev_task_dir):
             prev_task_dir = None
 
-    lora_params = {k: p for k, p in global_model.named_parameters() if "lora" in k}
-
-    def get_param_bit_width(param):
-        """根据参数数据类型自动获取比特宽度"""
-        dtype = param.dtype
-        if dtype == torch.float32 or dtype == torch.int32:
-            return 32
-        elif dtype == torch.float16 or dtype == torch.int16 or dtype == torch.bfloat16:
-            return 16
-        elif dtype == torch.int8 or dtype == torch.uint8:
-            return 8
-        else:
-            logger.warning(f"未知数据类型 {dtype}，默认使用32位计算")
-            return 32
-
-    def calculate_layer_packet_cost(param, packet_size=1500):
-        """计算单个LoRA层所需的数据包数量"""
-        num_elements = param.numel()
-        bit_width = get_param_bit_width(param)
-        total_bytes = (num_elements * bit_width) // 8  # 总字节数
-        return (total_bytes + packet_size - 1) // packet_size  # 向上取整
-
-    # 预计算所有LoRA层的成本（只需要计算一次，全局共享）
-    layer_costs = {
-        k: calculate_layer_packet_cost(p)
-        for k, p in lora_params.items()
-    }
-    logger.info(f"预计算的LoRA层通信成本: {layer_costs['base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
-
-    # 新增：跟踪客户端被选中的次数和最后选中轮次
-    client_selection_tracker = {
-        cid: {'count': 0, 'last_round': -1}
-        for cid in range(fed_args.num_clients)
-    }
-
     # 新增：记录当前任务中被选中的客户端
     current_task_selected_clients = set()
 
-    # TODO 可能有问题
     client_state_dir = os.path.join(current_output_dir, "client_states")
     os.makedirs(client_state_dir, exist_ok=True)
 
@@ -382,9 +379,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         cid: {"F_sum": None, "count": 0, "F_last": None, "theta_last": None}
         for cid in range(fed_args.num_clients)
     }
-
-
-
 
 
 

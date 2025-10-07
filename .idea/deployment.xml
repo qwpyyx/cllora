@@ -61,7 +61,7 @@
       <paths name="qiuwenqi@172.31.233.163:22 key (9)">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/adaptive" local="$PROJECT_DIR$" />
+            <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

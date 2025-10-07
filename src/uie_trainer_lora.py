@@ -111,12 +111,16 @@ class UIETrainer(Seq2SeqTrainer):
         tau: float = 0.0,
         beta: float = 1.0,
         alpha: float = 0.5,
+        comm_bandwidth: float = 1.0,
+        comm_fixed_cost: float = 0.0,
         comm_budget: int = 0,
         layer_costs: Dict[str, int] = None,** kwargs,
     ):
         self.continual_state = kwargs.pop("state", None)  # 这里直接赋值给 continual_state
         super().__init__(*args, **kwargs)  # 此时 kwargs 中已无 state，父类不会报错
         self.radius = radius
+        self.comm_bandwidth = comm_bandwidth  # MB/s
+        self.comm_fixed_cost = comm_fixed_cost  # 固定开销（秒）
         self.sigma = sigma
         self.tau = tau
         self.beta = beta
@@ -266,55 +270,90 @@ class UIETrainer(Seq2SeqTrainer):
                 return delta, F_client, theta_last
 
             # --------------Train---------------
+            use_adaptive_logic = True  # 切换：False=基线模式，True=自适应模式
+            batch_times = []  # 存储每个batch的训练耗时（毫秒）
+            warmup_skip = 1  # 跳过第一个batch（GPU热身时间，避免干扰统计）
+            logger.info(f"===== 开始训练 | 模式：{'自适应' if use_adaptive_logic else '基线'} | Task {task_id} =====")
+
             model = self.model
             dataloader = self.get_train_dataloader()
             device = next(model.parameters()).device
             model.train()
 
-            # 初始化F_curr为小正值，提升稳定性
-            F_curr = {
-                n: 1e-3 * torch.ones_like(p, device=device)  # 初始化为1e-6，而非0
-                for n, p in model.named_parameters()
-                if p.requires_grad
-            }
-
-            # Load old task
-            bar_F_raw  = {k: v.to(device) for k, v in self.continual_state.bar_F.items()}
-            bar_B_raw  = {k: v.to(device) for k, v in self.continual_state.bar_B.items()}
-            bar_theta = {}
-            for k, p in model.named_parameters():
-                if not p.requires_grad:
-                    continue
-                if (k in bar_F_raw) and (k in bar_B_raw):
-                    bar_theta[k] = bar_B_raw[k] / (bar_F_raw[k] + 1e-8)
-                else:
-                    bar_theta[k] = torch.zeros_like(p, device=device)
-
             # 工程
-            bar_F_eff, bar_B_eff = {}, {}
-            scale_s, calibrated = {}, False
-            S_MIN, S_MAX, EPS_S = 0.1, 1000.0, 1e-12  # 放缩上/下界
-
+            F_curr = None
+            bar_F_raw = None
+            bar_B_raw = None
+            bar_theta = {}
+            # bar_F_eff, bar_B_eff = {}, {}
+            #scale_s, calibrated = {}, False
+            #S_MIN, S_MAX, EPS_S = 0.1, 1000.0, 1e-12  # 原代码参数
             r2, r2_start = {}, {}
             B_round, conf = {}, {}
+
+            if use_adaptive_logic:
+                # 初始化F_curr为小正值，提升稳定性
+                # F_curr = {
+                #     n: 1e-3 * torch.ones_like(p, device=device)  # 初始化为1e-6，而非0
+                #     for n, p in model.named_parameters()
+                #     if p.requires_grad
+                # }
+                F_curr = {
+                    n: torch.zeros_like(p, device=device)  # 令F_curr^l = 0
+                    for n, p in model.named_parameters()
+                    if p.requires_grad
+                }
+
+                # Load old task
+                bar_F_raw  = {k: v.to(device) for k, v in self.continual_state.bar_F.items()}
+                bar_B_raw  = {k: v.to(device) for k, v in self.continual_state.bar_B.items()}
+                bar_theta = {}
+                for k, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if (k in bar_F_raw) and (k in bar_B_raw):
+                        bar_theta[k] = bar_B_raw[k] / (bar_F_raw[k] + 1e-8)
+                    else:
+                        bar_theta[k] = torch.zeros_like(p, device=device)
+
+                for name, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    # r²_ℓ = ‖θ^(ℓ) - bar_theta^(ℓ)‖²_{bar_F^(ℓ)}
+                    f_past = bar_F_raw.get(name, torch.zeros_like(p))  # 过去任务Fisher
+                    theta_curr = p  # 当前层参数θ^(ℓ)
+                    theta_past = bar_theta.get(name, torch.zeros_like(p))  # 过去最优参数bar_theta^(ℓ)
+                    r2[name] = ((theta_curr - theta_past).pow(2) * f_past).sum()
+                    # r²_ℓ,start = r²_ℓ（记录初始半径）
+                    r2_start[name] = r2[name].clone()
+                    # B^round_ℓ = 0（收益累计）
+                    B_round[name] = torch.tensor(0.0, device=device)
+                    # conf_ℓ = 0（冲突次数统计）
+                    conf[name] = 0
+
+
+
+            else:
+                # 基线模式：仅初始化“手动更新必要参数”（无多余代码）
+                lr_base = self.args.learning_rate  # 基线用固定学习率（与自适应lr_cap一致）
+                # 基线无需bar_F/bar_B，仅记录初始参数用于计算delta
+                for k, p in model.named_parameters():
+                    if p.requires_grad:
+                        bar_theta[k] = p.detach().clone()
+
+
             num_epochs = int(self.args.num_train_epochs)
             steps_per_epoch = len(dataloader)
             actual_steps = 0  # 真实已处理的 mini-batch 数（用于 p_round 分母）
 
-            # for name, p in model.named_parameters():
-            #     if not p.requires_grad:
-            #         continue
-            #     f = bar_F.get(name, torch.zeros_like(p, device=device))
-            #     r2[name] = ((p - bar_theta.get(name, torch.zeros_like(p))).pow(2) * f).sum()
-            #     r2_start[name] = r2[name].clone()
-            #     B_round[name] = torch.tensor(0.0, device=device)
-            #     conf[name] = 0
+
 
 
 
             # /*-------------Begin train------------
             for epoch in range(num_epochs):
                 for step, batch in enumerate(dataloader):
+                    batch_start = time.perf_counter()
                     actual_steps += 1
                     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
@@ -340,311 +379,366 @@ class UIETrainer(Seq2SeqTrainer):
                         f"Batch Loss: {raw_loss:.6f}"
                     )
 
+
                     # 自适应学习率
                     with torch.no_grad():
-                        F_norm_per_param = {}
-                        for name, p in model.named_parameters():
-                            if not p.requires_grad or p.grad is None:
-                                continue
-                            g = p.grad
-                            F_batch = g * g
-                            F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
-
-                            # 对F归一化
-                            F_min = torch.min(F_curr[name])
-                            F_max = torch.max(F_curr[name])
-                            epsilon = 1e-3  # 避免除零，同时接近0以保留[0,1]的相对比例特性
-                            if (F_max - F_min) <= 1e-12:
-                                F_norm = torch.full_like(F_curr[name], epsilon)
-                            else:
-                                # 1. 缩放到[0, 1]：保留原始F_curr的相对比例
-                                F_scaled = (F_curr[name] - F_min) / (F_max - F_min + 1e-12)
-                                # 2. 偏移到[ε, 1]：确保最小值为ε，最大值为1，既安全又接近0-1
-                                F_norm = F_scaled * (1 - epsilon) + epsilon
-                            F_norm_per_param[name] = F_norm
-
-                        if not calibrated:
+                        if use_adaptive_logic:
+                            # F_norm_per_param = {}
                             for name, p in model.named_parameters():
-                                if not p.requires_grad:
+                                if not p.requires_grad or p.grad is None:
                                     continue
-                                if name in bar_F_raw:
-                                    m_curr = float(F_norm_per_param[name].mean().detach().cpu())
-                                    m_hist = float(bar_F_raw[name].mean().detach().cpu())
-                                    if m_hist > 0.0:
-                                        s = m_curr / (m_hist + EPS_S)
-                                        s = max(S_MIN, min(s, S_MAX))
-                                    else:
-                                        s = 1.0
-                                    scale_s[name] = s
-                                    bar_F_eff[name] = bar_F_raw[name] * s
-                                    bar_B_eff[name] = bar_B_raw[name] * s
-                                    # === 新增：把半径/σ/τ同步到同一尺度（单位对齐）===
-                                    if "R2_eff" not in locals():
-                                        R2_eff = {}
-                                        sigma_eff_map = {}
-                                        tau_eff_map = {}
+                                g = p.grad
+                                F_batch = g * g
+                                F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
+                                # --------------------------
+                                # 算法步骤7：计算 v_B^(ℓ)、a_B^(ℓ)、b_B^(ℓ)、Δ_ℓ
+                                # --------------------------
+                                # 1. v_B^(ℓ) = g_B^(ℓ) ⊘ F_curr^(ℓ)（加1e-8避免除零）
+                                F_curr_safe = F_curr[name] + 1e-8  # 算法隐含：避免F_curr为0导致除零
+                                v = g / F_curr_safe
+                                # 2. 过去任务Fisher（bar_F^(ℓ)）
+                                f_past = bar_F_raw.get(name, torch.zeros_like(p))
+                                # 3. 当前参数与过去最优参数的差：Δθ = θ^(ℓ) - bar_theta^(ℓ)
+                                delta_theta = p - bar_theta.get(name, torch.zeros_like(p))
+                                # 4. a_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * v_B^(ℓ)
+                                a_raw = (v * f_past * v).sum()
+                                # 5. b_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * Δθ
+                                b_raw = (v * f_past * delta_theta).sum()
+                                # 6. 半径余量 Δ_ℓ = R² - r²_ℓ
+                                Delta = (self.radius ** 2) - r2[name]
 
-                                    R2_eff[name] = (self.radius ** 2) * s
-                                    sigma_eff_map[name] = torch.as_tensor(self.sigma, device=device) * s
-                                    tau_eff_map[name] = torch.as_tensor(self.tau, device=device) * s
-                                else:
-                                    # 没有历史，就视为 0 惩罚
-                                    bar_F_eff[name] = torch.zeros_like(p, device=device)
+                                # --------------------------
+                                # 算法步骤8：冲突判断与步长计算
+                                # --------------------------
+                                if b_raw.item() < 0.0:  # 冲突层：b_B^(ℓ) < 0（新旧任务方向冲突）
+                                    # 闭式步长公式（严格按算法）：
+                                    term_u = b_raw - self.sigma
+                                    discriminant = term_u ** 2 + self.beta * a_raw * (Delta - self.tau)
+                                    discriminant = torch.clamp(discriminant, min=0.0)  # 确保开方非负
+                                    eta_closed = (term_u + torch.sqrt(discriminant)) / (self.beta * a_raw + 1e-8)
+                                    # 步长上限：不超过初始学习率 η₀
+                                    eta = torch.minimum(eta_closed, torch.tensor(self.args.learning_rate, device=device))
+                                    # 记录冲突次数 conf_ℓ += 1
+                                    conf[name] += 1
+                                    # logger.info(f"[{name}] 冲突层 | 步长: {float(eta):.6g} | 冲突次数: {conf[name]}")
+                                else:  # 非冲突层：步长 = 初始学习率 η₀
+                                    eta = torch.tensor(self.args.learning_rate, device=device)
 
-                                # 用“生效的历史 Fisher”初始化半径与统计量
-                                f_eff = bar_F_eff[name]
-                                theta_ref = bar_theta.get(name, torch.zeros_like(p))
-                                r2[name] = ((p - theta_ref).pow(2) * f_eff).sum()
-                                r2_start[name] = r2[name].clone()
-                                B_round[name] = torch.tensor(0.0, device=device)
-                                conf[name] = 0
-                            calibrated = True  # 仅做一次
+                                # --------------------------
+                                # 算法步骤9：累计收益 B^round_ℓ
+                                # --------------------------
+                                # 二阶收益 Q_B^(ℓ) = (g_B^(ℓ))^T * (F_curr^(ℓ))^(-1) * g_B^(ℓ)（等价于 g·v）
+                                Q = torch.sum(g * v)
+                                # 收益计算：max{0, (η - 0.5η²) * Q}
+                                gain = (eta - 0.5 * eta ** 2) * Q
+                                gain = torch.clamp(gain, min=0.0)  # 收益非负
+                                B_round[name] = B_round[name] + gain
+
+                                # --------------------------
+                                # 算法步骤10：更新马氏半径 r²_ℓ
+                                # --------------------------
+                                r2[name] = r2[name] - 2.0 * eta * b_raw + (eta ** 2) * a_raw
+
+                                # --------------------------
+                                # 算法步骤11：更新参数 θ^(ℓ) = θ^(ℓ) - η·v_B^(ℓ)
+                                # --------------------------
+                                p.add_(-eta * v)
 
 
-                        damping_factor = 1e-5
-                        for name, p in model.named_parameters():
-                            if not p.requires_grad or p.grad is None:
-                                continue
 
-                            g = p.grad
-                            F_norm = F_norm_per_param[name]
-                            v = g / (F_norm + damping_factor)
+                                # # 对F归一化
+                                # F_min = torch.min(F_curr[name])
+                                # F_max = torch.max(F_curr[name])
+                                # epsilon = 1e-3  # 避免除零，同时接近0以保留[0,1]的相对比例特性
+                                # if (F_max - F_min) <= 1e-12:
+                                #     F_norm = torch.full_like(F_curr[name], epsilon)
+                                # else:
+                                #     # 1. 缩放到[0, 1]：保留原始F_curr的相对比例
+                                #     F_scaled = (F_curr[name] - F_min) / (F_max - F_min + 1e-12)
+                                #     # 2. 偏移到[ε, 1]：确保最小值为ε，最大值为1，既安全又接近0-1
+                                #     F_norm = F_scaled * (1 - epsilon) + epsilon
+                                # F_norm_per_param[name] = F_norm
 
-                            f_eff = bar_F_eff.get(name, torch.zeros_like(p))
-                            diff = p - bar_theta[name]
-                            a_raw = (v * f_eff * v).sum()  # v^T \bar F_eff v
-                            b_raw = (v * f_eff * diff).sum()  # v^T \bar F_eff (θ-θ̄)
-                            Delta = (self.radius ** 2) - r2[name]  # 或者你用的 R2_eff[name] - r2[name]
-
-                            a_curr = (v * F_norm * v).sum()
-
-                            # 2) 每层维护一个 a 的 EMA 作为基线
-                            if not hasattr(self, "_a_ema"):
-                                self._a_ema = {}
-                            rho = getattr(self, "a_ema_rho", 0.1)  # EMA 系数（0.05~0.2）
-                            a_prev = self._a_ema.get(name, a_curr.detach())
-                            a_ema = (1 - rho) * a_prev + rho * a_curr.detach()
-                            self._a_ema[name] = a_ema
-
-                            # 3) 只在“步长计算”里给 a 一个动态下界
-                            mu = getattr(self, "a_curr_floor_mu", 0.05)  # 0.02~0.2
-                            kappa = getattr(self, "a_ema_floor_kappa", 0.1)  # 0.05~0.3
-                            a_eta = torch.maximum(a_raw, torch.maximum(mu * a_curr,
-                                                                       kappa * a_ema.to(a_raw.dtype).to(a_raw.device)))
-
-                            # # ======= ★ 关键：把“步长用的 Δ”压到目标尺度 ★ =======
-                            # # 目标：eta_closed 不超过 eta_goal（通常取你想要的上限量级，比如 1e-3 或 0.5*1e-3）
-                            # eta_goal = torch.as_tensor(getattr(self, "eta_goal", self.args.learning_rate),
-                            #                            device=device)
-                            # beta_t = torch.as_tensor(self.beta, device=device)
-                            # # 近似反推：Δ_goal ≈ eta_goal^2 * β * a_eta
-                            # Delta_goal = (eta_goal * eta_goal) * beta_t * a_eta
-                            # Delta_step = torch.clamp_min(torch.minimum(Delta, Delta_goal), 0.0)  # 仅用于闭式步长
+                            # if not calibrated:
+                            #     for name, p in model.named_parameters():
+                            #         if not p.requires_grad:
+                            #             continue
+                            #         if name in bar_F_raw:
+                            #             m_curr = float(F_norm_per_param[name].mean().detach().cpu())
+                            #             m_hist = float(bar_F_raw[name].mean().detach().cpu())
+                            #             if m_hist > 0.0:
+                            #                 s = m_curr / (m_hist + EPS_S)
+                            #                 s = max(S_MIN, min(s, S_MAX))
+                            #             else:
+                            #                 s = 1.0
+                            #             scale_s[name] = s
+                            #             bar_F_eff[name] = bar_F_raw[name] * s
+                            #             bar_B_eff[name] = bar_B_raw[name] * s
+                            #             # === 新增：把半径/σ/τ同步到同一尺度（单位对齐）===
+                            #             if "R2_eff" not in locals():
+                            #                 R2_eff = {}
+                            #                 sigma_eff_map = {}
+                            #                 tau_eff_map = {}
                             #
-                            # EPS = 1e-8
-                            # LR_T = torch.as_tensor(self.args.learning_rate, device=device)
+                            #             R2_eff[name] = (self.radius ** 2) * s
+                            #             sigma_eff_map[name] = torch.as_tensor(self.sigma, device=device) * s
+                            #             tau_eff_map[name] = torch.as_tensor(self.tau, device=device) * s
+                            #         else:
+                            #             # 没有历史，就视为 0 惩罚
+                            #             bar_F_eff[name] = torch.zeros_like(p, device=device)
                             #
-                            # if b_raw.item() < 0.0:
-                            #     term = (b_raw - self.sigma)  # 若你做了 σ 的尺度对齐，替换为 sigma_eff_map[name]
-                            #     # 用 Δ_step 进入闭式公式（只改这一处 Δ）
-                            #     disc = term * term + beta_t * a_eta * (
-                            #                 Delta_step - self.tau)  # τ 同理，可用 tau_eff_map[name]
-                            #     disc = torch.clamp(disc, min=0.0)
-                            #     eta_closed = (term + torch.sqrt(disc)) / (beta_t * a_eta + EPS)
+                            #         # 用“生效的历史 Fisher”初始化半径与统计量
+                            #         f_eff = bar_F_eff[name]
+                            #         theta_ref = bar_theta.get(name, torch.zeros_like(p))
+                            #         r2[name] = ((p - theta_ref).pow(2) * f_eff).sum()
+                            #         r2_start[name] = r2[name].clone()
+                            #         B_round[name] = torch.tensor(0.0, device=device)
+                            #         conf[name] = 0
+                            #     calibrated = True  # 仅做一次
+
+
+                            # damping_factor = 1e-5
+                            # for name, p in model.named_parameters():
+                            #     if not p.requires_grad or p.grad is None:
+                            #         continue
                             #
-                            #     # 信赖域（严格几何）仍用原始 Δ 与 a_raw，保持你的遗忘定义
-                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #     g = p.grad
+                            #     F_norm = F_norm_per_param[name]
+                            #     v = g / (F_norm + damping_factor)
                             #
-                            #     # 最终步长：闭式 ∩ 信赖域 ∩ 全局 lr
-                            #     eta = torch.minimum(torch.minimum(eta_closed, eta_tr), LR_T)
-                            #     conf[name] += 1
-                            #     logger.info(f"eta is {eta} when conflict")
-                            # else:
-                            #     # 非冲突：你原来的策略（也可加上信赖域）
-                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
-                            #     eta = torch.minimum(LR_T, eta_tr)
-
-                            beta_t = torch.as_tensor(self.beta, device=device)
-                            lr_cap = torch.as_tensor(self.args.learning_rate, device=device)
-
-                            # 冲突项（与闭式一致）：term_u = (b - σ)
-                            term_u = b_raw - self.sigma
-
-                            # —— 用“冲突强度”决定目标步长是 lr 的几分之几 —— #
-                            # 归一尺度：√(β a_eta · Δ) ；冲突越强，目标越接近 lr，反之越小
-                            scale = torch.sqrt(
-                                torch.clamp(beta_t * a_eta * torch.clamp(Delta, min=0.0) + 1e-12, min=1e-12))
-                            b_norm = torch.abs(term_u) / scale  # 无量纲冲突强度
-
-                            conf_k = getattr(self, "conf_k", 1.0)  # 0.5~2.0：对冲突强度的敏感度
-                            eta_min_frac = getattr(self, "eta_min_frac", 0.01)  # 0.05~0.3：最小占比，给很弱冲突一个小步长
-                            # 映射到 (eta_min_frac, 1)：平滑且有界
-                            w_conf = eta_min_frac + (1.0 - eta_min_frac) * (b_norm * conf_k / (1.0 + b_norm * conf_k))
-
-                            eta_goal_dyn = lr_cap * w_conf  # 动态目标步长（≤ lr）
-
-                            # —— 精确反推 Δ_goal（包含 b 项；比 “η^2 β a” 更精确）—— #
-                            # 由闭式反解：η* = ((b-σ)+√((b-σ)^2 + β a (Δ-τ)))/(β a)
-                            # 推得：Δ_goal = β a η*^2 - 2 (b-σ) η* + τ
-                            Delta_goal_exact = beta_t * a_eta * (
-                                        eta_goal_dyn ** 2) - 2.0 * term_u * eta_goal_dyn + self.tau
-
-                            # 仅用于“求步长”的 Δ（不改你的遗忘几何）
-                            Delta_step = torch.clamp_min(torch.minimum(Delta, Delta_goal_exact), 0.0)
-
-                            EPS = 1e-8
-                            if b_raw.item() < 0.0:
-                                disc = term_u * term_u + beta_t * a_eta * (Delta_step - self.tau)
-                                disc = torch.clamp(disc, min=0.0)
-                                eta_closed = (term_u + torch.sqrt(disc)) / (beta_t * a_eta + EPS)
-
-                                # 信赖域上界仍用原 Δ 与 a_raw（保持几何）
-                                eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
-
-                                eta = torch.minimum(torch.minimum(eta_closed, eta_tr), lr_cap)
-                                conf[name] += 1
-                                logger.info(f"[{name}] eta={float(eta):.6g} w_conf={float(w_conf):.3f} "
-                                            f"goal={float(eta_goal_dyn):.3g} b_norm={float(b_norm):.3g}")
-                            else:
-                                eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
-                                eta = torch.minimum(lr_cap, eta_tr)
-
-
-
-
-
-
-
-
-
-
-
-
-
-                            # # 4) 冲突闭式步长 + 温和信赖域上界（半径上界仍用 a_raw，几何不变）
-                            # LR_T = torch.as_tensor(self.args.learning_rate, device=device)
-                            # EPS = 1e-8
+                            #     f_eff = bar_F_eff.get(name, torch.zeros_like(p))
+                            #     diff = p - bar_theta[name]
+                            #     a_raw = (v * f_eff * v).sum()  # v^T \bar F_eff v
+                            #     b_raw = (v * f_eff * diff).sum()  # v^T \bar F_eff (θ-θ̄)
+                            #     Delta = (self.radius ** 2) - r2[name]  # 或者你用的 R2_eff[name] - r2[name]
                             #
-                            # if b_raw.item() < 0.0:
-                            #     term = (b_raw - self.sigma)  # 若你已做 σ 对齐，可替换为 sigma_eff_map[name]
-                            #     disc = term * term + self.beta * a_eta * (Delta - self.tau)  # τ 同理；不想动就保留原样
-                            #     disc = torch.clamp(disc, min=0.0)
-                            #     eta_closed = (term + torch.sqrt(disc)) / (self.beta * a_eta + EPS)
+                            #     a_curr = (v * F_norm * v).sum()
                             #
-                            #     # 信赖域上限（仍以历史几何衡量半径，保持你的遗忘定义）
-                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #     # 2) 每层维护一个 a 的 EMA 作为基线
+                            #     if not hasattr(self, "_a_ema"):
+                            #         self._a_ema = {}
+                            #     rho = getattr(self, "a_ema_rho", 0.1)  # EMA 系数（0.05~0.2）
+                            #     a_prev = self._a_ema.get(name, a_curr.detach())
+                            #     a_ema = (1 - rho) * a_prev + rho * a_curr.detach()
+                            #     self._a_ema[name] = a_ema
                             #
-                            #     eta = torch.minimum(torch.minimum(eta_closed, eta_tr), LR_T)
-                            #     conf[name] += 1
-                            # else:
-                            #     # 非冲突：用基础 lr，也可与 eta_tr 取 min 防越半径
-                            #     eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
-                            #     eta = torch.minimum(LR_T, eta_tr)
-
-
-
-                            # /* -----------step-2----------------
-                            # a = (v * bar_F[name] * v).sum() if name in bar_F else torch.tensor(0.0, device=device)
-                            # diff = p - bar_theta[name]
-                            # b_val = (v * bar_F[name] * diff).sum() if name in bar_F else torch.tensor(0.0, device=device)
-                            # Delta = (self.radius ** 2) - r2[name]
-
-                            # if b_val.item() < 0.0:
-                            #     term = (b_val - self.sigma)
-                            #     disc = term * term + self.beta * a * (Delta - self.tau)
-                            #     disc = torch.clamp(disc, min=0.0)
-                            #     eta = (term + torch.sqrt(disc)) / (self.beta * a + 1e-8)
-                            #     eta = torch.clamp(eta, max=self.args.learning_rate)
-                            #     conf[name] += 1
-                            # else:
-                            #     eta = torch.as_tensor(self.args.learning_rate, device=device)
-
-                            # 新任务收益（二阶）
-                            Q = torch.sum(g * v)
-                            gain = (eta - 0.5 * eta * eta) * Q
-                            gain = torch.clamp(gain, min=0.0)
-
-                            # C = a  # 自然梯度等价：C = v^T f_eff v == a
-                            # gain_2 = torch.clamp(eta * Q - 0.5 * eta * eta * C, min=0.0)
+                            #     # 3) 只在“步长计算”里给 a 一个动态下界
+                            #     mu = getattr(self, "a_curr_floor_mu", 0.05)  # 0.02~0.2
+                            #     kappa = getattr(self, "a_ema_floor_kappa", 0.1)  # 0.05~0.3
+                            #     a_eta = torch.maximum(a_raw, torch.maximum(mu * a_curr,
+                            #                                                kappa * a_ema.to(a_raw.dtype).to(a_raw.device)))
                             #
-                            # if gain == gain_2:
-                            #     pass
+                            #     beta_t = torch.as_tensor(self.beta, device=device)
+                            #     lr_cap = torch.as_tensor(self.args.learning_rate, device=device)
+                            #
+                            #     # 冲突项（与闭式一致）：term_u = (b - σ)
+                            #     term_u = b_raw - self.sigma
+                            #
+                            #     # —— 用“冲突强度”决定目标步长是 lr 的几分之几 —— #
+                            #     # 归一尺度：√(β a_eta · Δ) ；冲突越强，目标越接近 lr，反之越小
+                            #     scale = torch.sqrt(
+                            #         torch.clamp(beta_t * a_eta * torch.clamp(Delta, min=0.0) + 1e-12, min=1e-12))
+                            #     b_norm = torch.abs(term_u) / scale  # 无量纲冲突强度
+                            #
+                            #     conf_k = getattr(self, "conf_k", 1.0)  # 0.5~2.0：对冲突强度的敏感度
+                            #     eta_min_frac = getattr(self, "eta_min_frac", 0.01)  # 0.05~0.3：最小占比，给很弱冲突一个小步长
+                            #     # 映射到 (eta_min_frac, 1)：平滑且有界
+                            #     w_conf = eta_min_frac + (1.0 - eta_min_frac) * (b_norm * conf_k / (1.0 + b_norm * conf_k))
+                            #
+                            #     eta_goal_dyn = lr_cap * w_conf  # 动态目标步长（≤ lr）
+                            #
+                            #     # —— 精确反推 Δ_goal（包含 b 项；比 “η^2 β a” 更精确）—— #
+                            #     # 由闭式反解：η* = ((b-σ)+√((b-σ)^2 + β a (Δ-τ)))/(β a)
+                            #     # 推得：Δ_goal = β a η*^2 - 2 (b-σ) η* + τ
+                            #     Delta_goal_exact = beta_t * a_eta * (
+                            #                 eta_goal_dyn ** 2) - 2.0 * term_u * eta_goal_dyn + self.tau
+                            #
+                            #     # 仅用于“求步长”的 Δ（不改你的遗忘几何）
+                            #     Delta_step = torch.clamp_min(torch.minimum(Delta, Delta_goal_exact), 0.0)
+                            #
+                            #     EPS = 1e-8
+                            #     if b_raw.item() < 0.0:
+                            #         disc = term_u * term_u + beta_t * a_eta * (Delta_step - self.tau)
+                            #         disc = torch.clamp(disc, min=0.0)
+                            #         eta_closed = (term_u + torch.sqrt(disc)) / (beta_t * a_eta + EPS)
+                            #
+                            #         # 信赖域上界仍用原 Δ 与 a_raw（保持几何）
+                            #         eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #
+                            #         eta = torch.minimum(torch.minimum(eta_closed, eta_tr), lr_cap)
+                            #         conf[name] += 1
+                            #         logger.info(f"[{name}] eta={float(eta):.6g} w_conf={float(w_conf):.3f} "
+                            #                     f"goal={float(eta_goal_dyn):.3g} b_norm={float(b_norm):.3g}")
+                            #     else:
+                            #         eta_tr = torch.sqrt(torch.clamp(Delta, min=0.0) / (a_raw + EPS))
+                            #         eta = torch.minimum(lr_cap, eta_tr)
+                            #
+                            #
+                            #     # 新任务收益（二阶）
+                            #     Q = torch.sum(g * v)
+                            #     gain = (eta - 0.5 * eta * eta) * Q
+                            #     gain = torch.clamp(gain, min=0.0)
+                            #
+                            #     # C = a  # 自然梯度等价：C = v^T f_eff v == a
+                            #     # gain_2 = torch.clamp(eta * Q - 0.5 * eta * eta * C, min=0.0)
+                            #     #
+                            #     # if gain == gain_2:
+                            #     #     pass
+                            #
+                            #     B_round[name] = B_round[name] + gain
+                            #
+                            #     # 半径更新：r^2 = r^2 - 2η b + η^2 a
+                            #     # r2[name] = r2[name] - 2.0 * eta * b_val + (eta * eta) * a
+                            #
+                            #     r2[name] = r2[name] - 2.0 * eta * b_raw + (eta * eta) * a_raw
+                            #
+                            #     # 参数更新
+                            #     p.add_(-eta * v)
+                        else:
+                            # --------------------------
+                            # 基线模式：仅保留“手动SGD更新”（无任何自适应逻辑）
+                            # --------------------------
+                            for name, p in model.named_parameters():
+                                if not p.requires_grad or p.grad is None:
+                                    continue
+                                # 基线：无Fisher归一化，v=原始梯度；无动态步长，eta=固定学习率
+                                v_baseline = p.grad
+                                eta_baseline = lr_base
+                                # 与自适应模式相同的手动更新方式（保证公平性）
+                                p.add_(-eta_baseline * v_baseline)
 
-                            B_round[name] = B_round[name] + gain
+                    # ==============================================
+                    # 仅添加：记录当前batch耗时（跳过热身batch）
+                    # ==============================================
+                    batch_end = time.perf_counter()
+                    batch_time_ms = (batch_end - batch_start) * 1000  # 转毫秒
+                    # 跳过热身batch（第一个batch可能含GPU初始化耗时）
+                    if (epoch == 0 and step >= warmup_skip) or epoch > 0:
+                        batch_times.append(batch_time_ms)
+                        # 每10个batch打印一次耗时（可选，便于实时观察）
+                        if step % 10 == 0:
+                            avg_curr = np.mean(batch_times) if batch_times else 0.0
+                            logger.info(f"Batch [{step + 1}] 耗时：{batch_time_ms:.2f} ms | 累计平均：{avg_curr:.2f} ms")
 
-                            # 半径更新：r^2 = r^2 - 2η b + η^2 a
-                            # r2[name] = r2[name] - 2.0 * eta * b_val + (eta * eta) * a
-
-                            r2[name] = r2[name] - 2.0 * eta * b_raw + (eta * eta) * a_raw
-
-                            # 参数更新
-                            p.add_(-eta * v)
-
-
-            # ====== Step-3 ======
-            F_round = {n: 0.5 * torch.clamp(r2[n] - r2_start[n], min=0.0) for n in r2}
-            p_round = {n: conf[n] / max(actual_steps, 1) for n in conf}  # ←← 用真实步数
-
-            # --- 轮内稳健归一 + 自适应 λ ---
-
-            # eps = 1e-8
-            # names = list(B_round.keys())
-            # b_vals = torch.tensor([B_round[n].item() for n in names])
-            # c_vals = torch.tensor([(p_round[n] * F_round[n]).item() for n in names])
-            #
-            # # 分位数归一
-            # med_b = torch.quantile(b_vals, 0.5)
-            # med_c = torch.quantile(c_vals, 0.5) if (c_vals > 0).any() else torch.tensor(1.0)
-            #
-            # def norm_b(x):
-            #     return x / (med_b + eps)
-            #
-            # def norm_c(x):
-            #     return x / (med_c + eps)
-            #
-            # # 自适应 λ
-            # lambda_base = getattr(self, "lambda_conf", 1.0)
-            # lambda_eff = float(lambda_base) * float(med_b / (med_c + eps))
-            #
-            # # B 的 p95 截断，抑制异常层
-            # b_cap = torch.quantile(b_vals, 0.95).item()
-            # for n in names:
-            #     B_round[n] = torch.clamp(B_round[n], max=b_cap)
-            #
-            # # 构建背包价值与成本
-            # values, costs = [], []
-            # for n in names:
-            #     b = norm_b(B_round[n])
-            #     c = norm_c(p_round[n] * F_round[n])
-            #     v = float(b - lambda_eff * c)
-            #     values.append(v)
-            #     costs.append(int(self.layer_costs.get(n, 1)))
-            #
-            # selected = _knapsack(values, costs, self.comm_budget)
-
-
-            # select layer update
-            values, costs, names = [], [], []
-            for name in B_round:
-                val = (B_round[name] - self.lambda_conf * p_round[name] * F_round[name]).item()
-                values.append(val)
-                costs.append(int(self.layer_costs.get(name, 1)))
-                names.append(name)
-            selected = _knapsack(values, costs, self.comm_budget)
-
-            # 1) 选层打包（你现有的）
-            delta = {}
             state_dict = model.state_dict()
-            for name, sel in zip(names, selected):
-                local_param = state_dict[name].detach().cpu()
-                delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
+            if len(batch_times) > 0:
+                avg_batch_time = np.mean(batch_times)
+                std_batch_time = np.std(batch_times)
 
-            # 2) 本轮 Fisher（保持你现有的）
-            F_client = {k: v.detach().cpu() for k, v in F_curr.items()}
+                # ==============================================
+                # 关键修改：文件名加入客户端ID（cid），确保唯一性
+                # ==============================================
+                # 文件名格式：[模式]_task[任务ID]_cid[客户端ID]_batch_times.npy
+                save_filename = (
+                    f"{'adaptive' if use_adaptive_logic else 'baseline'}"
+                    f"_task{task_id}_cid{cid}_batch_times.npy"
+                )
+                save_path = os.path.join(self.args.output_dir, save_filename)
+                np.save(save_path, batch_times)
 
-            # 3) 本轮结束时该客户端的 θ*（只取可训练/LoRA keys）
+                # 日志中增加客户端ID信息，便于追踪
+                logger.info(
+                    f"\n===== 训练结束 | 模式：{'自适应' if use_adaptive_logic else '基线'} | 客户端ID：{cid} =====")
+                logger.info(f"总有效batch数：{len(batch_times)}")
+                logger.info(f"平均batch耗时：{avg_batch_time:.2f} ms（±{std_batch_time:.2f} ms）")
+                logger.info(f"时间数据保存至：{save_path}")
+            else:
+                logger.warning(f"客户端ID：{cid} 无有效batch时间记录（可能所有batch都被视为热身）")
+                avg_batch_time = 0.0
+
+            delta = {}
+            F_client = {}
+            # 新增：通信时间计算相关参数（带宽单位：MB/s，默认100MB/s；固定开销单位：秒）
+            comm_bandwidth = self.comm_bandwidth if hasattr(self, 'comm_bandwidth') else 100.0
+            comm_fixed_cost = self.comm_fixed_cost if hasattr(self, 'comm_fixed_cost') else 0.1
+            baseline_comm_time = 0.0
+            adaptive_comm_time = 0.0
+            save_time = 0.0
+
+            # 辅助函数：计算通信数据量（字节）和时间（秒）
+            def calculate_comm_metrics(param_dict: Dict[str, torch.Tensor]) -> Tuple[float, int]:
+                total_bytes = 0
+                for param in param_dict.values():
+                    # 计算参数总字节数（元素数 × 每个元素字节数，float32为4字节）
+                    total_bytes += param.numel() * param.element_size()
+                # 转换带宽单位：MB/s → 字节/秒（1MB = 1024×1024字节）
+                bandwidth_bytes_per_sec = comm_bandwidth * 1024 * 1024
+                # 通信时间 = 数据传输时间 + 固定开销
+                comm_time = (total_bytes / bandwidth_bytes_per_sec) + comm_fixed_cost
+                return comm_time, total_bytes
+
+            if use_adaptive_logic:
+                # ====== Step-3：选层与通信计算 ======
+                F_round = {n: 0.5 * torch.clamp(r2[n] - r2_start[n], min=0.0) for n in r2}
+                p_round = {n: conf[n] / max(actual_steps, 1) for n in conf}  # 用真实步数计算冲突占比
+
+                # 背包算法选层
+                values, costs, names = [], [], []
+                for name in B_round:
+                    val = (B_round[name] - self.lambda_conf * p_round[name] * F_round[name]).item()
+                    values.append(val)
+                    costs.append(int(self.layer_costs.get(name, 1)))
+                    names.append(name)
+                selected = _knapsack(values, costs, self.comm_budget)
+
+                # 1) 自适应模式：仅传输选中层的delta
+                state_dict = model.state_dict()
+                adaptive_delta = {}
+                for name, sel in zip(names, selected):
+                    local_param = state_dict[name].detach().cpu()
+                    # 仅选中的层传输真实delta，未选中的层传输零（不实际传输，仅占位）
+                    adaptive_delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
+                delta = adaptive_delta
+
+                # 计算自适应模式通信时间
+                adaptive_comm_time, adaptive_bytes = calculate_comm_metrics(
+                    {k: v for k, v in delta.items() if not v.equal(torch.zeros_like(v))}  # 过滤零值delta
+                )
+
+                # 2) 计算基线模式通信时间（传输所有可训练参数的delta）
+                baseline_delta = {}
+                for name, p in model.named_parameters():
+                    if name in base_params and p.requires_grad:
+                        local_param = state_dict[name].detach().cpu()
+                        baseline_delta[name] = base_params[name] - local_param
+                baseline_comm_time, baseline_bytes = calculate_comm_metrics(baseline_delta)
+
+                # 计算节省的通信时间
+                save_time = baseline_comm_time - adaptive_comm_time
+
+                # 日志输出通信统计
+                logger.info(
+                    f"通信统计 - 自适应模式: {adaptive_bytes / (1024 * 1024):.2f} MB, 时间: {adaptive_comm_time:.4f}秒\n"
+                    f"通信统计 - 基线模式: {baseline_bytes / (1024 * 1024):.2f} MB, 时间: {baseline_comm_time:.4f}秒\n"
+                    f"通信节省时间: {save_time:.4f}秒 (节省比例: {save_time / baseline_comm_time * 100:.2f}%)"
+                )
+
+                # 3) 本轮Fisher计算
+                F_client = {k: v.detach().cpu() for k, v in F_curr.items()}
+            else:
+                # 基线模式：传输所有可训练参数的delta
+                state_dict = model.state_dict()
+                baseline_delta = {}
+                for name, p in model.named_parameters():
+                    if name in base_params and p.requires_grad:
+                        local_param = state_dict[name].detach().cpu()
+                        baseline_delta[name] = base_params[name] - local_param
+                delta = baseline_delta
+
+                # 计算基线模式通信时间（自适应模式未启用，节省时间为0）
+                baseline_comm_time, baseline_bytes = calculate_comm_metrics(baseline_delta)
+                adaptive_comm_time = 0.0
+
+                logger.info(
+                    f"通信统计 - 基线模式: {baseline_bytes / (1024 * 1024):.2f} MB, 时间: {baseline_comm_time:.4f}秒"
+                )
+
+                F_client = {k: torch.zeros_like(v) for k, v in base_params.items()}
+
+            # 4) 本轮结束时该客户端的θ*（只取可训练/LoRA参数）
             theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
 
+            # 返回值新增通信节省时间
             return delta, F_client, theta_last
 
     def evaluation_loop(

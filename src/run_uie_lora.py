@@ -199,14 +199,14 @@ class DataTrainingArguments:
         },
     )
     max_eval_samples: Optional[int] = field(
-        default=500,
+        default=1000,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
                     "value if set."
         },
     )
     max_predict_samples: Optional[int] = field(
-        default=500,
+        default=1000,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
                     "value if set."
@@ -247,6 +247,8 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     lamda_1: float = field(default=0.5)
     lamda_2: float = field(default=0)
     method: str = field(default="lora_origin", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
+    uplink_mbps: str = field(default="10,100", metadata={"help": "逗号分隔的上行带宽(Mbps)，用于计算通信节省时间下界"})
+    packet_bytes: int = field(default=1500, metadata={"help": "每个传输包的有效负载字节数"})
 
 @dataclass
 class FederatedArguments:
@@ -268,7 +270,7 @@ class FederatedArguments:
         metadata={"help": "Total number of global federated rounds."},
     )
     local_epochs: int = field(
-        default=5,
+        default=1,
         metadata={"help": "Local training epochs for each selected client."},
     )
     dirichlet_alpha: float = field(
@@ -282,7 +284,7 @@ class FederatedArguments:
     )
 # ---------- Continual FL hyperparameters ----------
     comm_budget: Optional[int] = field(
-        default=1440,
+        default=1200,
         metadata={
             "help": "Maximum upload cost per round. None means all LoRA layers are sent."
         },
