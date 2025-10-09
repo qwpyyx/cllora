@@ -5,18 +5,18 @@ export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export TRANSFORMERS_CACHE=/home/qiuwenqi/.cache/huggingface
 
 port=$(shuf -i25000-30000 -n1)
-lora_rank=32
+lora_rank=16
 lamda_2=0
 lamda_1=0
  # Order 4
 # bash scripts/long.sh> logs_and_outputs/long/logs/train_and_infer.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=2 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path /home/qiuwenqi/LLM/models/t5-base \
+   --model_name_or_path /home/qiuwenqi/LLM/models/t5-large \
    --data_dir CL_Benchmark \
    --task_config_dir configs/order4_configs/MNLI \
    --instruction_file configs/instruction_config.json \

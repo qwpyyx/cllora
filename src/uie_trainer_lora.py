@@ -1,3 +1,6 @@
+import logging
+import os
+import time
 from typing import Any, Dict, List, Tuple, Union
 import numpy as np
 import torch
@@ -8,9 +11,8 @@ from transformers.trainer_callback import TrainerCallback
 from fed_continual_state import ContinualState
 from uie_collator import SUPPORTED_DECODER_MODELS, check_model
 from uie_dataset_lora import ANSWER_PREFIX
-from collections import deque
-from tqdm.auto import tqdm
-import torch.nn.utils as utils
+
+# logger = logging.getLogger(__name__)
 
 def _knapsack(values: List[float], costs: List[int], budget: int) -> List[bool]:
     """0/1 knapsack dynamic programming."""
@@ -131,6 +133,7 @@ class UIETrainer(Seq2SeqTrainer):
         self.deepspeed_engine = None
         self.lambda_conf = 1.0  # 可选：背包里的 λ
         self.method = self.args.method
+        self._force_sgd = False
 
     def _init_deepspeed(self):
         """初始化DeepSpeed引擎（修复属性名+配置格式转换）"""
@@ -190,6 +193,7 @@ class UIETrainer(Seq2SeqTrainer):
             # 算前向loss
             loss = self.compute_loss(model, inputs)
 
+
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
@@ -232,6 +236,10 @@ class UIETrainer(Seq2SeqTrainer):
         else:
             loss.backward()
 
+        if self.state.global_step % 1 == 0:  # 每10步打印一次损失
+            self.log({"train_loss": loss.item()})  # 关键修改：用字典封装指标
+
+
         return loss.detach()
 
     def train(
@@ -242,14 +250,16 @@ class UIETrainer(Seq2SeqTrainer):
         **kwargs,
     ):  # type: ignore[override]
 
+        if self.method == "lora_origin":
+            return super().train(**kwargs)
+
+
+        ########################adaLR###########################
         if not hasattr(self, "_eta_scale"):
             self._eta_scale = {}  # per-parameter EMA 的 s
         self._eta_scale_rho = getattr(self, "eta_scale_rho", 0.1)  # EMA 系数，0.05~0.2
         self._eta_smin = getattr(self, "eta_smin", 0.1)  # 缩放下界
         self._eta_smax = getattr(self, "eta_smax", 10.0)  # 缩放上界
-
-        if self.method == "lora_origin":
-            return super().train(**kwargs)
 
 
         if self.method == "adaptive" and task_id == 1:
@@ -271,8 +281,8 @@ class UIETrainer(Seq2SeqTrainer):
 
             # --------------Train---------------
             use_adaptive_logic = True  # 切换：False=基线模式，True=自适应模式
-            batch_times = []  # 存储每个batch的训练耗时（毫秒）
-            warmup_skip = 1  # 跳过第一个batch（GPU热身时间，避免干扰统计）
+            # batch_times = []  # 存储每个batch的训练耗时（毫秒）
+            # warmup_skip = 1  # 跳过第一个batch（GPU热身时间，避免干扰统计）
             logger.info(f"===== 开始训练 | 模式：{'自适应' if use_adaptive_logic else '基线'} | Task {task_id} =====")
 
             model = self.model
@@ -283,21 +293,12 @@ class UIETrainer(Seq2SeqTrainer):
             # 工程
             F_curr = None
             bar_F_raw = None
-            bar_B_raw = None
             bar_theta = {}
-            # bar_F_eff, bar_B_eff = {}, {}
-            #scale_s, calibrated = {}, False
-            #S_MIN, S_MAX, EPS_S = 0.1, 1000.0, 1e-12  # 原代码参数
             r2, r2_start = {}, {}
             B_round, conf = {}, {}
 
             if use_adaptive_logic:
-                # 初始化F_curr为小正值，提升稳定性
-                # F_curr = {
-                #     n: 1e-3 * torch.ones_like(p, device=device)  # 初始化为1e-6，而非0
-                #     for n, p in model.named_parameters()
-                #     if p.requires_grad
-                # }
+
                 F_curr = {
                     n: torch.zeros_like(p, device=device)  # 令F_curr^l = 0
                     for n, p in model.named_parameters()
@@ -331,8 +332,6 @@ class UIETrainer(Seq2SeqTrainer):
                     # conf_ℓ = 0（冲突次数统计）
                     conf[name] = 0
 
-
-
             else:
                 # 基线模式：仅初始化“手动更新必要参数”（无多余代码）
                 lr_base = self.args.learning_rate  # 基线用固定学习率（与自适应lr_cap一致）
@@ -345,10 +344,6 @@ class UIETrainer(Seq2SeqTrainer):
             num_epochs = int(self.args.num_train_epochs)
             steps_per_epoch = len(dataloader)
             actual_steps = 0  # 真实已处理的 mini-batch 数（用于 p_round 分母）
-
-
-
-
 
             # /*-------------Begin train------------
             for epoch in range(num_epochs):
@@ -387,42 +382,64 @@ class UIETrainer(Seq2SeqTrainer):
                             for name, p in model.named_parameters():
                                 if not p.requires_grad or p.grad is None:
                                     continue
+
+                                # Step 1
                                 g = p.grad
                                 F_batch = g * g
                                 F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
-                                # --------------------------
-                                # 算法步骤7：计算 v_B^(ℓ)、a_B^(ℓ)、b_B^(ℓ)、Δ_ℓ
-                                # --------------------------
-                                # 1. v_B^(ℓ) = g_B^(ℓ) ⊘ F_curr^(ℓ)（加1e-8避免除零）
                                 F_curr_safe = F_curr[name] + 1e-8  # 算法隐含：避免F_curr为0导致除零
+
+
+                                # Step 2
                                 v = g / F_curr_safe
                                 # 2. 过去任务Fisher（bar_F^(ℓ)）
                                 f_past = bar_F_raw.get(name, torch.zeros_like(p))
                                 # 3. 当前参数与过去最优参数的差：Δθ = θ^(ℓ) - bar_theta^(ℓ)
                                 delta_theta = p - bar_theta.get(name, torch.zeros_like(p))
                                 # 4. a_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * v_B^(ℓ)
+                                # TODO
                                 a_raw = (v * f_past * v).sum()
                                 # 5. b_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * Δθ
                                 b_raw = (v * f_past * delta_theta).sum()
                                 # 6. 半径余量 Δ_ℓ = R² - r²_ℓ
                                 Delta = (self.radius ** 2) - r2[name]
 
+                                if Delta.item() <= self.tau:
+                                    eta = torch.zeros(1, device=device, dtype=p.dtype).squeeze()
+                                else:
+                                    a_safe = torch.clamp(a_raw, min=1e-12)
+                                    Delta_eff = torch.clamp(Delta - self.tau, min=0.0)
+
+
+
                                 # --------------------------
                                 # 算法步骤8：冲突判断与步长计算
                                 # --------------------------
-                                if b_raw.item() < 0.0:  # 冲突层：b_B^(ℓ) < 0（新旧任务方向冲突）
+                                    if b_raw.item() < 0.0:  # 冲突层：b_B^(ℓ) < 0（新旧任务方向冲突）
                                     # 闭式步长公式（严格按算法）：
-                                    term_u = b_raw - self.sigma
-                                    discriminant = term_u ** 2 + self.beta * a_raw * (Delta - self.tau)
-                                    discriminant = torch.clamp(discriminant, min=0.0)  # 确保开方非负
-                                    eta_closed = (term_u + torch.sqrt(discriminant)) / (self.beta * a_raw + 1e-8)
-                                    # 步长上限：不超过初始学习率 η₀
-                                    eta = torch.minimum(eta_closed, torch.tensor(self.args.learning_rate, device=device))
-                                    # 记录冲突次数 conf_ℓ += 1
-                                    conf[name] += 1
+                                        term_u = b_raw - self.sigma
+                                        discriminant = term_u ** 2 + self.beta * a_safe * Delta_eff
+                                        discriminant = torch.clamp(discriminant, min=0.0)  # 确保开方非负
+                                        eta_closed = (term_u + torch.sqrt(discriminant)) / (self.beta * a_raw + 1e-12)
+                                        # 步长上限：不超过初始学习率 η₀
+                                        eta = torch.minimum(eta_closed,
+                                                            torch.tensor(self.args.learning_rate, device=device, dtype=p.dtype))
+                                        if eta.item() > 0:
+                                            conf[name] += 1
+
                                     # logger.info(f"[{name}] 冲突层 | 步长: {float(eta):.6g} | 冲突次数: {conf[name]}")
-                                else:  # 非冲突层：步长 = 初始学习率 η₀
-                                    eta = torch.tensor(self.args.learning_rate, device=device)
+                                    else:
+                                        eta_trust = torch.sqrt(Delta_eff / (a_safe + 1e-12))
+                                        eta = torch.clamp(
+                                            eta_trust,
+                                            max=torch.as_tensor(self.args.learning_rate, device=device, dtype=p.dtype),
+                                        )
+
+
+                                    # 确保 eta 为标量并非 NaN
+                                    if torch.isnan(eta):
+                                        eta = torch.zeros(1, device=device, dtype=p.dtype).squeeze()
+
 
                                 # --------------------------
                                 # 算法步骤9：累计收益 B^round_ℓ
@@ -442,7 +459,8 @@ class UIETrainer(Seq2SeqTrainer):
                                 # --------------------------
                                 # 算法步骤11：更新参数 θ^(ℓ) = θ^(ℓ) - η·v_B^(ℓ)
                                 # --------------------------
-                                p.add_(-eta * v)
+                                if eta.item() != 0.0:
+                                    p.add_(-eta * v)
 
 
 
@@ -607,53 +625,12 @@ class UIETrainer(Seq2SeqTrainer):
                                 # 与自适应模式相同的手动更新方式（保证公平性）
                                 p.add_(-eta_baseline * v_baseline)
 
-                    # ==============================================
-                    # 仅添加：记录当前batch耗时（跳过热身batch）
-                    # ==============================================
-                    batch_end = time.perf_counter()
-                    batch_time_ms = (batch_end - batch_start) * 1000  # 转毫秒
-                    # 跳过热身batch（第一个batch可能含GPU初始化耗时）
-                    if (epoch == 0 and step >= warmup_skip) or epoch > 0:
-                        batch_times.append(batch_time_ms)
-                        # 每10个batch打印一次耗时（可选，便于实时观察）
-                        if step % 10 == 0:
-                            avg_curr = np.mean(batch_times) if batch_times else 0.0
-                            logger.info(f"Batch [{step + 1}] 耗时：{batch_time_ms:.2f} ms | 累计平均：{avg_curr:.2f} ms")
 
-            state_dict = model.state_dict()
-            if len(batch_times) > 0:
-                avg_batch_time = np.mean(batch_times)
-                std_batch_time = np.std(batch_times)
 
-                # ==============================================
-                # 关键修改：文件名加入客户端ID（cid），确保唯一性
-                # ==============================================
-                # 文件名格式：[模式]_task[任务ID]_cid[客户端ID]_batch_times.npy
-                save_filename = (
-                    f"{'adaptive' if use_adaptive_logic else 'baseline'}"
-                    f"_task{task_id}_cid{cid}_batch_times.npy"
-                )
-                save_path = os.path.join(self.args.output_dir, save_filename)
-                np.save(save_path, batch_times)
 
-                # 日志中增加客户端ID信息，便于追踪
-                logger.info(
-                    f"\n===== 训练结束 | 模式：{'自适应' if use_adaptive_logic else '基线'} | 客户端ID：{cid} =====")
-                logger.info(f"总有效batch数：{len(batch_times)}")
-                logger.info(f"平均batch耗时：{avg_batch_time:.2f} ms（±{std_batch_time:.2f} ms）")
-                logger.info(f"时间数据保存至：{save_path}")
-            else:
-                logger.warning(f"客户端ID：{cid} 无有效batch时间记录（可能所有batch都被视为热身）")
-                avg_batch_time = 0.0
 
-            delta = {}
-            F_client = {}
-            # 新增：通信时间计算相关参数（带宽单位：MB/s，默认100MB/s；固定开销单位：秒）
-            comm_bandwidth = self.comm_bandwidth if hasattr(self, 'comm_bandwidth') else 100.0
-            comm_fixed_cost = self.comm_fixed_cost if hasattr(self, 'comm_fixed_cost') else 0.1
-            baseline_comm_time = 0.0
-            adaptive_comm_time = 0.0
-            save_time = 0.0
+
+
 
             # 辅助函数：计算通信数据量（字节）和时间（秒）
             def calculate_comm_metrics(param_dict: Dict[str, torch.Tensor]) -> Tuple[float, int]:
@@ -661,6 +638,8 @@ class UIETrainer(Seq2SeqTrainer):
                 for param in param_dict.values():
                     # 计算参数总字节数（元素数 × 每个元素字节数，float32为4字节）
                     total_bytes += param.numel() * param.element_size()
+                if total_bytes == 0:
+                    return 0.0, 0
                 # 转换带宽单位：MB/s → 字节/秒（1MB = 1024×1024字节）
                 bandwidth_bytes_per_sec = comm_bandwidth * 1024 * 1024
                 # 通信时间 = 数据传输时间 + 固定开销
@@ -677,44 +656,62 @@ class UIETrainer(Seq2SeqTrainer):
                 for name in B_round:
                     val = (B_round[name] - self.lambda_conf * p_round[name] * F_round[name]).item()
                     values.append(val)
-                    costs.append(int(self.layer_costs.get(name, 1)))
+                    costs.append(max(int(self.layer_costs.get(name, 1)), 1))
                     names.append(name)
-                selected = _knapsack(values, costs, self.comm_budget)
+                #selected = _knapsack(values, costs, self.comm_budget)
+
+                total_cost = sum(costs)
+                budget = self.comm_budget if self.comm_budget is not None else total_cost
+                if budget >= total_cost:
+                    selected_flags = [True] * len(names)
+                else:
+                    selected_flags = _knapsack(values, costs, budget)
+                selection_map = {n: f for n, f in zip(names, selected_flags)}
+
 
                 # 1) 自适应模式：仅传输选中层的delta
                 state_dict = model.state_dict()
                 adaptive_delta = {}
-                for name, sel in zip(names, selected):
+                for name in base_params:
                     local_param = state_dict[name].detach().cpu()
                     # 仅选中的层传输真实delta，未选中的层传输零（不实际传输，仅占位）
-                    adaptive_delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
+                    #adaptive_delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
+                    if selection_map.get(name, True):
+                        adaptive_delta[name] = base_params[name] - local_param
+                    else:
+                        adaptive_delta[name] = torch.zeros_like(local_param)
+
                 delta = adaptive_delta
 
-                # 计算自适应模式通信时间
-                adaptive_comm_time, adaptive_bytes = calculate_comm_metrics(
-                    {k: v for k, v in delta.items() if not v.equal(torch.zeros_like(v))}  # 过滤零值delta
-                )
-
-                # 2) 计算基线模式通信时间（传输所有可训练参数的delta）
-                baseline_delta = {}
-                for name, p in model.named_parameters():
-                    if name in base_params and p.requires_grad:
-                        local_param = state_dict[name].detach().cpu()
-                        baseline_delta[name] = base_params[name] - local_param
-                baseline_comm_time, baseline_bytes = calculate_comm_metrics(baseline_delta)
-
-                # 计算节省的通信时间
-                save_time = baseline_comm_time - adaptive_comm_time
-
-                # 日志输出通信统计
-                logger.info(
-                    f"通信统计 - 自适应模式: {adaptive_bytes / (1024 * 1024):.2f} MB, 时间: {adaptive_comm_time:.4f}秒\n"
-                    f"通信统计 - 基线模式: {baseline_bytes / (1024 * 1024):.2f} MB, 时间: {baseline_comm_time:.4f}秒\n"
-                    f"通信节省时间: {save_time:.4f}秒 (节省比例: {save_time / baseline_comm_time * 100:.2f}%)"
-                )
+                # # 计算自适应模式通信时间
+                # adaptive_comm_time, adaptive_bytes = calculate_comm_metrics(
+                #     {k: v for k, v in delta.items() if torch.count_nonzero(v).item() > 0}
+                # )
+                #
+                # # 2) 计算基线模式通信时间（传输所有可训练参数的delta）
+                # baseline_delta = {}
+                # for name, p in model.named_parameters():
+                #     if name in base_params and p.requires_grad:
+                #         local_param = state_dict[name].detach().cpu()
+                #         baseline_delta[name] = base_params[name] - local_param
+                # baseline_comm_time, baseline_bytes = calculate_comm_metrics(baseline_delta)
+                #
+                # # 计算节省的通信时间
+                # save_time = baseline_comm_time - adaptive_comm_time
+                # save_ratio = (save_time / baseline_comm_time * 100.0) if baseline_comm_time > 0 else 0.0
+                #
+                # # 日志输出通信统计
+                # logger.info(
+                #     f"通信统计 - 自适应模式: {adaptive_bytes / (1024 * 1024):.2f} MB, 时间: {adaptive_comm_time:.4f}秒\n"
+                #     f"通信统计 - 基线模式: {baseline_bytes / (1024 * 1024):.2f} MB, 时间: {baseline_comm_time:.4f}秒\n"
+                #     f"通信节省时间: {save_time:.4f}秒 (节省比例: {save_ratio:.2f}%)"
+                # )
 
                 # 3) 本轮Fisher计算
-                F_client = {k: v.detach().cpu() for k, v in F_curr.items()}
+                F_client = {
+                    k: F_curr.get(k, torch.zeros_like(state_dict[k])).detach().cpu()
+                    for k in base_params
+                }
             else:
                 # 基线模式：传输所有可训练参数的delta
                 state_dict = model.state_dict()
@@ -736,10 +733,13 @@ class UIETrainer(Seq2SeqTrainer):
                 F_client = {k: torch.zeros_like(v) for k, v in base_params.items()}
 
             # 4) 本轮结束时该客户端的θ*（只取可训练/LoRA参数）
-            theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+            theta_last = {k: state_dict[k].detach().cpu() for k in base_params.keys()}
 
             # 返回值新增通信节省时间
             return delta, F_client, theta_last
+
+
+
 
     def evaluation_loop(
         self,
