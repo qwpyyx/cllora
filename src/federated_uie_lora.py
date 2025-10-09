@@ -464,7 +464,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     F_full = compute_fisher(
                         local_model,
                         trainer.get_train_dataloader(),
-                        engine=deepspeed_engine  # 关键：传入DeepSpeed引擎
+                        engine=deepspeed_engine
                     )
                     F_client = {
                         k: F_full.get(k, torch.zeros_like(global_state_cpu[k]))
