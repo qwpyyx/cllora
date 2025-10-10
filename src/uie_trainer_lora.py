@@ -160,7 +160,7 @@ class UIETrainer(Seq2SeqTrainer):
         sigma: float = 0.0,
         tau: float = 0.0,
         beta: float = 1.0,
-        alpha: float = 0.5,
+        alpha: float = 0.1,
         comm_bandwidth: float = 1.0,
         comm_fixed_cost: float = 0.0,
         comm_budget: int = 0,
@@ -443,6 +443,13 @@ class UIETrainer(Seq2SeqTrainer):
                                 # 2. 过去任务Fisher（bar_F^(ℓ)）
                                 f_past = bar_F_raw.get(name, torch.zeros_like(p))
 
+                                # Fisher 信息的绝对量级不影响 “参数重要性的区分”，仅相对比例有意义
+                                if torch.any(f_past > 0):
+                                    f_past_mean = torch.mean(f_past)
+                                    if f_past_mean > 0:
+                                        f_past = f_past / f_past_mean  # 归一化，让f_past均值为1
+
+
                                 scale = 1.0
                                 if torch.is_tensor(f_past) and torch.numel(f_past) > 0 and torch.any(f_past > 0):
                                     curr_mean = torch.mean(F_curr_safe).item()
@@ -466,7 +473,8 @@ class UIETrainer(Seq2SeqTrainer):
                                 # std_v = torch.clamp(std_v, min=1e-8)  # 防止除零
                                 # scale_v = std_g / std_v  # 计算缩放因子
                                 mean_g = torch.mean(torch.abs(g))
-                                mean_v = torch.mean(torch.abs(v))
+                                # mean_v = torch.mean(torch.abs(v))
+                                mean_v = torch.median(torch.abs(v))
                                 mean_v = torch.clamp(mean_v, min=1e-8)  # 防止除零
                                 scale_v = mean_g / mean_v  # 用均值比计算缩放因子
                                 v_scaled = v * scale_v  # 缩放后的v，量级与g一致
@@ -475,7 +483,8 @@ class UIETrainer(Seq2SeqTrainer):
                                 scale_tensor = torch.as_tensor(scale, device=device, dtype=p.dtype)
                                 # v_alg 对应“算法中的 v_B^(ℓ)”，后续 a/b/Q 等均基于该无缩放版本计算，
                                 # 只在最终更新时再与 scale_tensor 结合，保持量纲一致。
-                                v_alg = v_scaled / scale_tensor
+                                # v_alg = v_scaled / scale_tensor
+                                v_alg = v_scaled
 
                                 # 3. 当前参数与过去最优参数的差：Δθ = θ^(ℓ) - bar_theta^(ℓ)
                                 delta_theta = p - bar_theta.get(name, torch.zeros_like(p))
@@ -501,7 +510,7 @@ class UIETrainer(Seq2SeqTrainer):
                                         term_u = b_raw_alg - self.sigma
                                         discriminant = term_u ** 2 + self.beta * a_safe * Delta_eff
                                         discriminant = torch.clamp(discriminant, min=0.0)  # 确保开方非负
-                                        eta_closed = (term_u + torch.sqrt(discriminant)) / (self.beta * a_safe + 1e-12)
+                                        eta_closed = (term_u + torch.sqrt(discriminant)) / (self.beta * a_safe + 1e-6)
                                         # 步长上限：不超过初始学习率 η₀
                                         eta_alg = torch.minimum(
                                             eta_closed,
@@ -510,7 +519,7 @@ class UIETrainer(Seq2SeqTrainer):
                                         if eta_alg.item() > 0:
                                             conf[name] += 1
                                     else:
-                                        eta_trust = torch.sqrt(Delta_eff / (a_safe + 1e-12))
+                                        eta_trust = torch.sqrt(Delta_eff / (a_safe + 1e-6))
                                         eta_alg = torch.clamp(
                                             eta_trust,
                                             max=torch.as_tensor(self.args.learning_rate, device=device, dtype=p.dtype),
