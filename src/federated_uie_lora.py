@@ -20,7 +20,7 @@ import transformers
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 from uie_collator import DataCollatorForUIE
-from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions, compute_fisher
+from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions, compute_fisher, compute_fisher_arithmetic
 from compute_metrics import compute_metrics, compute_grouped_metrics
 from model.llama import LlamaForCausalLM_with_lossmask
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
@@ -461,16 +461,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         k: global_state_cpu[k] - state_dict[k].detach().cpu()
                         for k in lora_keys
                     }
-                    F_full = compute_fisher(
-                        local_model,
-                        trainer.get_train_dataloader(),
-                        engine=deepspeed_engine
-                    )
-                    F_client = {
-                        k: F_full.get(k, torch.zeros_like(global_state_cpu[k]))
-                        for k in lora_keys
-                    }
+
+                    # 新增：选择Fisher计算方式（通过参数控制，默认用原有EMA）
+                    use_arithmetic_fisher = getattr(fed_args, "use_arithmetic_fisher", False)
+                    if use_arithmetic_fisher:
+                        # 调用新的算术平均Fisher函数
+                        F_client = compute_fisher_arithmetic(local_model, trainer.get_train_dataloader())
+                    else:
+                        # 保留原有EMA方式
+                        F_client = compute_fisher(local_model, trainer.get_train_dataloader())
+
+                    # 确保F_client与base_params对齐（原有逻辑不变）
+                    F_client = {k: F_client.get(k, torch.zeros_like(global_state_cpu[k])) for k in lora_keys}
                     theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+
                 else:
                     trainer = UIETrainer(
                         model=local_model,

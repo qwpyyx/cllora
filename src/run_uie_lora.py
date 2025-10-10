@@ -292,6 +292,11 @@ class FederatedArguments:
         },
     )
 
+    use_arithmetic_fisher: str = field(
+        default="False",
+        metadata={"help": "Training mode: centralized or federated"},
+    )
+
 
 def main():
     # sys.modules['mpi4py'] = None
