@@ -36,8 +36,3 @@ class ContinualState:
         """判断是否包含有效的历史信息（如 Fisher 矩阵）"""
         return hasattr(self, 'bar_F') and self.bar_F is not None and len(self.bar_F) > 0
 
-    def append_eta_history(self, eta_batch: Dict[str, float]) -> None:
-        for layer_name, eta_val in eta_batch.items():
-            if layer_name not in self.eta_history:
-                self.eta_history[layer_name] = []
-            self.eta_history[layer_name].append(eta_val)
