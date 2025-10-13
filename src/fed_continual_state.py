@@ -1,8 +1,7 @@
 import os
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, List
 import torch
-
 
 @dataclass
 class ContinualState:

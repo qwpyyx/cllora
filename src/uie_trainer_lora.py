@@ -373,6 +373,28 @@ class UIETrainer(Seq2SeqTrainer):
                     f_past = bar_F_raw.get(name, torch.zeros_like(p))  # 过去任务Fisher
                     theta_curr = p  # 当前层参数θ^(ℓ)
                     theta_past = bar_theta.get(name, torch.zeros_like(p))  # 过去最优参数bar_theta^(ℓ)
+
+                    # 计算核心变量
+                    delta_theta = theta_curr - theta_past  # 偏移量：θ - bar_θ
+                    delta_sq_mean = torch.mean(delta_theta.pow(2)).item()  # 偏移平方的均值（反映整体偏移程度）
+                    bar_F_mean = torch.mean(f_past).item()  # bar_F的均值（反映历史累积量级）
+                    r_sq = ((delta_theta.pow(2) * f_past).sum()).item()  # 当前r²_ℓ的值
+                    r_sq_threshold = self.radius ** 2  # R²（半径阈值）
+
+                    # 打印关键信息（使用logger或print，建议用logger）
+                    # logger.info(
+                    #     f"任务{task_id} | 层{name} | "
+                    #     f"偏移平方均值: {delta_sq_mean:.6f} | "
+                    #     f"bar_F均值: {bar_F_mean:.6f} | "
+                    #     f"r²_ℓ: {r_sq:.6f} | "
+                    #     f"R²阈值: {r_sq_threshold:.6f} | "
+                    #     f"Delta: {r_sq_threshold - r_sq:.6f}"  # 直接显示Delta值
+                    # )
+
+
+
+
+                    # TODO task3时，task2的做了归一化，task3没做，因此需要保存的时候就是归一化状态，把归一化那个融进保存里面
                     r2[name] = ((theta_curr - theta_past).pow(2) * f_past).sum()
                     # r²_ℓ,start = r²_ℓ（记录初始半径）
                     r2_start[name] = r2[name].clone()
@@ -444,6 +466,7 @@ class UIETrainer(Seq2SeqTrainer):
                                 f_past = bar_F_raw.get(name, torch.zeros_like(p))
 
                                 # Fisher 信息的绝对量级不影响 “参数重要性的区分”，仅相对比例有意义
+                                # TODO 问题就出现在这里，有归一化跟没有是不一样的结果。但是没有归一化的时候也不是所有delta都大于0，要排查
                                 if torch.any(f_past > 0):
                                     f_past_mean = torch.mean(f_past)
                                     if f_past_mean > 0:
@@ -480,7 +503,7 @@ class UIETrainer(Seq2SeqTrainer):
                                 v_scaled = v * scale_v  # 缩放后的v，量级与g一致
                                 ####################################################
 
-                                scale_tensor = torch.as_tensor(scale, device=device, dtype=p.dtype)
+                                # scale_tensor = torch.as_tensor(scale, device=device, dtype=p.dtype)
                                 # v_alg 对应“算法中的 v_B^(ℓ)”，后续 a/b/Q 等均基于该无缩放版本计算，
                                 # 只在最终更新时再与 scale_tensor 结合，保持量纲一致。
                                 # v_alg = v_scaled / scale_tensor
@@ -529,7 +552,7 @@ class UIETrainer(Seq2SeqTrainer):
                                     if torch.isnan(eta_alg):
                                         eta_alg = torch.zeros(1, device=device, dtype=p.dtype).squeeze()
 
-                                    eta = eta_alg / scale_tensor
+                                    eta = eta_alg
 
                                 # --------------------------
                                 # 算法步骤9：累计收益 B^round_ℓ
@@ -551,6 +574,7 @@ class UIETrainer(Seq2SeqTrainer):
                                 # --------------------------
                                 if eta.item() != 0.0:
                                     p.add_(-eta * v_scaled)  # 修正：使用缩放后的v_scaled
+                                    # p.add_(-self.args.learning_rate * g)
 
                                 eta_save.append(eta)
 
