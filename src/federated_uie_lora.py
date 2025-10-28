@@ -7,16 +7,17 @@ import logging
 import os
 import random
 from collections import defaultdict
-from typing import List
 import json
 import datasets
 import numpy as np
 import torch
+
 import math
 from datasets import load_dataset, concatenate_datasets
 import pandas as pd
 import matplotlib.pyplot as plt
 import transformers
+from accelerate import PartialState
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 from uie_collator import DataCollatorForUIE
@@ -30,7 +31,8 @@ from run_uie_lora import ModelArguments, DataTrainingArguments, UIETrainingArgum
 from torch.utils.data import DataLoader
 from continual_fisher_client import ContinualFisherClient, ClientState
 from fed_continual_state import ContinualState
-
+from scipy.stats import pearsonr
+from typing import Dict, Tuple, List
 logger = logging.getLogger("federated_training")
 CURRENT_DIR = os.path.dirname(__file__)
 
@@ -155,7 +157,259 @@ def build_model_and_tokenizer(model_args: ModelArguments):
     return model, tokenizer
 
 
+def compute_fisher_diag(model, dataloader):
+    """
+    适配LoRA模型的对角线Fisher信息计算（修正版）
+    仅计算带"lora"的可训练参数，返回字典格式
+    """
+    # 自动获取模型所在设备（与模型参数一致）
+    device = next(model.parameters()).device
+    model.eval()  # 计算梯度时使用训练模式
+
+    # 初始化Fisher累积器（仅跟踪LoRA可训练参数，用参数名作为键）
+    fisher_diag = {
+        name: torch.zeros_like(param, device=device)
+        for name, param in model.named_parameters()
+        if param.requires_grad and "lora" in name  # 仅保留LoRA相关参数
+    }
+
+    total_samples = 0  # 累计样本数用于平均
+
+    for batch in dataloader:
+        # 适配字典形式的输入批次（如包含input_ids、labels等键）
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        inputs = {k: v for k, v in batch.items() if k != "labels"}  # 输入特征
+        labels = batch.get("labels", None)
+
+        if labels is None:
+            continue  # 无标签数据不参与计算
+
+        # 前向计算获取logits
+        outputs = model(**inputs)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+
+        # 计算log概率（适配seq2seq模型的标签维度）
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        # 对每个样本计算梯度并累积Fisher
+        batch_size = logits.size(0)
+        total_samples += batch_size
+
+        for i in range(batch_size):
+            # 提取当前样本的标签（忽略填充值-100）
+            sample_label = labels[i]
+            valid_mask = sample_label != -100
+            if not valid_mask.any():
+                continue  # 跳过全填充的样本
+
+            # 计算当前样本的log概率（仅有效标签部分）
+            sample_log_prob = log_probs[i, torch.arange(log_probs.size(1)), sample_label]
+            sample_log_prob = sample_log_prob[valid_mask].sum()  # 累加有效位置的log概率
+
+            # 计算梯度（创建计算图用于二阶导数）
+            model.zero_grad(set_to_none=True)
+            grads = torch.autograd.grad(
+                sample_log_prob,
+                [param for name, param in model.named_parameters() if param.requires_grad and "lora" in name],
+                create_graph=True,
+                retain_graph=True
+            )
+
+            # 累积梯度平方到Fisher对角线
+            for (name, param), grad in zip(fisher_diag.items(), grads):
+                if grad is not None:
+                    fisher_diag[name].add_(grad.detach() ** 2)
+
+    # 计算平均Fisher（除以总样本数）
+    if total_samples > 0:
+        for name in fisher_diag:
+            fisher_diag[name] /= total_samples
+    else:
+        logger.warning("未处理有效样本，Fisher保持初始零值")
+
+    # 归一化处理（保留原min-max归一化逻辑）
+    normalized_fisher = {}
+    for name, fisher in fisher_diag.items():
+        x_min = fisher.min()
+        x_max = fisher.max()
+        if x_max - x_min > 1e-8:  # 避免除零
+            normalized_fisher[name] = (fisher - x_min) / (x_max - x_min)
+        else:
+            normalized_fisher[name] = torch.zeros_like(fisher)
+
+    # 转移到CPU并返回（与其他Fisher函数格式一致）
+    return {k: v.detach().cpu() for k, v in normalized_fisher.items()}
+
+
+
+def filter_lora_parameters(fisher_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """过滤仅保留包含"lora"的参数（与compute_fisher_diag保持一致）"""
+    return {
+        name: tensor for name, tensor in fisher_dict.items()
+        if "lora" in name.lower()
+    }
+
+
+def normalize_fisher(fisher_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """对compute_fisher的结果执行min-max归一化（与compute_fisher_diag对齐）"""
+    normalized = {}
+    for name, tensor in fisher_dict.items():
+        x_min = tensor.min()
+        x_max = tensor.max()
+        if x_max - x_min > 1e-8:
+            normalized[name] = (tensor - x_min) / (x_max - x_min)
+        else:
+            normalized[name] = torch.zeros_like(tensor)
+    return normalized
+
+
+def compute_difference_metrics(
+        f1: Dict[str, torch.Tensor],
+        f2: Dict[str, torch.Tensor]
+) -> Tuple[Dict[str, float], float, float, float, float]:
+    """计算两个Fisher结果的差异指标（支持字典格式输入）"""
+    per_layer_metrics = {}
+    all_f1 = []
+    all_f2 = []
+
+    # 获取共有的参数名（确保对比的是相同参数）
+    common_keys = f1.keys() & f2.keys()
+    if not common_keys:
+        logging.warning("未找到共有的LoRA参数，无法计算差异指标")
+        return {}, 0.0, 0.0, 0.0, 0.0
+
+    for name in common_keys:
+        tensor1 = f1[name].flatten().cpu().numpy()
+        tensor2 = f2[name].flatten().cpu().numpy()
+
+        # 层级指标
+        abs_error = np.mean(np.abs(tensor1 - tensor2))
+        rel_error = np.mean(np.abs(tensor1 - tensor2) / (np.abs(tensor1) + 1e-8))  # 避免除零
+        per_layer_metrics[name] = {"abs_error": abs_error, "rel_error": rel_error}
+
+        # 收集全局数据
+        all_f1.extend(tensor1)
+        all_f2.extend(tensor2)
+
+    # 全局指标
+    all_f1 = np.array(all_f1)
+    all_f2 = np.array(all_f2)
+    mean_abs_error = np.mean(np.abs(all_f1 - all_f2))
+    mean_rel_error = np.mean(np.abs(all_f1 - all_f2) / (np.abs(all_f1) + 1e-8))
+    l2_distance = np.sqrt(np.sum((all_f1 - all_f2) ** 2))
+    pearson_corr, _ = pearsonr(all_f1, all_f2) if len(all_f1) > 1 else (0.0, 0.0)
+
+    return per_layer_metrics, mean_abs_error, mean_rel_error, l2_distance, pearson_corr
+
+
+def visualize_comparison(
+        f1: Dict[str, torch.Tensor],
+        f2: Dict[str, torch.Tensor],
+        sample_layers: int = 3,
+        save_dir: str = "."
+) -> None:
+    """可视化对比结果（直方图和散点图）"""
+    common_keys = list(f1.keys() & f2.keys())
+    if not common_keys:
+        logging.warning("无共有的LoRA参数，跳过可视化")
+        return
+
+    # 随机选择样本层（最多sample_layers个）
+    layers_to_plot = common_keys[:min(sample_layers, len(common_keys))]
+
+    # 1. 直方图对比
+    plt.figure(figsize=(15, 5))
+    for i, name in enumerate(layers_to_plot):
+        plt.subplot(1, sample_layers, i + 1)
+        tensor1 = f1[name].flatten().cpu().numpy()
+        tensor2 = f2[name].flatten().cpu().numpy()
+        plt.hist(tensor1, bins=50, alpha=0.5, label="compute_fisher")
+        plt.hist(tensor2, bins=50, alpha=0.5, label="compute_fisher_diag")
+        plt.title(f"Layer: {name.split('.')[-1]}")  # 显示短名称
+        plt.xlabel("Fisher Value")
+        plt.ylabel("Count")
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/fisher_histogram_comparison.png")
+    plt.close()
+
+    # 2. 散点图（全局分布）
+    plt.figure(figsize=(8, 8))
+    all_f1 = np.concatenate([f1[name].flatten().cpu().numpy() for name in common_keys])
+    all_f2 = np.concatenate([f2[name].flatten().cpu().numpy() for name in common_keys])
+    plt.scatter(all_f1, all_f2, alpha=0.5, s=1)
+    plt.plot([0, 1], [0, 1], 'r--')  # 归一化后的理想对角线（0-1范围）
+    plt.xlabel("compute_fisher (Normalized)")
+    plt.ylabel("compute_fisher_diag (Normalized)")
+    plt.title("Fisher Value Scatter Plot (LoRA Parameters Only)")
+    plt.savefig(f"{save_dir}/fisher_scatter_comparison.png")
+    plt.close()
+
+
+def compare_fishers(
+        model: torch.nn.Module,
+        dataloader: DataLoader,
+        alpha: float = 0.5,
+        save_dir: str = ".",
+        sample_layers: int = 3
+) -> None:
+    """主函数：对比两个Fisher计算函数的结果"""
+    # 1. 计算两个Fisher矩阵
+    logging.info("开始计算Fisher矩阵...")
+    fisher = compute_fisher(model, dataloader, alpha=alpha)  # EMA版本（所有可训练参数）
+    fisher_diag = compute_fisher_diag(model, dataloader)  # 样本平均版本（仅LoRA参数）
+
+    # 2. 过滤compute_fisher的结果：仅保留LoRA参数（与fisher_diag对齐）
+    fisher_lora = filter_lora_parameters(fisher)
+    logging.info(f"compute_fisher中LoRA参数数量: {len(fisher_lora)}")
+    logging.info(f"compute_fisher_diag中LoRA参数数量: {len(fisher_diag)}")
+
+    # 3. 归一化compute_fisher的LoRA参数（与fisher_diag的归一化方式一致）
+    # fisher_lora_norm = normalize_fisher(fisher_lora)
+
+    # 4. 计算差异指标
+    per_layer_metrics, mean_abs, mean_rel, l2, corr = compute_difference_metrics(
+        fisher_lora, fisher_diag
+    )
+
+    # 5. 输出量化结果
+    logging.info("\n===== Fisher对比量化指标 =====")
+    logging.info(f"共有的LoRA参数数量: {len(per_layer_metrics)}")
+    logging.info(f"全局平均绝对误差: {mean_abs:.6f}")
+    logging.info(f"全局平均相对误差: {mean_rel:.6f}")
+    logging.info(f"全局L2距离: {l2:.6f}")
+    logging.info(f"全局Pearson相关系数: {corr:.6f}")
+
+    # 打印前5层的详细误差
+    if per_layer_metrics:
+        logging.info("\n===== 部分LoRA层的误差详情 =====")
+        for name in list(per_layer_metrics.keys())[:5]:
+            logging.info(
+                f"层 {name}: 绝对误差={per_layer_metrics[name]['abs_error']:.6f}, "
+                f"相对误差={per_layer_metrics[name]['rel_error']:.6f}"
+            )
+
+    # 6. 可视化
+    visualize_comparison(fisher_lora, fisher_diag, sample_layers, save_dir)
+    logging.info(f"可视化结果已保存至 {save_dir}")
+
+
+
+
+
+
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
+
+
+    distributed_state = PartialState()
+    world_size = getattr(distributed_state, "num_processes", 1)
+    process_index = getattr(distributed_state, "process_index", 0)
+    main_process = getattr(distributed_state, "main_process", 0)
+    if isinstance(main_process, (list, tuple)):
+        main_process = main_process[0]
+    effective_world_size = max(int(world_size), 1)
+    process_index = int(process_index) % effective_world_size
+
 
     # loading logging
     logging.basicConfig(format="%(message)s", handlers=[logging.StreamHandler()])
@@ -313,8 +567,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             logger.warning(f"未知数据类型 {dtype}，默认使用32位计算")
             return 32
 
-
-
     def calculate_layer_packet_cost(param, packet_size=1500):
         """计算单个LoRA层所需的数据包数量"""
         num_elements = param.numel()
@@ -383,29 +635,53 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     }
     logger.info(f"预计算的LoRA层通信成本: "
                 f"{layer_costs['base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
-
+    import torch.distributed as dist
     for rnd in range(fed_args.global_rounds):
         logger.info(f"Global round {rnd + 1}/{fed_args.global_rounds}")
 
-        selected = client_rng.sample(
-            range(fed_args.num_clients),
-            min(fed_args.clients_per_round, fed_args.num_clients),
-        )
+        # selected = client_rng.sample(
+        #     range(fed_args.num_clients),
+        #     min(fed_args.clients_per_round, fed_args.num_clients),
+        # )
 
-        logger.info(f"Selected client {selected}")
+        selected = None
+        if distributed_state.is_main_process:
+            selected = client_rng.sample(
+                range(fed_args.num_clients),
+                min(fed_args.clients_per_round, fed_args.num_clients),
+            )
+
+        if dist.is_available() and dist.is_initialized():
+            selected_container = [selected]
+            dist.broadcast_object_list(selected_container, src=main_process)
+            selected = selected_container[0]
+        if selected is None:
+            selected = client_rng.sample(
+                range(fed_args.num_clients),
+                min(fed_args.clients_per_round, fed_args.num_clients),
+            )
+
+        # logger.info(f"Selected client {selected}")
+        if distributed_state.is_main_process:
+            logger.info(f"Selected client {selected}")
 
         lora_keys = get_lora_trainable_keys(global_model)
         global_state_cpu = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
         aggregated = {k: torch.zeros_like(global_state_cpu[k]) for k in lora_keys}
         total = 0
 
-        for cid in selected:
-            logger.info(f"Client ID: {cid}")
-            # 更新客户端选择跟踪
-            client_selection_tracker[cid]['count'] += 1
-            client_selection_tracker[cid]['last_round'] = rnd
-            current_task_selected_clients.add(cid)
+        # for cid in selected:
+        #     logger.info(f"Client ID: {cid}")
+        #     # 更新客户端选择跟踪
+        #     client_selection_tracker[cid]['count'] += 1
+        #     client_selection_tracker[cid]['last_round'] = rnd
+        #     current_task_selected_clients.add(cid)
 
+        local_selected = [cid for idx, cid in enumerate(selected) if idx % effective_world_size == process_index]
+        local_payloads = []
+
+        for cid in local_selected:
+            logger.info(f"Client ID: {cid}")
             local_model = copy.deepcopy(global_model)
             local_args = copy.deepcopy(base_args)
             local_args.resume_from_checkpoint = None
@@ -432,6 +708,13 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 delta = {
                     k: global_state_cpu[k] - state_dict[k].detach().cpu()
                     for k in lora_keys
+                }
+
+                payload = {
+                    "cid": cid,
+                    "weight": len(client_datasets[cid]),
+                    "delta": delta,
+                    "cache": None,
                 }
 
             elif method == "adaptive":
@@ -463,17 +746,75 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     }
 
                     # 新增：选择Fisher计算方式（通过参数控制，默认用原有EMA）
-                    use_arithmetic_fisher = getattr(fed_args, "use_arithmetic_fisher", False)
-                    if use_arithmetic_fisher:
-                        # 调用新的算术平均Fisher函数
-                        F_client = compute_fisher_arithmetic(local_model, trainer.get_train_dataloader())
-                    else:
-                        # 保留原有EMA方式
-                        F_client = compute_fisher(local_model, trainer.get_train_dataloader())
-
+                    # use_arithmetic_fisher = getattr(fed_args, "use_arithmetic_fisher", False)
+                    # if use_arithmetic_fisher:
+                    #     # 调用新的算术平均Fisher函数
+                    #     F_client = compute_fisher_arithmetic(local_model, trainer.get_train_dataloader())
+                    # else:
+                    #     # 保留原有EMA方式
+                    # F_client = compute_fisher(local_model, trainer.get_train_dataloader())
+                    F_client = compute_fisher_diag(local_model, trainer.get_train_dataloader())
                     # 确保F_client与base_params对齐（原有逻辑不变）
-                    F_client = {k: F_client.get(k, torch.zeros_like(global_state_cpu[k])) for k in lora_keys}
+                    # F_client = {k: F_client.get(k, torch.zeros_like(global_state_cpu[k])) for k in lora_keys}
                     theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+
+                    payload = {
+                        "cid": cid,
+                        "weight": len(client_datasets[cid]),
+                        "delta": delta,
+                        "cache": {"F_client": F_client, "theta_last": theta_last},
+                    }
+
+
+
+                    # ---------------------- 新增：两种Fisher计算方法对比 ----------------------
+                    # 1. 计算算术平均方式的Fisher（假设compute_fisher_diag已实现）
+                    # F_client_arithmetic = compute_fisher_diag(local_model, trainer.get_train_dataloader())
+
+                    # # 2. 确保两种Fisher的参数键对齐（只对比共同参数）
+                    # common_keys = set(F_client.keys()) & set(F_client_arithmetic.keys())
+                    # if not common_keys:
+                    #     logger.warning("两种Fisher计算方法无共同参数，无法对比")
+                    # else:
+                    #     # 3. 计算并记录对比指标
+                    #     fisher_comparison = {}
+                    #     for key in common_keys:
+                    #         f_ema = F_client[key]
+                    #         f_arith = F_client_arithmetic[key]
+                    #
+                    #         # 计算数值差异（绝对值、相对值）
+                    #         abs_diff = torch.abs(f_ema - f_arith)
+                    #         rel_diff = abs_diff / (torch.abs(f_ema) + 1e-8)  # 避免除以0
+                    #
+                    #         # 记录关键统计量
+                    #         fisher_comparison[key] = {
+                    #             "ema_mean": f_ema.mean().item(),
+                    #             "arith_mean": f_arith.mean().item(),
+                    #             "abs_diff_mean": abs_diff.mean().item(),
+                    #             "rel_diff_mean": rel_diff.mean().item(),
+                    #             "ema_max": f_ema.max().item(),
+                    #             "arith_max": f_arith.max().item()
+                    #         }
+                    #
+                    #     # 4. 输出对比结果（日志+文件）
+                    #     logger.info(f"客户端 {cid} 两种Fisher计算方法对比（共同参数数：{len(common_keys)}）：")
+                    #     for key, stats in fisher_comparison.items():
+                    #         logger.info(
+                    #             f"参数 {key}：EMA均值={stats['ema_mean']:.6f}, "
+                    #             f"算术均值={stats['arith_mean']:.6f}, "
+                    #             f"平均绝对差={stats['abs_diff_mean']:.6f}, "
+                    #             f"平均相对差={stats['rel_diff_mean']:.6f}"
+                    #         )
+                    #
+                    #     # 保存详细对比结果到文件
+                    #     comparison_dir = os.path.join(training_args.output_dir, "fisher_comparison")
+                    #     os.makedirs(comparison_dir, exist_ok=True)
+                    #     comparison_path = os.path.join(comparison_dir, f"client_{cid}_round_{rnd}_fisher_compare.json")
+                    #     with open(comparison_path, "w") as f:
+                    #         json.dump(fisher_comparison, f, indent=2)
+                    #     logger.info(f"Fisher对比结果已保存至：{comparison_path}")
+                    # -------------------------------------------------------------------------
+                    # compare_fishers(local_model, trainer.get_train_dataloader(),0.5,comparison_dir,3)
 
                 else:
                     trainer = UIETrainer(
@@ -495,37 +836,80 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     )
 
                 # —— 轮内：累计/覆盖本任务 Fisher
-                acc = per_task_cache[cid]
+                # acc = per_task_cache[cid]
+                    payload = {
+                        "cid": cid,
+                        "weight": len(client_datasets[cid]),
+                        "delta": delta,
+                        "cache": {"F_client": F_client, "theta_last": theta_last},
+                    }
+            else:
+                payload = {
+                    "cid": cid,
+                    "weight": len(client_datasets[cid]),
+                    "delta": delta,
+                    "cache": None,
+                }
+            local_payloads.append(payload)
+                # if reduce_mode == "last":
+                #     # 只保留最新一轮
+                #     acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
+                # else:  # "mean"
+                #     if acc["F_sum"] is None:
+                #         acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
+                #         acc["count"] = 1
+                #     else:
+                #         for k in F_client:
+                #             acc["F_sum"][k] += F_client[k]
+                #         acc["count"] += 1
+        if dist.is_available() and dist.is_initialized():
+            gathered_payloads = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered_payloads, local_payloads)
+            all_payloads = []
+            for chunk in gathered_payloads:
+                if chunk:
+                    all_payloads.extend(chunk)
+        else:
+            all_payloads = list(local_payloads)
 
-                # 记录该客户端在本任务的“最后一次” θ*
-                acc["theta_last"] = theta_last  # ← 直接用 trainer 返回的
+        for payload in all_payloads:
+            cid = payload["cid"]
+            client_selection_tracker[cid]['count'] += 1
+            client_selection_tracker[cid]['last_round'] = rnd
+            current_task_selected_clients.add(cid)
 
-                if reduce_mode == "last":
-                    # 只保留最新一轮
-                    acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
-                else:  # "mean"
-                    if acc["F_sum"] is None:
-                        acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
-                        acc["count"] = 1
-                    else:
-                        for k in F_client:
-                            acc["F_sum"][k] += F_client[k]
-                        acc["count"] += 1
-
-
+            delta = payload["delta"]
+            weight = payload["weight"]
 
             # Server update
-            weight = len(client_datasets[cid])
+            # weight = len(client_datasets[cid])
             for k in lora_keys:
                 aggregated[k] += delta[k] * weight
             total += weight
 
+            if method == "adaptive" and payload.get("cache") is not None:
+                F_client = payload["cache"].get("F_client")
+                theta_last = payload["cache"].get("theta_last")
+                if F_client is not None and theta_last is not None:
+                    acc = per_task_cache[cid]
+                    acc["theta_last"] = theta_last
+                    if reduce_mode == "last":
+                        acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
+                    else:
+                        if acc["F_sum"] is None:
+                            acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
+                            acc["count"] = 1
+                        else:
+                            for k in F_client:
+                                acc["F_sum"][k] += F_client[k]
+                            acc["count"] += 1
         for k in lora_keys:
             mu = aggregated[k] / max(total, 1)
             global_state_cpu[k] = global_state_cpu[k] - mu
 
         update_dict = {k: global_state_cpu[k].to(device) for k in lora_keys}
         global_model.load_state_dict(update_dict, strict=False)
+        distributed_state.wait_for_everyone()
 
     # ===== 任务结束：将“本任务”信息并入历史 =====
     if method == "adaptive" and data_args.task >= 1:
@@ -549,15 +933,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             # 载入历史（若有），执行指数累计
             client_state_path = os.path.join(client_state_dir, f"client_{cid}_state.pt")
             client_state = ContinualState.load(client_state_path)
-            client_state.update(F_task, theta_star, gamma=gamma)  # 只在任务末更新历史
-            client_state.save(client_state_path)
+            client_state.update(F_task, theta_star)
+            # client_state.save(client_state_path)
+            if distributed_state.is_main_process:
+                client_state.save(client_state_path)
+        distributed_state.wait_for_everyone()
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")
-    global_model.save_pretrained(peft_model_id)
-    tokenizer.save_pretrained(peft_model_id)
+    # global_model.save_pretrained(peft_model_id)
+    # tokenizer.save_pretrained(peft_model_id)
+    if distributed_state.is_main_process:
+        global_model.save_pretrained(peft_model_id)
+        tokenizer.save_pretrained(peft_model_id)
+        logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
     all_metrics.update({"adapter_saved": peft_model_id})
-    logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
+    # logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
 
     # ========== 最终预测 & 指标记录 ==========
     if training_args.do_predict:
@@ -588,9 +979,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         all_metrics.update(metrics)
         logger.info(f"Final federated evaluation metrics: {metrics}")
 
-    import torch.distributed as dist
+    # import torch.distributed as dist
     if dist.is_initialized():
         dist.destroy_process_group()
-
+    distributed_state.wait_for_everyone()
     return all_metrics
 

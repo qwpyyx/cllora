@@ -32,6 +32,7 @@ from datasets import load_dataset
 import transformers
 import schedulefree
 from filelock import FileLock
+from accelerate import PartialState
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
@@ -193,21 +194,21 @@ class DataTrainingArguments:
         metadata={"help": "The maximum number of instances we will consider for each validation/test task."}
     )
     max_train_samples: Optional[int] = field(
-        default=None,
+        default=2000,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
                     "value if set."
         },
     )
     max_eval_samples: Optional[int] = field(
-        default=1000,
+        default=500,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
                     "value if set."
         },
     )
     max_predict_samples: Optional[int] = field(
-        default=1000,
+        default=500,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
                     "value if set."
@@ -260,7 +261,7 @@ class FederatedArguments:
         metadata={"help": "Training mode: centralized or federated"},
     )
     num_clients: int = field(
-        default=50,
+        default=20,
         metadata={"help": "Total number of clients in federated learning."},
     )
     clients_per_round: int = field(
@@ -272,11 +273,11 @@ class FederatedArguments:
         metadata={"help": "Total number of global federated rounds."},
     )
     local_epochs: int = field(
-        default=1,
+        default=3,
         metadata={"help": "Local training epochs for each selected client."},
     )
     dirichlet_alpha: float = field(
-        default=1,
+        default=10,
         metadata={"help": "Dirichlet alpha controlling data heterogeneity."},
     )
     # 新增：联邦采样专用的随机种子
@@ -309,6 +310,8 @@ def main():
         model_args, data_args, training_args, federated_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args, federated_args = parser.parse_args_into_dataclasses()
+
+    # distributed_state = PartialState()
 
     if federated_args.mode == "federated":
         from federated_uie_lora import run_federated_training
@@ -630,8 +633,12 @@ def main():
 
         peft_model_id = training_args.output_dir + "/adapter"
         # 保存训练下来的模型参数和tokenizer
-        trainer.model.save_pretrained(peft_model_id)  
-        tokenizer.save_pretrained(peft_model_id)
+        # trainer.model.save_pretrained(peft_model_id)
+        # tokenizer.save_pretrained(peft_model_id)
+
+        if trainer.is_world_process_zero():
+            trainer.model.save_pretrained(peft_model_id)
+            tokenizer.save_pretrained(peft_model_id)
 
         metrics = train_result.metrics
         max_train_samples = (
@@ -684,6 +691,7 @@ def main():
         trainer.save_metrics("predict", metrics)
         all_metrics.update(metrics)
 
+    distributed_state.wait_for_everyone()
     return results
 
 
