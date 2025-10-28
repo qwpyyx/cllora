@@ -690,7 +690,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             local_args.logging_strategy = "no"
             local_args.evaluation_strategy = "no"
 
-            # TODO 考虑如何把deepspeed兼容进来
+            # TODO 考虑如何把deepspeed兼容
             if method == "lora_origin":
                 local_args.deepspeed = None
                 trainer = UIETrainer(
