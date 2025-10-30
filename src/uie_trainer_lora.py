@@ -15,7 +15,7 @@ from uie_dataset_lora import ANSWER_PREFIX
 from collections import defaultdict
 # logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
-
+from accelerate import Accelerator
 import logging
 import time
 import torch
@@ -294,7 +294,7 @@ def update_online_fisher(
     """
     # 保存当前梯度状态
     original_grads = {}
-    for name, param in unwrap_model.named_parameters():
+    for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
             original_grads[name] = param.grad.clone()
 
@@ -554,10 +554,23 @@ class UIETrainer(Seq2SeqTrainer):
         comm_bandwidth: float = 1.0,
         comm_fixed_cost: float = 0.0,
         comm_budget: int = 0,
-        layer_costs: Dict[str, int] = None,** kwargs,
+        layer_costs: Dict[str, int] = None,
+        accelerator: Accelerator = None,
+        **kwargs,
     ):
         self.continual_state = kwargs.pop("state", None)  # 这里直接赋值给 continual_state
         super().__init__(*args, **kwargs)  # 此时 kwargs 中已无 state，父类不会报错
+
+
+        # Accelerator 集成
+        if accelerator is None:
+            # 如果没有传入 accelerator，创建一个默认的
+            self.accelerator = Accelerator()
+        else:
+            self.accelerator = accelerator
+
+
+
         self.radius = radius
         self.comm_bandwidth = comm_bandwidth  # MB/s
         self.comm_fixed_cost = comm_fixed_cost  # 固定开销（秒）
@@ -573,12 +586,131 @@ class UIETrainer(Seq2SeqTrainer):
         self.method = self.args.method
         self._force_sgd = False
         self.fisher_floor = getattr(self.args, "fisher_floor", 1e-5)
-        #
+
+
         self.adam_states = {}  # 存储Adam状态：key为参数名，value为字典(m, v, t)
         # 初始化Adam超参数（可根据需要调整）
         self.beta1 = 0.9  # 一阶矩动量系数
         self.beta2 = 0.999  # 二阶矩动量系数
         self.eps = 1e-8  # 数值稳定项
+
+
+    def _ema_fisher_from_synced_grads(self, unwrapped_model, F_curr: Dict[str, torch.Tensor], alpha: float):
+        """
+        用 DDP 同步后的 p.grad 估计 Fisher 对角（EMA 版本）：
+          F[name] = alpha * F[name] + (1 - alpha) * (grad^2)
+        说明：
+          - 必须在 self.accelerator.backward(loss) 之后调用；
+          - 不需要再做 dist.all_reduce，DDP 已经把 grad 同步为一致值；
+          - 仅对 requires_grad 且存在 grad 的参数更新。
+        """
+        for name, p in unwrapped_model.named_parameters():
+            if not p.requires_grad or p.grad is None:
+                continue
+            g2 = (p.grad.detach() ** 2)
+            if name not in F_curr:
+                F_curr[name] = torch.zeros_like(p, device=p.device)
+            F_curr[name] = alpha * F_curr[name] + (1.0 - alpha) * g2
+        return F_curr
+
+    # ===== [NEW] Fisher EMA（DDP/Accelerate 已同步梯度）=====
+    def _synchronized_ema_fisher(
+            self,
+            model,
+            F_curr: Dict[str, torch.Tensor],
+            alpha: float,
+            *,
+            ddp_avg_of_squares: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        要求：必须在 self.accelerator.backward(loss) 之后调用。
+        默认用 (E[g])^2；若 ddp_avg_of_squares=True，则改用 E[g^2]（多一次 all_reduce）。
+        """
+        import torch
+        import torch.distributed as dist
+
+        self.accelerator.wait_for_everyone()
+        unwrapped = self.accelerator.unwrap_model(model)
+        world_size = max(1, getattr(self.accelerator.state, "num_processes", 1))
+
+        for name, p in unwrapped.named_parameters():
+            if (not p.requires_grad) or (p.grad is None):
+                continue
+            g = p.grad.detach()
+            need_upcast = (g.dtype in (torch.float16, torch.bfloat16))
+            g2 = (g.float() * g.float()) if need_upcast else (g * g)
+
+            if ddp_avg_of_squares and world_size > 1:
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(g2, op=dist.ReduceOp.SUM)
+                    g2 = g2 / float(world_size)
+
+            if name not in F_curr:
+                F_curr[name] = torch.zeros_like(
+                    p, device=p.device, dtype=(torch.float32 if need_upcast else p.dtype)
+                )
+
+            if F_curr[name].dtype != g2.dtype:
+                g2 = g2.to(F_curr[name].dtype)
+            F_curr[name] = alpha * F_curr[name] + (1.0 - alpha) * g2
+
+        return F_curr
+
+    # ===== [NEW] 规约/广播工具（可复用）=====
+    def _reduce_scalar(self, value, reduction: str = "mean"):
+        import torch
+        t = torch.as_tensor(value, device=self.accelerator.device, dtype=torch.float32)
+        t = self.accelerator.reduce(t, reduction=reduction)
+        return float(t.item())
+
+    def _reduce_tensor(self, t: "torch.Tensor", reduction: str = "mean"):
+        return self.accelerator.reduce(t, reduction=reduction)
+
+    def _broadcast_state_dict_(self, *dicts: dict, src: int = 0):
+        import torch, torch.distributed as dist
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        device = self.accelerator.device
+        for d in dicts:
+            for k, v in d.items():
+                if isinstance(v, torch.Tensor):
+                    dist.broadcast(v.data, src=src)
+                else:
+                    t = torch.tensor(v, device=device)
+                    dist.broadcast(t, src=src)
+                    d[k] = int(t.item()) if isinstance(v, int) else float(t.item())
+
+    def _assert_equal_across_processes(self, value, name="var"):
+        import torch
+        v = torch.tensor(float(value), device=self.accelerator.device)
+        v_min = self.accelerator.reduce(v, reduction="min")
+        v_max = self.accelerator.reduce(v, reduction="max")
+        if self.accelerator.is_main_process and abs(v_max.item() - v_min.item()) > 1e-8:
+            print(f"[WARN] {name} mismatch across ranks: min={v_min.item():.6g}, max={v_max.item():.6g}")
+
+    def _synchronized_preconditioner(self, F_curr_safe: torch.Tensor, scale: float, device: torch.device) -> torch.Tensor:
+        """
+        输入：当前步 EMA Fisher 对角（同步梯度得到，天然一致）+ 层级缩放因子 scale
+        输出：用于 v = g / preconditioner 的对角预条件器
+        做法：bias-correct -> 分位数软抬升 -> 幂次（RMS风格） -> / scale
+        """
+        eps = 1e-12
+        F_hat = F_curr_safe
+        # 软抬升 floor
+        q = float(getattr(self.args, "fisher_floor_quantile", 0.02))
+        lam = float(getattr(self.args, "fisher_floor_mix", 0.7))
+        floor_min = torch.as_tensor(getattr(self.args, "fisher_floor_min", 1e-12), device=F_hat.device, dtype=F_hat.dtype)
+        pos = F_hat[F_hat > 0]
+        if pos.numel() > 0:
+            floor_q = torch.quantile(pos, q)
+            floor = torch.maximum(floor_q, floor_min)
+        else:
+            floor = floor_min
+        F_soft = torch.where(F_hat < floor, (1.0 - lam) * F_hat + lam * floor, F_hat)
+        gamma = float(getattr(self.args, "precond_power", 0.5))
+        precond = F_soft.pow(gamma)
+        precond = precond / max(float(scale), 1e-8)
+        return precond.clamp_min(1e-12).to(device)
 
 
     def _init_deepspeed(self):
@@ -630,85 +762,44 @@ class UIETrainer(Seq2SeqTrainer):
             print(f"[TRIPWIRE] {name}: eta 非有限")
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        """
-        Perform a training step on a batch of inputs.
-        Subclass and override to inject custom behavior.
+        """添加详细调试信息的 training_step"""
 
-        Args:
-            model (`nn.Module`):
-                The model to train.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
+        # 调试信息
+        if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
+            logger.info(f"[DEBUG] training_step 开始, 进程: {self.accelerator.process_index}")
 
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
+        try:
+            # 原有的训练逻辑
+            model.train()
+            inputs = self._prepare_inputs(inputs)
 
-        Return:
-            `torch.Tensor`: The tensor with training loss on this batch.
-        """
+            with self.accelerator.autocast():
+                outputs = model(**inputs)
+                loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
 
-        model.train()
-        # 根据输入数据的类型进行适当的处理，确保输入数据符合模型的要求。
-        inputs = self._prepare_inputs(inputs)
+            # 梯度累积
+            if self.args.gradient_accumulation_steps > 1:
+                loss = loss / self.args.gradient_accumulation_steps
 
-        # if is_sagemaker_mp_enabled():
-        #     loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-        #     return loss_mb.reduce_mean().detach().to(self.args.device)
+            # 反向传播
+            self.accelerator.backward(loss)
 
-        # 根据当前训练环境（是否使用 AMP、是在 CPU 还是 CUDA 上）和 PyTorch 版本，返回一个合适的 autocast 上下文管理器，
-        # 以便在 with 中使用混合精度加速模型推理或训练。
-        with self.compute_loss_context_manager():
-            # 算前向loss
-            loss = self.compute_loss(model, inputs)
+            # 调试信息
+            if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
+                print(f"[DEBUG] 反向传播完成, loss: {loss.item():.6f}")
 
+            # 关键：等待所有进程完成
+            self.accelerator.wait_for_everyone()
 
-        if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
+                print(f"[DEBUG] 所有进程同步完成")
 
-        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
-            loss = loss / self.args.gradient_accumulation_steps
+            return loss.detach()
 
-        ########################### Regularization ##########################
-        # orthogonal_loss = 0.
-        # for name, param in self.model.named_parameters():
-        #     if "lora_A" in name:
-        #         for name_, param_ in self.model.named_parameters():
-        #             if "loranew_A" in name_ and name.split("lora_A")[0] == name_.split("loranew_A")[0]:
-        #                 orthogonal_loss += torch.abs(torch.mm(param, param_.T)).sum() # [r * dim] * [dim * r]
-        #                 break # target modules have been matched
-        #
-        # # l2-normalization for loranew_A/B
-        # l2_loss = 0.
-        # for name, param in self.model.named_parameters():
-        #     if "loranew_" in name:
-        #         l2_loss += torch.norm(param, p=2)
-        #
-        # lamda_1 = self.args.lamda_1
-        # lamda_2 = self.args.lamda_2
-        #
-        # #logger.info(f"orthogonal_loss: {orthogonal_loss.item()}; l2_loss: {l2_loss.item()}; accuracy_loss: {loss.item()}; λ1: {lamda_1}; λ2: {lamda_2}")
-        # logger.info(
-        #     f"orthogonal_loss: {orthogonal_loss}; l2_loss: {l2_loss}; accuracy_loss: {loss.item()}; λ1: {lamda_1}; λ2: {lamda_2}")
-        # loss = loss + orthogonal_loss * lamda_1 + l2_loss * lamda_2
-        ######################################################################
-
-        if self.do_grad_scaling:
-            self.scaler.scale(loss).backward()
-        elif self.use_apex:
-            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                scaled_loss.backward()
-        elif self.deepspeed:
-            # loss gets scaled under gradient_accumulation_steps in deepspeed
-            loss = self.deepspeed.backward(loss)
-        else:
-            loss.backward()
-
-        if self.state.global_step % 1 == 0:  # 每10步打印一次损失
-            self.log({"train_loss": loss.item()})  # 关键修改：用字典封装指标
-
-
-        return loss.detach()
+        except Exception as e:
+            logger.error(f"training_step 错误: {e}")
+            # 返回一个虚拟的损失值避免卡死
+            return torch.tensor(0.0, requires_grad=False)
 
     def train(
         self,
@@ -731,6 +822,10 @@ class UIETrainer(Seq2SeqTrainer):
 
 
         if self.method == "adaptive" and task_id == 1:
+            dataloader = self.get_train_dataloader()
+            dataloader = self.accelerator.prepare(dataloader)
+            # 验证：不同进程的数据集长度应不同（分片后）
+            print(f"进程 {self.accelerator.process_index} 数据加载器长度: {len(dataloader)}")
             return super().train(**kwargs)
 
         elif self.method == "adaptive" and task_id > 1:
@@ -740,7 +835,7 @@ class UIETrainer(Seq2SeqTrainer):
                     self.continual_state is not None and not state_has_history
             ):
                 super().train(**kwargs)
-                state_dict = self.model.state_dict()
+                state_dict = self.accelerator.unwrap_model(self.model).state_dict()
                 delta = {k: base_params[k] - state_dict[k].detach().cpu() for k in base_params}
                 F_client = compute_fisher(self.model, self.get_train_dataloader())
                 F_client = {k: F_client.get(k, torch.zeros_like(base_params[k])) for k in base_params}
@@ -748,30 +843,24 @@ class UIETrainer(Seq2SeqTrainer):
                 return delta, F_client, theta_last
 
             # --------------Train---------------
-            use_adaptive_logic = True  # 切换：False=基线模式，True=自适应模式
-            # batch_times = []  # 存储每个batch的训练耗时（毫秒）
-            # warmup_skip = 1  # 跳过第一个batch（GPU热身时间，避免干扰统计）
+            use_adaptive_logic = True
             logger.info(f"===== 开始训练 | 模式：{'自适应' if use_adaptive_logic else '基线'} | Task {task_id} =====")
 
-
-
             # model = self.model
-            if getattr(self, "model_wrapped", None) is None:
-                self.model_wrapped = self._wrap_model(self.model)
-            model = self.model_wrapped
-            unwrapped_model = self.accelerator.unwrap_model(model)
-
+            model = self.accelerator.unwrap_model(self.model)
             dataloader = self.get_train_dataloader()
             dataloader = self.accelerator.prepare(dataloader)
+            device = self.accelerator.device
+
             # device = next(model.parameters()).device
             model.train()
             self.eta_per_layer = defaultdict(list)
-            unwrapped_model.train()
-            device = next(unwrapped_model.parameters()).device
+            # unwrapped_model.train()
 
+            # 启用激活探针
             self.enable_activation_probe = bool(getattr(self.args, "enable_activation_probe", True))
             # === [新增] 在进入自适应训练循环前安装激活探针 ===
-            if self.enable_activation_probe:
+            if self.accelerator.is_main_process and getattr(self.args, "enable_activation_probe", True):
                 self._act_probe = _ActivationProbe(
                     topk=5,
                     ratio_trigger=float(getattr(self.args, "actprobe_ratio_trigger", 30.0)),
@@ -792,8 +881,8 @@ class UIETrainer(Seq2SeqTrainer):
             if use_adaptive_logic:
 
                 F_curr = {
-                    n: torch.zeros_like(p, device=device)  # 令F_curr^l = 0
-                    for n, p in unwrapped_model.named_parameters()
+                    n: torch.zeros_like(p, device=device)
+                    for n, p in model.named_parameters()
                     if p.requires_grad
                 }
 
@@ -801,7 +890,7 @@ class UIETrainer(Seq2SeqTrainer):
                 bar_F_raw = {}
                 bar_theta = {}
                 # 从ContinualState获取归一化后的bar_F和bar_B
-                for name, p in unwrapped_model.named_parameters():
+                for name, p in model.named_parameters():
                     if not p.requires_grad:
                         continue
 
@@ -830,7 +919,7 @@ class UIETrainer(Seq2SeqTrainer):
                 #     else:
                 #         print(f"{name}: bu yi zhi")
 
-                for name, p in unwrapped_model.named_parameters():
+                for name, p in model.named_parameters():
                     if p.requires_grad:
                         self.adam_states[name] = {
                             'm': torch.zeros_like(p, device=p.device),  # 一阶矩（动量）
@@ -838,9 +927,11 @@ class UIETrainer(Seq2SeqTrainer):
                             't': 0  # 时间步（用于偏差修正）
                         }
 
-                for name, p in unwrapped_model.named_parameters():
+                # 初始化半径和收益状态（关键：需要跨进程同步）
+                for name, p in model.named_parameters():
                     if not p.requires_grad:
                         continue
+
                     # r²_ℓ = ‖θ^(ℓ) - bar_theta^(ℓ)‖²_{bar_F^(ℓ)}
                     f_past = bar_F_raw[name]
                     hist_mean = torch.clamp(f_past.mean(), min=1e-12)
@@ -888,10 +979,19 @@ class UIETrainer(Seq2SeqTrainer):
                 # 基线模式：仅初始化“手动更新必要参数”（无多余代码）
                 lr_base = self.args.learning_rate  # 基线用固定学习率（与自适应lr_cap一致）
                 # 基线无需bar_F/bar_B，仅记录初始参数用于计算delta
-                for k, p in unwrapped_model.named_parameters():
+                for k, p in model.named_parameters():
                     if p.requires_grad:
                         bar_theta[k] = p.detach().clone()
 
+            if getattr(self.accelerator.state, "num_processes", 1) > 1:
+                try:
+                    self._broadcast_state_dict_(bar_theta, r2, r2_start, B_round, conf)
+                    if isinstance(F_curr, dict) and len(F_curr) > 0:
+                        self._broadcast_state_dict_(F_curr)
+                    if isinstance(bar_F_raw, dict) and len(bar_F_raw) > 0:
+                        self._broadcast_state_dict_(bar_F_raw)
+                except Exception as _:
+                    pass
 
             num_epochs = int(self.args.num_train_epochs)
             steps_per_epoch = len(dataloader)
@@ -930,7 +1030,7 @@ class UIETrainer(Seq2SeqTrainer):
 
 
                     # 前向
-                    with self.compute_loss_context_manager():
+                    with self.compute_loss_context_manager(), self.accelerator.autocast():
                         outputs = model(**batch)
                         loss = outputs[0] if isinstance(outputs, (list, tuple)) else outputs["loss"]
 
@@ -944,10 +1044,11 @@ class UIETrainer(Seq2SeqTrainer):
                     # 打印loss结果
                     raw_loss = loss.detach().item() * self.args.gradient_accumulation_steps
                     # 输出日志：包含epoch、step、当前batch的loss
-                    logger.info(
-                        f"Task {task_id} | Epoch [{epoch + 1}/{num_epochs}] | Batch [{step + 1}/{steps_per_epoch}] | "
-                        f"Batch Loss: {raw_loss:.6f}"
-                    )
+                    if self.accelerator.is_main_process:
+                        logger.info(
+                            f"Task {task_id} | Epoch [{epoch + 1}/{num_epochs}] | Batch [{step + 1}/{steps_per_epoch}] | "
+                            f"Batch Loss: {raw_loss:.6f}"
+                        )
 
 
                     # before_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
@@ -956,14 +1057,14 @@ class UIETrainer(Seq2SeqTrainer):
                     # 第二步：调用独立函数，在线更新Fisher
                     ###########################################
                     # 调用函数：传入模型、当前batch、F_curr、EMA系数、设备
-                    F_curr, F_batch = update_online_fisher(
-                        model=model,
-                        batch=batch,
-                        F_curr=F_curr,
-                        alpha_ema=self.alpha,
-                        device=device
-                    )
-
+                    # F_curr, F_batch = update_online_fisher(
+                    #     model=model,
+                    #     batch=batch,
+                    #     F_curr=F_curr,
+                    #     alpha_ema=self.alpha,
+                    #     device=device
+                    # )
+                    F_curr = self._synchronized_ema_fisher(model, F_curr, alpha=self.alpha)
                     # global_norm = None
                     # if any(p.grad is not None for p in unwrapped_model.parameters()):
                     #     s = 0.0
@@ -981,7 +1082,7 @@ class UIETrainer(Seq2SeqTrainer):
 
                     # 监控点1：梯度范数检查
                     grad_norms = {}
-                    for name, p in unwrapped_model.named_parameters():
+                    for name, p in model.named_parameters():
                         if p.grad is not None:
                             grad_norm = torch.norm(p.grad).item()
                             grad_norms[name] = grad_norm
@@ -997,9 +1098,10 @@ class UIETrainer(Seq2SeqTrainer):
                             logger.warning(f"Fisher值异常: {name}, 均值: {fisher_mean}")
 
                     # 将监控数据保存
-                    gradient_monitor['grad_norms'].append(grad_norms)
-                    gradient_monitor['fisher_values'].append(fisher_values)
-                    gradient_monitor['loss_values'].append(raw_loss)
+                    if self.accelerator.is_main_process:
+                        gradient_monitor['grad_norms'].append(grad_norms)
+                        gradient_monitor['fisher_values'].append(fisher_values)
+                        gradient_monitor['loss_values'].append(raw_loss)
                     # after_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
                     # # 验证梯度是否一致
                     # for name in before_grads:
@@ -1017,7 +1119,7 @@ class UIETrainer(Seq2SeqTrainer):
                     with torch.no_grad():
                         if use_adaptive_logic:
                             # F_norm_per_param = {}
-                            for name, p in unwrapped_model.named_parameters():
+                            for name, p in model.named_parameters():
                                 if not p.requires_grad or p.grad is None:
                                     continue
 
@@ -1098,7 +1200,9 @@ class UIETrainer(Seq2SeqTrainer):
 
                                 # 4) 幂次预条件（RMS 风格），继续抑制长尾
                                 gamma = float(getattr(self.args, "precond_power", 0.5))  # 0.5~0.75
-                                preconditioner = (F_soft.pow(gamma)) / scale
+                                # preconditioner = (F_soft.pow(gamma)) / scale
+
+                                preconditioner = self._synchronized_preconditioner(F_curr_safe, scale, device)
                                 v = g / (preconditioner + eps)
 
                                 # 计算v的均值和标准差（统计分布特征）
@@ -1160,8 +1264,10 @@ class UIETrainer(Seq2SeqTrainer):
                                 v2_clip = torch.clamp(v2, max=cap)
 
 
-                                a_raw_alg = (v2_clip * f_past_eff).sum()
-                                b_raw_alg = (v_alg * f_past_eff * delta_theta).sum()
+                                # a_raw_alg = (v2_clip * f_past_eff).sum()
+                                # b_raw_alg = (v_alg * f_past_eff * delta_theta).sum()
+                                a_local = (v2_clip * f_past_eff).sum()  # v^T \bar F v
+                                b_local = (v_alg * f_past_eff * delta_theta).sum()
 
 
                                 # a_raw_alg = (v2_clip * f_past).sum()
@@ -1169,7 +1275,21 @@ class UIETrainer(Seq2SeqTrainer):
                                 # 6. 半径余量 Δ_ℓ = R² - r²_ℓ
                                 if name == 'base_model.model.encoder.block.10.layer.0.SelfAttention.q.lora_B.default.weight':
                                     pass
-                                Delta = (self.radius ** 2) - r2[name]
+                                # Delta = (self.radius ** 2) - r2[name]
+                                Delta_local = (self.radius ** 2) - r2[name]
+                                Q_local = (g * v_alg).sum()
+
+                                a_raw_alg = torch.as_tensor(self._reduce_scalar(a_local, reduction="mean"),
+                                                            device=device, dtype=p.dtype)
+                                b_raw_alg = torch.as_tensor(self._reduce_scalar(b_local, reduction="mean"),
+                                                            device=device, dtype=p.dtype)
+                                Delta = torch.as_tensor(self._reduce_scalar(Delta_local, reduction="mean"),
+                                                        device=device, dtype=p.dtype)
+                                Q_alg = torch.as_tensor(self._reduce_scalar(Q_local, reduction="mean"), device=device,
+                                                        dtype=p.dtype)
+
+
+
                                 Delta_s.append(Delta)
 
                                 if Delta.item() <= self.tau:
@@ -1211,7 +1331,8 @@ class UIETrainer(Seq2SeqTrainer):
                                     # --------------------------
                                     if b_raw_alg.item() < 0.0:  # 冲突层：b_B^(ℓ) < 0（新旧任务方向冲突）
                                         # 闭式步长公式（严格按算法）：
-                                        term_u = b_raw_alg - self.sigma
+                                        #term_u = b_raw_alg - self.sigma
+                                        term_u = b_raw_alg - torch.as_tensor(self.sigma, device=device, dtype=p.dtype)
                                         discriminant = term_u ** 2 + self.beta * a_safe * Delta_eff
                                         discriminant = torch.clamp(discriminant, min=0.0)  # 确保开方非负
                                         xx = (term_u + torch.sqrt(discriminant))
@@ -1226,7 +1347,7 @@ class UIETrainer(Seq2SeqTrainer):
                                         if eta_alg.item() > 0:
                                             conf[name] += 1
                                     else:
-                                        eta_trust = torch.sqrt(Delta_eff / (a_safe))
+                                        eta_trust = torch.sqrt(Delta_eff / a_safe)
                                         eta_save_step.append(eta_trust.detach().float().mean().cpu().clone())
                                         eta_alg = torch.clamp(
                                             eta_trust,
@@ -1240,16 +1361,19 @@ class UIETrainer(Seq2SeqTrainer):
                                     eta = eta_alg
                                     eta_d.append(eta)
 
-
+                                if step % 1 == 0:
+                                    self._assert_equal_across_processes(eta_alg.item(), name="eta_alg")
 
                                 # --------------------------
                                 # 算法步骤9：累计收益 B^round_ℓ
                                 # --------------------------
                                 # 二阶收益 Q_B^(ℓ) = (g_B^(ℓ))^T * (F_curr^(ℓ))^(-1) * g_B^(ℓ)（等价于 g·v）
-                                Q_alg = torch.sum(g * v_alg)
+                                # Q_alg = torch.sum(g * v_alg)
                                 # 收益计算：max{0, (η - 0.5η²) * Q}
-                                gain = (eta_alg - 0.5 * eta_alg ** 2) * Q_alg
-                                gain = torch.clamp(gain, min=0.0)  # 收益非负
+                                gain_local = (eta_alg - 0.5 * eta_alg * eta_alg) * Q_alg
+                                gain_local = torch.clamp(gain_local, min=0.0)
+                                gain = torch.as_tensor(self._reduce_scalar(gain_local, reduction="mean"), device=device,
+                                                       dtype=p.dtype)
 
                                 B_round[name] = B_round[name] + gain
                                 if "model.encoder.block.1.layer.0.SelfAttention.v.lora_A.default" in name:
@@ -1262,14 +1386,15 @@ class UIETrainer(Seq2SeqTrainer):
 
                                 if "base_model.model.encoder.block.3.layer.0.SelfAttention.q.lora_A.default.weight" in name:
                                     pass
-                                r2[name] = r2[name] - 2.0 * eta_alg * b_raw_alg + (eta_alg ** 2) * a_raw_alg
+                                r2[name] = r2[name] - 2.0 * eta_alg * b_raw_alg + (eta_alg * eta_alg) * a_raw_alg
                                 if r2[name] > 1:
                                     pass
                                 # --------------------------
                                 # 算法步骤11：更新参数 θ^(ℓ) = θ^(ℓ) - η·v_B^(ℓ)
                                 # --------------------------
                                 if eta.item() != 0.0:
-                                    p.add_(-eta * v_scaled)  # 修正：使用缩放后的v_scaled
+                                    with self.accelerator.no_sync(model):
+                                        p.add_(-eta * v_scaled)  # 修正：使用缩放后的v_scaled
                                     # p.add_(-self.args.learning_rate * g)
                                     # state = self.adam_states[name]
                                     # state['t'] += 1
@@ -1300,6 +1425,8 @@ class UIETrainer(Seq2SeqTrainer):
                                 # 与自适应模式相同的手动更新方式（保证公平性）
                                 p.add_(-eta_baseline * v_baseline)
 
+                    self.accelerator.wait_for_everyone()
+
                     s = 0
                     for i in eta_d:
                         if i == self.args.learning_rate:
@@ -1320,8 +1447,6 @@ class UIETrainer(Seq2SeqTrainer):
                         # for metric, value in health_report['metrics'].items():
                         #     if 'grad_norm' in metric or 'b_round' in metric:
                         #         logger.info(f"  {metric}: {value:.6f}")
-
-            self.accelerator.wait_for_everyone()
 
             # 辅助函数：计算通信数据量（字节）和时间（秒）
             def calculate_comm_metrics(param_dict: Dict[str, torch.Tensor]) -> Tuple[float, int]:
@@ -1358,6 +1483,13 @@ class UIETrainer(Seq2SeqTrainer):
                 else:
                     selected_flags = _knapsack(values, costs, budget)
 
+                if self.accelerator.num_processes > 1:
+                    import torch.distributed as dist
+                    obj = [selected_flags] if self.accelerator.is_main_process else [None]
+                    dist.broadcast_object_list(obj, src=0)
+                    selected_flags = obj[0]
+
+
                 # Test
                 # selected_flags = [True] * len(names)
                 selection_map = {n: f for n, f in zip(names, selected_flags)}
@@ -1366,7 +1498,7 @@ class UIETrainer(Seq2SeqTrainer):
 
 
                 # 1) 自适应模式：仅传输选中层的delta
-                state_dict = unwrapped_model.state_dict()
+                state_dict = model.state_dict()
                 adaptive_delta = {}
                 for name in base_params:
                     local_param = state_dict[name].detach().cpu()

@@ -32,7 +32,6 @@ from datasets import load_dataset
 import transformers
 import schedulefree
 from filelock import FileLock
-from accelerate import PartialState
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
@@ -194,21 +193,21 @@ class DataTrainingArguments:
         metadata={"help": "The maximum number of instances we will consider for each validation/test task."}
     )
     max_train_samples: Optional[int] = field(
-        default=2000,
+        default=None,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
                     "value if set."
         },
     )
     max_eval_samples: Optional[int] = field(
-        default=500,
+        default=1000,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
                     "value if set."
         },
     )
     max_predict_samples: Optional[int] = field(
-        default=500,
+        default=1000,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
                     "value if set."
@@ -311,7 +310,6 @@ def main():
     else:
         model_args, data_args, training_args, federated_args = parser.parse_args_into_dataclasses()
 
-    # distributed_state = PartialState()
 
     if federated_args.mode == "federated":
         from federated_uie_lora import run_federated_training
@@ -691,7 +689,7 @@ def main():
         trainer.save_metrics("predict", metrics)
         all_metrics.update(metrics)
 
-    distributed_state.wait_for_everyone()
+    # distributed_state.wait_for_everyone()
     return results
 
 

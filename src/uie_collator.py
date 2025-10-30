@@ -1,5 +1,5 @@
 import logging
-
+from torch.nn.parallel import DistributedDataParallel
 import torch
 from transformers.data.data_collator import *
 
@@ -39,7 +39,12 @@ class DataCollatorForUIE:
         if return_tensors is None:
             return_tensors = self.return_tensors
 
-        model_name = self.model.config._name_or_path
+        if isinstance(self.model, DistributedDataParallel):
+            original_model = self.model.module
+        else:
+            original_model = self.model
+
+        model_name = original_model.config._name_or_path
         # print(model_name)
         if check_model(model_name, SUPPORTED_DECODER_MODELS):
             model_inputs = self.decoder_call(batch, return_tensors)
@@ -122,11 +127,17 @@ class DataCollatorForUIE:
 
             # prepare decoder_input_ids
             if self.model is not None:
-                decoder_input_ids = self.model.prepare_decoder_input_ids_from_labels(labels=model_inputs["labels"])
+                # 若模型被DDP包装，通过.module获取原始模型
+                if isinstance(self.model, DistributedDataParallel):
+                    original_model = self.model.module
+                else:
+                    original_model = self.model
+                decoder_input_ids = original_model.prepare_decoder_input_ids_from_labels(labels=model_inputs["labels"])
                 model_inputs["decoder_input_ids"] = decoder_input_ids
 
             self._save_samples(model_inputs, sources, labels)
-
+        logger.info(
+            f"seq2seq_call: input_ids shape {model_inputs['input_ids'].shape}, labels shape {model_inputs['labels'].shape}")
         return model_inputs
 
     def decoder_call(self, batch, return_tensors):
@@ -204,24 +215,32 @@ class DataCollatorForUIE:
 
             self._save_samples(model_inputs, sources, labels)
 
+        logger.info(
+            f"decoder_call: input_ids shape {model_inputs['input_ids'].shape}, loss_mask shape {model_inputs['loss_mask'].shape}")
         return model_inputs
 
     def _save_samples(self, model_inputs, sources, labels):
         if not self.input_record_file:
             return
 
+        # 只让主进程写入文件（避免分布式环境下的竞争）
+        if not self.accelerator.is_main_process:
+            return
+
         loss_label = []
-        if hasattr(model_inputs, 'loss_mask'):
-            for loss, id in zip(model_inputs.loss_mask, model_inputs.input_ids):
-                loss_label.append(self.tokenizer.decode((loss * id).view(-1).int()))
+        if 'loss_mask' in model_inputs:  # 用字典键判断更安全，避免hasattr的潜在问题
+            for loss, input_id in zip(model_inputs['loss_mask'], model_inputs['input_ids']):
+                loss_label.append(self.tokenizer.decode((loss * input_id).view(-1).int(), skip_special_tokens=True))
 
             with open(self.input_record_file, 'a+', encoding='utf-8') as f:
                 for text, label, mask_label in zip(sources, labels, loss_label):
-                    f.write(text+'\n')
-                    f.write(label + '\n')
-                    f.write(mask_label+'\n\n')
+                    f.write(f"Source: {text}\n")
+                    f.write(f"Label: {label}\n")
+                    f.write(f"Loss Mask: {mask_label}\n\n")
         else:
             with open(self.input_record_file, 'a+', encoding='utf-8') as f:
-                for text, label in zip(sources, labels['input_ids']):
-                    f.write(text + '\n')
-                    f.write(self.tokenizer.decode(label, clean_up_tokenization_spaces=False) + '\n')
+                for text, label_ids in zip(sources, labels['input_ids']):
+                    label_text = self.tokenizer.decode(label_ids, clean_up_tokenization_spaces=False)
+                    f.write(f"Source: {text}\n")
+                    f.write(f"Label: {label_text}\n\n")
+
