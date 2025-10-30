@@ -788,11 +788,11 @@ class UIETrainer(Seq2SeqTrainer):
             if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
                 print(f"[DEBUG] 反向传播完成, loss: {loss.item():.6f}")
 
-            # 关键：等待所有进程完成
-            self.accelerator.wait_for_everyone()
-
-            if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
-                print(f"[DEBUG] 所有进程同步完成")
+            # # 关键：等待所有进程完成
+            # self.accelerator.wait_for_everyone()
+            #
+            # if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
+            #     print(f"[DEBUG] 所有进程同步完成")
 
             return loss.detach()
 
@@ -822,11 +822,14 @@ class UIETrainer(Seq2SeqTrainer):
 
 
         if self.method == "adaptive" and task_id == 1:
-            dataloader = self.get_train_dataloader()
-            dataloader = self.accelerator.prepare(dataloader)
-            # 验证：不同进程的数据集长度应不同（分片后）
-            print(f"进程 {self.accelerator.process_index} 数据加载器长度: {len(dataloader)}")
-            return super().train(**kwargs)
+            output = super().train(**kwargs)
+            # Ensure every rank completes the wrapped Trainer cycle before
+            # returning control to the federated driver.  Without this
+            # rendezvous, rank0 may start assembling payloads while other
+            # workers are still draining the accelerate barriers, leading to
+            # an apparent hang after the first local epoch completes.
+            self.accelerator.wait_for_everyone()
+            return output
 
         elif self.method == "adaptive" and task_id > 1:
             state_has_history = self.continual_state.has_valid_history() if self.continual_state is not None else False
@@ -840,6 +843,7 @@ class UIETrainer(Seq2SeqTrainer):
                 F_client = compute_fisher(self.model, self.get_train_dataloader())
                 F_client = {k: F_client.get(k, torch.zeros_like(base_params[k])) for k in base_params}
                 theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+                self.accelerator.wait_for_everyone()
                 return delta, F_client, theta_last
 
             # --------------Train---------------
@@ -849,7 +853,7 @@ class UIETrainer(Seq2SeqTrainer):
             # model = self.model
             model = self.accelerator.unwrap_model(self.model)
             dataloader = self.get_train_dataloader()
-            dataloader = self.accelerator.prepare(dataloader)
+            # dataloader = self.accelerator.prepare(dataloader)
             device = self.accelerator.device
 
             # device = next(model.parameters()).device
@@ -1564,6 +1568,7 @@ class UIETrainer(Seq2SeqTrainer):
             theta_last = {k: state_dict[k].detach().cpu() for k in base_params.keys()}
 
             # 返回值新增通信节省时间
+            self.accelerator.wait_for_everyone()
             return delta, F_client, theta_last
 
 

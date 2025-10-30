@@ -39,10 +39,9 @@ class DataCollatorForUIE:
         if return_tensors is None:
             return_tensors = self.return_tensors
 
-        if isinstance(self.model, DistributedDataParallel):
-            original_model = self.model.module
-        else:
-            original_model = self.model
+        original_model = self.model
+        if hasattr(original_model, "module"):
+            original_model = original_model.module
 
         model_name = original_model.config._name_or_path
         # print(model_name)
@@ -127,11 +126,9 @@ class DataCollatorForUIE:
 
             # prepare decoder_input_ids
             if self.model is not None:
-                # 若模型被DDP包装，通过.module获取原始模型
-                if isinstance(self.model, DistributedDataParallel):
-                    original_model = self.model.module
-                else:
-                    original_model = self.model
+                original_model = self.model
+                if hasattr(original_model, "module"):
+                    original_model = original_model.module
                 decoder_input_ids = original_model.prepare_decoder_input_ids_from_labels(labels=model_inputs["labels"])
                 model_inputs["decoder_input_ids"] = decoder_input_ids
 

@@ -496,7 +496,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     # compare(client_datasets,fed_args.dirichlet_alpha)
     model, tokenizer = build_model_and_tokenizer(model_args)
 
-    model = accelerator.prepare(model)
+    # model = accelerator.prepare(model)
 
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
 
@@ -531,9 +531,18 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         return result
 
     def collator_for(model):
+        # 确保数据整理器始终拿到未被分布式/Accelerate 包装的原始模型，
+        # 以便访问 config 以及 prepare_decoder_input_ids 等方法。
+        base_model = model
+        try:
+            base_model = accelerator.unwrap_model(model)
+        except Exception:
+            if hasattr(model, "module"):
+                base_model = model.module
+
         return DataCollatorForUIE(
             tokenizer,
-            model=model,
+            model=base_model,
             padding="longest",
             max_source_length=data_args.max_source_length,
             max_target_length=data_args.max_target_length,
@@ -586,7 +595,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     base_args.do_eval = False
     base_args.do_predict = False
     method = base_args.method
-    logger.info("Use method: {}".format(method))
+    if accelerator.is_main_process:
+        logger.info("Use method: {}".format(method))
     global_model = model
     device = accelerator.device
 
@@ -632,7 +642,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     }
     if accelerator.is_main_process:
         logger.info(f"预计算的LoRA层通信成本: "
-                f"{layer_costs['module.base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
+                f"{layer_costs['base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
 
     for rnd in range(fed_args.global_rounds):
         if accelerator.is_main_process:
@@ -688,11 +698,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             local_model = copy.deepcopy(global_peft_model)
 
             # 重新用 accelerator 准备（适配本地分布式环境）
-            local_model = accelerator.prepare(local_model)
-
-
-
-            local_model = local_model.to(accelerator.device)
+            # local_model = accelerator.prepare(local_model)
+            # local_model = local_model.to(accelerator.device)
             local_args = copy.deepcopy(base_args)
             local_args.resume_from_checkpoint = None
             local_args.num_train_epochs = fed_args.local_epochs
@@ -714,18 +721,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     accelerator=accelerator,
                 )
                 trainer.train(task_id=data_args.task)
+                trainer.accelerator.wait_for_everyone()
 
-            # 仅 rank0 组装 payload；其他 rank 空列表
-            rank_payloads = []
-            if _is_main():
-                state_dict = local_model.state_dict()
-                delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
-                rank_payloads.append({
-                    "cid": cid,
-                    "weight": len(client_datasets[cid]),
-                    "delta": delta,
-                    "cache": None,
-                })
+                # 仅 rank0 组装 payload；其他 rank 空列表
+                rank_payloads = []
+                if _is_main():
+                    trained_model = trainer.accelerator.unwrap_model(trainer.model)
+                    state_dict = trained_model.state_dict()
+                    delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
+                    rank_payloads.append({
+                        "cid": cid,
+                        "weight": len(client_datasets[cid]),
+                        "delta": delta,
+                        "cache": None,
+                    })
 
             elif method == "adaptive":
                 client_state = ContinualState()
@@ -747,13 +756,14 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         accelerator=accelerator,
                     )
                     trainer.train(task_id=data_args.task)
-
+                    trainer.accelerator.wait_for_everyone()
 
                     rank_payloads = []
                     if _is_main():
-                        state_dict = local_model.state_dict()
+                        trained_model = trainer.accelerator.unwrap_model(trainer.model)
+                        state_dict = trained_model.state_dict()
                         delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
-                        F_client = compute_fisher_diag(local_model, trainer.get_train_dataloader())
+                        F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
                         theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
                         rank_payloads.append({
                             "cid": cid,
@@ -782,6 +792,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         base_params={k: global_state_cpu[k] for k in lora_keys},
                         cid=cid
                     )
+                    trainer.accelerator.wait_for_everyone()
                     rank_payloads = []
                     if _is_main():
                         rank_payloads.append({
@@ -793,9 +804,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             else:
                 rank_payloads = []
                 if _is_main():
-                    state_dict = local_model.state_dict()
+                    trained_model = trainer.accelerator.unwrap_model(trainer.model)
+                    state_dict = trained_model.state_dict()
                     delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
-                    F_client = compute_fisher_diag(local_model, trainer.get_train_dataloader())
+                    F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
                     theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
                     rank_payloads.append({
                         "cid": cid,

@@ -12,7 +12,7 @@ lamda_1=0
 
 # bash scripts/order_1.sh> logs_and_outputs/order_1/logs/train_and_infer.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=0,1,2 deepspeed --master_port $port src/run_uie_lora.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
