@@ -769,24 +769,44 @@ class UIETrainer(Seq2SeqTrainer):
             logger.info(f"[DEBUG] training_step 开始, 进程: {self.accelerator.process_index}")
 
         try:
-            # 原有的训练逻辑
-            model.train()
-            inputs = self._prepare_inputs(inputs)
+            # # 原有的训练逻辑
+            # model.train()
+            # inputs = self._prepare_inputs(inputs)
+            #
+            # with self.accelerator.autocast():
+            #     outputs = model(**inputs)
+            #     loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+            #
+            # # 梯度累积
+            # if self.args.gradient_accumulation_steps > 1:
+            #     loss = loss / self.args.gradient_accumulation_steps
+            #
+            # # 反向传播
+            # self.accelerator.backward(loss)
+            #
+            # # 调试信息
+            # if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
+            #     print(f"[DEBUG] 反向传播完成, loss: {loss.item():.6f}")
 
-            with self.accelerator.autocast():
-                outputs = model(**inputs)
-                loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+            loss = super().training_step(model, inputs)
+        except Exception as exc:  # pragma: no cover - debug safeguard
+            logger.error(f"training_step 错误: {exc}")
+            return torch.tensor(
+                0.0,
+                device=self.accelerator.device if hasattr(self, "accelerator") else None,
+                requires_grad=False,
+            )
 
-            # 梯度累积
-            if self.args.gradient_accumulation_steps > 1:
-                loss = loss / self.args.gradient_accumulation_steps
+        if hasattr(self, "accelerator") and self.accelerator.is_main_process:
+            try:
+                loss_value = loss.item()
+            except Exception:
+                loss_value = float("nan")
+            print(f"[DEBUG] 反向传播完成, loss: {loss_value:.6f}")
 
-            # 反向传播
-            self.accelerator.backward(loss)
+        return loss
 
-            # 调试信息
-            if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
-                print(f"[DEBUG] 反向传播完成, loss: {loss.item():.6f}")
+
 
             # # 关键：等待所有进程完成
             # self.accelerator.wait_for_everyone()
@@ -794,12 +814,12 @@ class UIETrainer(Seq2SeqTrainer):
             # if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
             #     print(f"[DEBUG] 所有进程同步完成")
 
-            return loss.detach()
+            # return loss.detach()
 
-        except Exception as e:
-            logger.error(f"training_step 错误: {e}")
-            # 返回一个虚拟的损失值避免卡死
-            return torch.tensor(0.0, requires_grad=False)
+        # except Exception as e:
+        #     logger.error(f"training_step 错误: {e}")
+        #     # 返回一个虚拟的损失值避免卡死
+        #     return torch.tensor(0.0, requires_grad=False)
 
     def train(
         self,
