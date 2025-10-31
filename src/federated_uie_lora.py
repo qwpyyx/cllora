@@ -11,7 +11,7 @@ import json
 import datasets
 import numpy as np
 import torch
-from accelerate import Accelerator
+from accelerate.utils import wait_for_everyone
 import math
 from datasets import load_dataset, concatenate_datasets
 import pandas as pd
@@ -35,6 +35,28 @@ from scipy.stats import pearsonr
 from typing import Dict, Tuple, List
 logger = logging.getLogger("federated_training")
 CURRENT_DIR = os.path.dirname(__file__)
+
+def _trainer_accelerator(trainer):
+    return getattr(trainer, "accelerator", None)
+
+
+def _trainer_wait_for_everyone(trainer) -> None:
+    accel = _trainer_accelerator(trainer)
+    if accel is not None:
+        accel.wait_for_everyone()
+    elif dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    else:  # fallback for single-process execution
+        wait_for_everyone()
+
+
+def _trainer_unwrap_model(trainer):
+    accel = _trainer_accelerator(trainer)
+    if accel is not None:
+        return accel.unwrap_model(trainer.model)
+    return trainer.model
+
+
 
 def partition_dataset(dataset, num_clients: int, alpha: float):
     label_key = "Dataset"
@@ -400,11 +422,10 @@ def compare_fishers(
 
 
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
-    accelerator = Accelerator()
-    world = accelerator.num_processes
+    world = max(getattr(training_args, "world_size", 1), 1)
 
     def _is_main():
-        return accelerator.is_main_process
+        return getattr(training_args, "process_index", 0) == 0
 
     # loading logging
     logging.basicConfig(format="%(message)s", handlers=[logging.StreamHandler()])
@@ -534,11 +555,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         # 确保数据整理器始终拿到未被分布式/Accelerate 包装的原始模型，
         # 以便访问 config 以及 prepare_decoder_input_ids 等方法。
         base_model = model
-        try:
-            base_model = accelerator.unwrap_model(model)
-        except Exception:
-            if hasattr(model, "module"):
-                base_model = model.module
+        if hasattr(base_model, "module"):
+            base_model = base_model.module
 
         return DataCollatorForUIE(
             tokenizer,
@@ -595,10 +613,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     base_args.do_eval = False
     base_args.do_predict = False
     method = base_args.method
-    if accelerator.is_main_process:
+    if _is_main():
         logger.info("Use method: {}".format(method))
     global_model = model
-    device = accelerator.device
+    device = next(global_model.parameters()).device
 
     # 加载过去任务的fisher信息
     current_output_dir = training_args.output_dir
@@ -640,12 +658,12 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         k: calculate_layer_packet_cost(p)
         for k, p in lora_params.items()
     }
-    if accelerator.is_main_process:
+    if _is_main():
         logger.info(f"预计算的LoRA层通信成本: "
                 f"{layer_costs['base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
 
     for rnd in range(fed_args.global_rounds):
-        if accelerator.is_main_process:
+        if _is_main():
             logger.info(f"Global round {rnd + 1}/{fed_args.global_rounds}")
 
         # selected = client_rng.sample(
@@ -654,8 +672,14 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         # )
 
         # rank0 抽样，被所有进程共享
-        selected = client_rng.sample(range(fed_args.num_clients),
-        min(fed_args.clients_per_round, fed_args.num_clients),) if _is_main() else None
+        selected = (
+            client_rng.sample(
+                range(fed_args.num_clients),
+                min(fed_args.clients_per_round, fed_args.num_clients),
+            )
+            if _is_main()
+            else None
+        )
 
 
         selected_container = [selected]
@@ -668,7 +692,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             selected = client_rng.sample(
                 range(fed_args.num_clients),
                 min(fed_args.clients_per_round, fed_args.num_clients),
-                )
+            )
 
         if _is_main():
             logger.info(f"Selected client {selected}")
@@ -718,15 +742,14 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     data_collator=collator_for(local_model),
                     compute_metrics=None,
                     callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-                    accelerator=accelerator,
                 )
                 trainer.train(task_id=data_args.task)
-                trainer.accelerator.wait_for_everyone()
+                _trainer_wait_for_everyone(trainer)
 
                 # 仅 rank0 组装 payload；其他 rank 空列表
                 rank_payloads = []
                 if _is_main():
-                    trained_model = trainer.accelerator.unwrap_model(trainer.model)
+                    trained_model = _trainer_unwrap_model(trainer)
                     state_dict = trained_model.state_dict()
                     delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
                     rank_payloads.append({
@@ -753,14 +776,13 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         data_collator=collator_for(local_model),
                         compute_metrics=None,
                         callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-                        accelerator=accelerator,
                     )
                     trainer.train(task_id=data_args.task)
-                    trainer.accelerator.wait_for_everyone()
+                    _trainer_wait_for_everyone(trainer)
 
                     rank_payloads = []
                     if _is_main():
-                        trained_model = trainer.accelerator.unwrap_model(trainer.model)
+                        trained_model = _trainer_unwrap_model(trainer)
                         state_dict = trained_model.state_dict()
                         delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
                         F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
@@ -784,7 +806,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         state=client_state,
                         comm_budget=fed_args.comm_budget,
                         layer_costs=layer_costs,
-                        accelerator=accelerator,
                     )
 
                     delta, F_client, theta_last = trainer.train(
@@ -792,7 +813,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         base_params={k: global_state_cpu[k] for k in lora_keys},
                         cid=cid
                     )
-                    trainer.accelerator.wait_for_everyone()
+                    _trainer_wait_for_everyone(trainer)
                     rank_payloads = []
                     if _is_main():
                         rank_payloads.append({
@@ -804,7 +825,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             else:
                 rank_payloads = []
                 if _is_main():
-                    trained_model = trainer.accelerator.unwrap_model(trainer.model)
+                    trained_model = _trainer_unwrap_model(trainer)
                     state_dict = trained_model.state_dict()
                     delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
                     F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
@@ -821,8 +842,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.all_gather_object(gathered, rank_payloads)
             else:
-                gathered[0] = rank_payloads  # 单机单卡直接赋值 # 仍可使用 dist API（与 Accelerator 兼容）
-            if accelerator.is_main_process:
+                gathered[0] = rank_payloads
+            if _is_main():
                 for pl in gathered:
                     if pl:
                         all_payloads.extend(pl)
@@ -867,7 +888,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         update_dict = {k: global_state_cpu[k].to(device) for k in lora_keys}
         global_model.load_state_dict(update_dict, strict=False)
         # distributed_state.wait_for_everyone()
-        accelerator.wait_for_everyone()
+        wait_for_everyone()
 
 
     # ===== 任务结束：将“本任务”信息并入历史 =====
@@ -897,19 +918,19 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
             if _is_main():
                 client_state.save(client_state_path)
-        accelerator.wait_for_everyone()
+        wait_for_everyone()
 
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")
     # global_model.save_pretrained(peft_model_id)
     # tokenizer.save_pretrained(peft_model_id)
-    if accelerator.is_main_process:
-        accelerator.save(global_model.state_dict(), os.path.join(peft_model_id, "pytorch_model.bin"))
+    if _is_main():
+        torch.save(global_model.state_dict(), os.path.join(peft_model_id, "pytorch_model.bin"))
         tokenizer.save_pretrained(peft_model_id)
         logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
     all_metrics.update({"adapter_saved": peft_model_id})
-    accelerator.wait_for_everyone()
+    wait_for_everyone()
     # logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
 
     # ========== 最终预测 & 指标记录 ==========
@@ -923,7 +944,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             data_collator=collator_for(global_model),
             compute_metrics=compute_rouge_metrics,
             callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-            accelerator=accelerator,
         )
 
         predict_results = eval_trainer.predict(
@@ -942,7 +962,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         all_metrics.update(metrics)
         logger.info(f"Final federated evaluation metrics: {metrics}")
 
-    accelerator.wait_for_everyone()
+    wait_for_everyone()
 
     return all_metrics
 

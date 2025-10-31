@@ -20,7 +20,7 @@ import logging
 import time
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, Any, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 
 # logger = logging.getLogger(__name__)
@@ -562,12 +562,20 @@ class UIETrainer(Seq2SeqTrainer):
         super().__init__(*args, **kwargs)  # 此时 kwargs 中已无 state，父类不会报错
 
 
-        # Accelerator 集成
-        if accelerator is None:
-            # 如果没有传入 accelerator，创建一个默认的
-            self.accelerator = Accelerator()
-        else:
+        # 🤗 Transformers 在 ``Trainer`` 基类内部已经会根据 ``TrainingArguments``
+        # 初始化一个 ``Accelerator`` 实例，并在数据加载、梯度累积和同步等
+        # 关键路径中复用它。如果我们在子类里无条件地再创建一个新的
+        # ``Accelerator``，就会触发第二套分布式状态 —— 这在 ``accelerate
+        # launch`` 的场景下会造成进程间握手的不一致，从而出现首轮训练
+        # 卡住的现象。这里通过读取父类已经准备好的 ``accelerator``（若存在）
+        # 并在用户显式传入时才覆写，确保我们始终引用同一个分布式上下文。
+        base_accelerator = getattr(self, "accelerator", None)
+        if accelerator is not None:
             self.accelerator = accelerator
+        elif base_accelerator is not None:
+            # Trainer 可能通过属性而非实例属性暴露 accelerator，这里将其缓存
+            # 到实例字典中，方便子类内部统一访问。
+            self.accelerator = base_accelerator
 
 
 
@@ -593,6 +601,27 @@ class UIETrainer(Seq2SeqTrainer):
         self.beta1 = 0.9  # 一阶矩动量系数
         self.beta2 = 0.999  # 二阶矩动量系数
         self.eps = 1e-8  # 数值稳定项
+
+
+    # ------------------------------------------------------------------
+    # Utilities to safely interact with the (optional) Accelerator handle
+    # ------------------------------------------------------------------
+    def _current_accelerator(self) -> Optional[Accelerator]:
+        return getattr(self, "accelerator", None)
+
+    def _wait_for_everyone(self) -> None:
+        accel = self._current_accelerator()
+        if accel is not None:
+            accel.wait_for_everyone()
+        elif dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+    def _unwrap_model(self, model: Optional[nn.Module] = None) -> nn.Module:
+        accel = self._current_accelerator()
+        target = model if model is not None else self.model
+        if accel is not None:
+            return accel.unwrap_model(target)
+        return target
 
 
     def _ema_fisher_from_synced_grads(self, unwrapped_model, F_curr: Dict[str, torch.Tensor], alpha: float):
@@ -843,12 +872,7 @@ class UIETrainer(Seq2SeqTrainer):
 
         if self.method == "adaptive" and task_id == 1:
             output = super().train(**kwargs)
-            # Ensure every rank completes the wrapped Trainer cycle before
-            # returning control to the federated driver.  Without this
-            # rendezvous, rank0 may start assembling payloads while other
-            # workers are still draining the accelerate barriers, leading to
-            # an apparent hang after the first local epoch completes.
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
             return output
 
         elif self.method == "adaptive" and task_id > 1:
