@@ -833,6 +833,7 @@ class UIETrainer(Seq2SeqTrainer):
                 loss_value = float("nan")
             print(f"[DEBUG] 反向传播完成, loss: {loss_value:.6f}")
 
+
         return loss
 
 
@@ -871,8 +872,16 @@ class UIETrainer(Seq2SeqTrainer):
 
 
         if self.method == "adaptive" and task_id == 1:
+            logger.info(f"[Task {task_id}] 开始调用父类train方法")
+            print(
+                "[whoami] get_train_dataloader =",
+                self.get_train_dataloader.__qualname__,
+                self.get_train_dataloader.__module__
+            )
             output = super().train(**kwargs)
-            self._wait_for_everyone()
+            #logger.info(f"[Task {task_id}] 父类train方法执行完成，进程 {self.accelerator.process_index}")
+            #self._wait_for_everyone()
+            #logger.info(f"[Task {task_id}] 所有进程同步完成，进程 {self.accelerator.process_index}")
             return output
 
         elif self.method == "adaptive" and task_id > 1:

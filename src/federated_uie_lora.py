@@ -18,7 +18,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import transformers
 import torch.distributed as dist
-from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 from uie_collator import DataCollatorForUIE
 from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions, compute_fisher, compute_fisher_arithmetic
@@ -56,32 +55,50 @@ def _trainer_unwrap_model(trainer):
         return accel.unwrap_model(trainer.model)
     return trainer.model
 
+def partition_dataset(train_dataset, num_clients, alpha, *, base_seed: int):
+     """
+     纯函数式联邦划分：给定 base_seed, num_clients, alpha, 和稳定的 train_dataset 顺序，
+     任意进程独立调用，都得到完全相同的划分结果。
+     """
+     rng = np.random.RandomState(base_seed)   # 局部 RNG，不污染全局
 
+     num_samples = len(train_dataset)
+     all_idx = np.arange(num_samples)
+     rng.shuffle(all_idx)                     # ← 替代 np.random.shuffle
 
-def partition_dataset(dataset, num_clients: int, alpha: float):
-    label_key = "Dataset"
-    label2indices = defaultdict(list)
-    for idx, example in enumerate(dataset):
-        label2indices[example[label_key]].append(idx)
+     # 例：数量非IID
+     props = rng.dirichlet([alpha] * num_clients)  # ← 替代 np.random.dirichlet
+     sizes = (props * num_samples).astype(int)
+     sizes[-1] = num_samples - sizes[:-1].sum()
+     splits = np.split(all_idx, np.cumsum(sizes)[:-1])
 
-    client_indices = [[] for _ in range(num_clients)]
-    for indices in label2indices.values():
-        np.random.shuffle(indices)
-        props = np.random.dirichlet([alpha] * num_clients)
-        # 累计比例映射到具体的 split 位置
-        bounds = (np.cumsum(props) * len(indices)).astype(int)[:-1]
-        splits = np.split(np.array(indices), bounds)
-        for cid, idxs in enumerate(splits):
-            client_indices[cid].extend(idxs.tolist())
+     client_datasets = [train_dataset.select(s.tolist()) for s in splits]
+     return client_datasets
 
-    # 修复空 client：从样本最多的 client 那里“偷”一个
-    for cid, idxs in enumerate(client_indices):
-        if len(idxs) == 0:
-            donor = max(range(num_clients), key=lambda x: len(client_indices[x]))
-            stolen = client_indices[donor].pop()
-            client_indices[cid].append(stolen)
-
-    return [dataset.select(idxs) for idxs in client_indices]
+# def partition_dataset(dataset, num_clients: int, alpha: float):
+#     label_key = "Dataset"
+#     label2indices = defaultdict(list)
+#     for idx, example in enumerate(dataset):
+#         label2indices[example[label_key]].append(idx)
+#
+#     client_indices = [[] for _ in range(num_clients)]
+#     for indices in label2indices.values():
+#         np.random.shuffle(indices)
+#         props = np.random.dirichlet([alpha] * num_clients)
+#         # 累计比例映射到具体的 split 位置
+#         bounds = (np.cumsum(props) * len(indices)).astype(int)[:-1]
+#         splits = np.split(np.array(indices), bounds)
+#         for cid, idxs in enumerate(splits):
+#             client_indices[cid].extend(idxs.tolist())
+#
+#     # 修复空 client：从样本最多的 client 那里“偷”一个
+#     for cid, idxs in enumerate(client_indices):
+#         if len(idxs) == 0:
+#             donor = max(range(num_clients), key=lambda x: len(client_indices[x]))
+#             stolen = client_indices[donor].pop()
+#             client_indices[cid].append(stolen)
+#
+#     return [dataset.select(idxs) for idxs in client_indices]
 
 def build_model_and_tokenizer(model_args: ModelArguments):
     if 'adapter' in model_args.model_name_or_path:
@@ -424,6 +441,10 @@ def compare_fishers(
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
     world = max(getattr(training_args, "world_size", 1), 1)
 
+    from accelerate.utils import set_seed
+    set_seed(fed_args.federated_seed, device_specific=False)  # 仅供 Trainer/Sampler 等内部用
+
+
     def _is_main():
         return getattr(training_args, "process_index", 0) == 0
 
@@ -513,7 +534,17 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # test_dataset = raw_datasets["test"] if training_args.do_predict else None
 
-    client_datasets = partition_dataset(train_dataset, fed_args.num_clients, fed_args.dirichlet_alpha)
+    client_datasets = partition_dataset(
+                train_dataset,
+                fed_args.num_clients,
+                fed_args.dirichlet_alpha,
+                base_seed = fed_args.federated_seed,  # 固定联邦种子
+        )
+
+
+
+
+
     # compare(client_datasets,fed_args.dirichlet_alpha)
     model, tokenizer = build_model_and_tokenizer(model_args)
 
@@ -671,28 +702,19 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         #     min(fed_args.clients_per_round, fed_args.num_clients),
         # )
 
-        # rank0 抽样，被所有进程共享
-        selected = (
-            client_rng.sample(
-                range(fed_args.num_clients),
-                min(fed_args.clients_per_round, fed_args.num_clients),
-            )
-            if _is_main()
-            else None
+        def pick_clients(num_clients, clients_per_round, round_id, base_seed):
+            rng = np.random.RandomState(base_seed + 10007 * round_id)
+            k = min(clients_per_round, num_clients)
+            return rng.choice(np.arange(num_clients), size=k, replace=False).tolist()
+
+        selected = pick_clients(
+                        fed_args.num_clients,
+                        fed_args.clients_per_round,
+                        rnd,
+                        fed_args.federated_seed,
         )
 
 
-        selected_container = [selected]
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.broadcast_object_list(selected_container, src=0)
-        selected = selected_container[0]
-        # 容错：单机单卡时 selected 仍为空则本地采样
-
-        if selected is None:
-            selected = client_rng.sample(
-                range(fed_args.num_clients),
-                min(fed_args.clients_per_round, fed_args.num_clients),
-            )
 
         if _is_main():
             logger.info(f"Selected client {selected}")
@@ -706,7 +728,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
 
-        all_payloads = []
+
         for cid in selected:
             if _is_main():
                 logger.info(f"Client ID: {cid}")
@@ -743,21 +765,17 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     compute_metrics=None,
                     callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
                 )
+
                 trainer.train(task_id=data_args.task)
                 _trainer_wait_for_everyone(trainer)
+                trained_model = _trainer_unwrap_model(trainer)
+                state_dict = trained_model.state_dict()
+                delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
+                w = len(client_datasets[cid])
+                for k in lora_keys:
+                    aggregated[k] += delta[k] * w
+                total += w
 
-                # 仅 rank0 组装 payload；其他 rank 空列表
-                rank_payloads = []
-                if _is_main():
-                    trained_model = _trainer_unwrap_model(trainer)
-                    state_dict = trained_model.state_dict()
-                    delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
-                    rank_payloads.append({
-                        "cid": cid,
-                        "weight": len(client_datasets[cid]),
-                        "delta": delta,
-                        "cache": None,
-                    })
 
             elif method == "adaptive":
                 client_state = ContinualState()
@@ -777,22 +795,45 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         compute_metrics=None,
                         callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
                     )
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        dl = trainer.get_train_dataloader()
+                        try:
+                            steps_local = len(dl)
+                        except TypeError:
+                            steps_local = -1
+                        t = torch.tensor([steps_local], device=trainer.args.device)
+                        gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
+                        dist.all_gather(gathered, t)
+                        steps_all = [int(x.item()) for x in gathered]
+                        if trainer.args.process_index == 0:
+                            print(f"[SANITY] num_batches_per_rank = {steps_all}")
+                        assert len(set(steps_all)) == 1, f"Dataloader length mismatch across ranks: {steps_all}"
+
                     trainer.train(task_id=data_args.task)
                     _trainer_wait_for_everyone(trainer)
+                    trained_model = _trainer_unwrap_model(trainer)
+                    state_dict = trained_model.state_dict()
+                    delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
+                    w = len(client_datasets[cid])
+                    for k in lora_keys:
+                        aggregated[k] += delta[k] * w
+                    total += w
 
-                    rank_payloads = []
                     if _is_main():
-                        trained_model = _trainer_unwrap_model(trainer)
-                        state_dict = trained_model.state_dict()
-                        delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
                         F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
                         theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
-                        rank_payloads.append({
-                            "cid": cid,
-                            "weight": len(client_datasets[cid]),
-                            "delta": delta,
-                            "cache": {"F_client": F_client, "theta_last": theta_last},
-                        })
+                        acc = per_task_cache[cid]
+                        acc["theta_last"] = theta_last
+                        if reduce_mode == "last":
+                            acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
+                        else:
+                            if acc["F_sum"] is None:
+                                acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
+                                acc["count"] = 1
+                            else:
+                                for k in F_client:
+                                    acc["F_sum"][k] += F_client[k]
+                                acc["count"] += 1
 
                 else:
                     trainer = UIETrainer(
@@ -814,14 +855,26 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         cid=cid
                     )
                     _trainer_wait_for_everyone(trainer)
-                    rank_payloads = []
+                    delta = {k: delta[k].detach().cpu() for k in lora_keys}
+                    w = len(client_datasets[cid])
+                    for k in lora_keys:
+                        aggregated[k] += delta[k] * w
+                    total += w
+
                     if _is_main():
-                        rank_payloads.append({
-                            "cid": cid,
-                            "weight": len(client_datasets[cid]),
-                            "delta": delta,
-                            "cache": {"F_client": F_client, "theta_last": theta_last},
-                        })
+                        acc = per_task_cache[cid]
+                        acc["theta_last"] = theta_last
+                        if reduce_mode == "last":
+                            acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
+                        else:
+                            if acc["F_sum"] is None:
+                                acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
+                                acc["count"] = 1
+                            else:
+                                for k in F_client:
+                                    acc["F_sum"][k] += F_client[k]
+                                acc["count"] += 1
+
             else:
                 rank_payloads = []
                 if _is_main():
@@ -837,58 +890,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         "cache": None,
                     })
 
-            # 聚合：只有 rank0 有元素，其它 rank 发空列表
-            gathered = [None for _ in range(world)]
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.all_gather_object(gathered, rank_payloads)
-            else:
-                gathered[0] = rank_payloads
-            if _is_main():
-                for pl in gathered:
-                    if pl:
-                        all_payloads.extend(pl)
-            else:
-                all_payloads.extend(rank_payloads)
-
-        for payload in all_payloads:
-            cid = payload["cid"]
+        for cid in selected:
             client_selection_tracker[cid]['count'] += 1
             client_selection_tracker[cid]['last_round'] = rnd
             current_task_selected_clients.add(cid)
 
-            delta = payload["delta"]
-            weight = payload["weight"]
-
-            # Server update
-            # weight = len(client_datasets[cid])
-            for k in lora_keys:
-                aggregated[k] += delta[k] * weight
-            total += weight
-
-            if method == "adaptive" and payload.get("cache") is not None:
-                F_client = payload["cache"].get("F_client")
-                theta_last = payload["cache"].get("theta_last")
-                if F_client is not None and theta_last is not None:
-                    acc = per_task_cache[cid]
-                    acc["theta_last"] = theta_last
-                    if reduce_mode == "last":
-                        acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
-                    else:
-                        if acc["F_sum"] is None:
-                            acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
-                            acc["count"] = 1
-                        else:
-                            for k in F_client:
-                                acc["F_sum"][k] += F_client[k]
-                            acc["count"] += 1
         for k in lora_keys:
             mu = aggregated[k] / max(total, 1)
             global_state_cpu[k] = global_state_cpu[k] - mu
 
         update_dict = {k: global_state_cpu[k].to(device) for k in lora_keys}
         global_model.load_state_dict(update_dict, strict=False)
-        # distributed_state.wait_for_everyone()
         wait_for_everyone()
+
+
 
 
     # ===== 任务结束：将“本任务”信息并入历史 =====
@@ -923,10 +938,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")
-    # global_model.save_pretrained(peft_model_id)
-    # tokenizer.save_pretrained(peft_model_id)
+
     if _is_main():
-        torch.save(global_model.state_dict(), os.path.join(peft_model_id, "pytorch_model.bin"))
+        global_model.save_pretrained(peft_model_id)
         tokenizer.save_pretrained(peft_model_id)
         logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
     all_metrics.update({"adapter_saved": peft_model_id})

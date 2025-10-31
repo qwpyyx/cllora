@@ -193,7 +193,7 @@ class DataTrainingArguments:
         metadata={"help": "The maximum number of instances we will consider for each validation/test task."}
     )
     max_train_samples: Optional[int] = field(
-        default=1000,
+        default=2000,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
                     "value if set."

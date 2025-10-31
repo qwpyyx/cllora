@@ -220,8 +220,8 @@ class DataCollatorForUIE:
         if not self.input_record_file:
             return
 
-        # 只让主进程写入文件（避免分布式环境下的竞争）
-        if not self.accelerator.is_main_process:
+        acc = getattr(self, "accelerator", None)
+        if acc is not None and not acc.is_main_process:
             return
 
         loss_label = []

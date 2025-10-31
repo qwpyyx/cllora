@@ -3,6 +3,13 @@ set -x
 
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export TRANSFORMERS_CACHE=/home/qiuwenqi/.cache/huggingface
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=WARN          # 或 INFO
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+
+
 
 port=$(shuf -i25000-30000 -n1)
 method=adaptive
