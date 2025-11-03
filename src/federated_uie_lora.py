@@ -589,9 +589,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         )
 
 
-
-
-
     # compare(client_datasets,fed_args.dirichlet_alpha)
     model, tokenizer = build_model_and_tokenizer(model_args)
 
