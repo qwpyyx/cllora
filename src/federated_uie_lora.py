@@ -484,7 +484,6 @@ def compare_fishers(
     logging.info(f"可视化结果已保存至 {save_dir}")
 
 
-
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
     world = max(getattr(training_args, "world_size", 1), 1)
 
