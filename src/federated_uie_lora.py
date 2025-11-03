@@ -56,24 +56,74 @@ def _trainer_unwrap_model(trainer):
     return trainer.model
 
 def partition_dataset(train_dataset, num_clients, alpha, *, base_seed: int):
-     """
-     纯函数式联邦划分：给定 base_seed, num_clients, alpha, 和稳定的 train_dataset 顺序，
-     任意进程独立调用，都得到完全相同的划分结果。
-     """
-     rng = np.random.RandomState(base_seed)   # 局部 RNG，不污染全局
+    rng = np.random.RandomState(base_seed)
 
-     num_samples = len(train_dataset)
-     all_idx = np.arange(num_samples)
-     rng.shuffle(all_idx)                     # ← 替代 np.random.shuffle
+    num_samples = len(train_dataset)
+    all_idx = np.arange(num_samples)
+    rng.shuffle(all_idx)
 
-     # 例：数量非IID
-     props = rng.dirichlet([alpha] * num_clients)  # ← 替代 np.random.dirichlet
-     sizes = (props * num_samples).astype(int)
-     sizes[-1] = num_samples - sizes[:-1].sum()
-     splits = np.split(all_idx, np.cumsum(sizes)[:-1])
+    # 1) 保证每个 client 至少 1 个样本（若 num_samples >= num_clients）
+    if num_samples >= num_clients:
+        props = rng.dirichlet([alpha] * num_clients)
+        # 先给每人 1 个，剩余再按 Dirichlet 分
+        sizes = (props * (num_samples - num_clients)).astype(int) + 1
+        # 修正最后一个，确保总和精确等于 num_samples
+        sizes[-1] = num_samples - sizes[:-1].sum()
+    else:
+        # 样本数少于 client 数，最多只能给前 num_samples 个 client 各 1 个，其余为空
+        sizes = np.zeros(num_clients, dtype=int)
+        sizes[:num_samples] = 1
+        rng.shuffle(sizes)  # 哪些 client 为空也固定可复现
 
-     client_datasets = [train_dataset.select(s.tolist()) for s in splits]
-     return client_datasets
+    # 2) 额外稳健：避免出现负数或最后一个被压成 0 的边缘情况
+    #    （正常不会出现，这里只是护栏）
+    sizes = np.maximum(sizes, 0)
+    sizes[-1] = num_samples - sizes[:-1].sum()
+
+    # 连续切块（全局随机后的 contiguous split）
+    splits = np.split(all_idx, np.cumsum(sizes)[:-1])
+    client_datasets = [train_dataset.select(s.tolist()) for s in splits]
+    return client_datasets
+
+def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_seed: int, label_key="Dataset"):
+    rng = np.random.RandomState(base_seed)
+
+    # 1) 按标签聚合索引
+    label2indices = defaultdict(list)
+    for idx, example in enumerate(dataset):
+        label2indices[example[label_key]].append(idx)
+
+    client_indices = [[] for _ in range(num_clients)]
+
+    # 2) 对每个标签做 Dirichlet，再把该标签的样本分片给各 client
+    for indices in label2indices.values():
+        indices = np.array(indices)
+        rng.shuffle(indices)
+        props = rng.dirichlet([alpha] * num_clients)
+        bounds = (np.cumsum(props) * len(indices)).astype(int)[:-1]
+        splits = np.split(indices, bounds)
+        for cid, idxs in enumerate(splits):
+            if len(idxs) > 0:
+                client_indices[cid].extend(idxs.tolist())
+
+    # 3) 防空 client：从样本最多的 client“偷”一个（可复现：用 rng 选择偷谁的哪一个）
+    empty_clients = [cid for cid, idxs in enumerate(client_indices) if len(idxs) == 0]
+    if len(empty_clients) > 0:
+        # donor 优先选择样本最多的；若并列，按 rng 的顺序处理
+        sizes = np.array([len(idxs) for idxs in client_indices])
+        for cid in empty_clients:
+            donors = np.where(sizes == sizes.max())[0]
+            donor = donors[rng.randint(len(donors))]
+            # 从 donor 随机偷一个
+            stolen_pos = rng.randint(len(client_indices[donor]))
+            stolen = client_indices[donor].pop(stolen_pos)
+            sizes[donor] -= 1
+            client_indices[cid].append(stolen)
+            sizes[cid] += 1
+
+    return [dataset.select(idxs) for idxs in client_indices]
+
+
 
 # def partition_dataset(dataset, num_clients: int, alpha: float):
 #     label_key = "Dataset"
@@ -435,9 +485,6 @@ def compare_fishers(
 
 
 
-
-
-
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
     world = max(getattr(training_args, "world_size", 1), 1)
 
@@ -723,11 +770,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         global_state_cpu = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
         aggregated = {k: torch.zeros_like(global_state_cpu[k]) for k in lora_keys}
         total = 0
-
-
-
-
-
 
         for cid in selected:
             if _is_main():
