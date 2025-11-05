@@ -247,6 +247,7 @@ def build_model_and_tokenizer(model_args: ModelArguments):
 
 
 
+
 def compute_fisher_diag(model, dataloader):
     """
     适配LoRA模型的对角线Fisher信息计算（修正版）
@@ -732,9 +733,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         k: calculate_layer_packet_cost(p)
         for k, p in lora_params.items()
     }
-    if _is_main():
-        logger.info(f"预计算的LoRA层通信成本: "
-                f"{layer_costs['base_model.model.encoder.block.0.layer.0.SelfAttention.q.lora_A.default.weight']}")
+    # if _is_main():
+    #     logger.info(f"预计算的LoRA层通信成本: "
+    #             f"{layer_costs['69']}")
 
     for rnd in range(fed_args.global_rounds):
         if _is_main():

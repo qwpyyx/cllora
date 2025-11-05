@@ -6,7 +6,7 @@ export TRANSFORMERS_CACHE=/home/qiuwenqi/.cache/huggingface
 
 port=$(shuf -i25000-30000 -n1)
  
-# bash scripts_llama/order_1.sh> logs_and_outputs_llama/order_1/logs/train_and_infer.log 2>&1 &
+# bash scripts_llama/order_1_adaptive.sh> logs_and_outputs_llama/order_1/logs/train_and_infer.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \

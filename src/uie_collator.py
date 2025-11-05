@@ -2,11 +2,11 @@ import logging
 from torch.nn.parallel import DistributedDataParallel
 import torch
 from transformers.data.data_collator import *
-
+import inspect
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_DECODER_MODELS = ['codegen', 'bloomz', 'gpt-neox', 'llama']
+SUPPORTED_DECODER_MODELS = ['codegen', 'bloomz', 'gpt-neox', 'llama', 'gpt2-xl','gpt2-large']
 SUPPORTED_SEQ2SEQ_MODELS = ['t5', 'flan-t5']
 
 
@@ -200,21 +200,49 @@ class DataCollatorForUIE:
                 pad_to_multiple_of=self.pad_to_multiple_of
             )
 
-            label_mask = model_inputs["attention_mask"].bool()
-            model_inputs["labels"] = model_inputs['input_ids'].masked_fill(~label_mask, self.label_pad_token_id)
+            label_pad = self.label_pad_token_id
+            label_mask_attn = model_inputs["attention_mask"].bool()
+            # 先按原来方式生成“全序列标签”，只把 padding 位置置 -100
+            model_inputs["labels"] = model_inputs['input_ids'].masked_fill(~label_mask_attn, label_pad)
 
-            # loss mask
+            # ==== 关键：根据模型是否支持 loss_mask 决定处理方式 ====
+            original_model = self.model.module if hasattr(self.model, "module") else self.model
+            accepts_loss_mask = False
+            try:
+                params = inspect.signature(original_model.forward).parameters
+                accepts_loss_mask = "loss_mask" in params
+            except Exception:
+                accepts_loss_mask = False
+
             max_len = min(max_len, limit_input_len)
-            loss_mask = torch.ones((label_mask.shape))
-            for k, label_len in enumerate(label_lens):
-                loss_mask[k, : max_len - label_len - 1] = 0
-            model_inputs['loss_mask'] = loss_mask.masked_fill(~label_mask, 0)
+
+            if accepts_loss_mask:
+                # 保持你原有的 loss_mask 路径（如 LlamaForCausalLM_with_lossmask）
+                loss_mask = torch.ones_like(model_inputs["attention_mask"], dtype=torch.float)
+                for k, label_len in enumerate(label_lens):
+                    loss_mask[k, : max_len - label_len - 1] = 0
+                model_inputs["loss_mask"] = loss_mask.masked_fill(~label_mask_attn, 0)
+            else:
+                # GPT-2 等不支持 loss_mask 的模型：把非答案区 label 直接置为 -100
+                labels = model_inputs["labels"].clone()
+                for k, label_len in enumerate(label_lens):
+                    # 你原逻辑中有效“答案区”是末尾的 label_len 部分
+                    # 因此把前面的 prompt/input 区域设为 -100
+                    cut = max_len - label_len - 1
+                    cut = max(cut, 0)
+                    labels[k, :cut] = label_pad
+                model_inputs["labels"] = labels
+                # 确保不再传 loss_mask
+                if "loss_mask" in model_inputs:
+                    del model_inputs["loss_mask"]
 
             self._save_samples(model_inputs, sources, labels)
-
-        logger.info(
-            f"decoder_call: input_ids shape {model_inputs['input_ids'].shape}, loss_mask shape {model_inputs['loss_mask'].shape}")
-        return model_inputs
+            logger.info(
+                f"decoder_call: input_ids shape {model_inputs['input_ids'].shape}, "
+                f"labels shape {model_inputs['labels'].shape}, "
+                f"{'with' if accepts_loss_mask else 'no'} loss_mask"
+            )
+            return model_inputs
 
     def _save_samples(self, model_inputs, sources, labels):
         if not self.input_record_file:

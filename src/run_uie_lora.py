@@ -250,7 +250,7 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     method: str = field(default="lora_origin", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
     uplink_mbps: str = field(default="10,100", metadata={"help": "逗号分隔的上行带宽(Mbps)，用于计算通信节省时间下界"})
     packet_bytes: int = field(default=1500, metadata={"help": "每个传输包的有效负载字节数"})
-    optim: str = field(default="sgd", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
+    # optim: str = field(default="sgd", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
 
 @dataclass
 class FederatedArguments:

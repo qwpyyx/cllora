@@ -698,6 +698,56 @@ class UIETrainer(Seq2SeqTrainer):
         self.beta1 = 0.9  # 一阶矩动量系数
         self.beta2 = 0.999  # 二阶矩动量系数
         self.eps = 1e-8  # 数值稳定项
+        self.adamw_weight_decay = getattr(self.args, "weight_decay", 0.01)
+        self.eta_shrink = float(getattr(self.args, "eta_shrink", 1.0))
+        self.trust_radius_shrink = float(getattr(self.args, "trust_radius_shrink", 1e-3))
+        self.beta_mul = float(getattr(self.args, "beta_mul", 1.0))
+
+    # ---- LoRA ΔW_eff 工具：把同名前缀的 lora_A / lora_B 配对并计算 ||B@A - B_bar@A_bar||_F ----
+    @torch.no_grad()
+    def _compute_delta_weff_norm(self, model_plain: nn.Module, bar_theta: Dict[str, torch.Tensor]) -> float:
+        named_params = dict(model_plain.named_parameters())
+        named_modules = dict(model_plain.named_modules())
+
+        def _pref(n: str) -> str:
+            # 形如 "...SelfAttention.q.lora_A.default.weight" -> 去掉 ".lora_A.default.weight"
+            return n.split(".lora_")[0] if ".lora_" in n else ""
+
+        # 收集 A/B
+        A_map, B_map, scale_map = {}, {}, {}
+        for n, p in named_params.items():
+            if ".lora_A." in n and n.endswith(".weight"):
+                A_map[_pref(n)] = p.detach().float()
+            elif ".lora_B." in n and n.endswith(".weight"):
+                B_map[_pref(n)] = p.detach().float()
+        # 取 scaling
+        for base in set(list(A_map.keys()) + list(B_map.keys())):
+            m = named_modules.get(base, None)
+            s = 1.0
+            if m is not None and hasattr(m, "scaling"):
+                try:
+                    s = float(getattr(m, "scaling"))
+                except Exception:
+                    s = 1.0
+            scale_map[base] = s
+        # 相同前缀配对并求和 Frobenius
+        total_sq = 0.0
+        for base in A_map.keys():
+            if base not in B_map:
+                continue
+            A_cur, B_cur, sc = A_map[base], B_map[base], scale_map.get(base, 1.0)
+            # 取历史 A/B
+            A_key = f"{base}.lora_A.default.weight"
+            B_key = f"{base}.lora_B.default.weight"
+            A_bar = bar_theta.get(A_key, torch.zeros_like(A_cur)).float()
+            B_bar = bar_theta.get(B_key, torch.zeros_like(B_cur)).float()
+            # ΔW_eff = sc * (B_cur@A_cur - B_bar@A_bar)
+            curr = torch.matmul(B_cur, A_cur)
+            past = torch.matmul(B_bar, A_bar)
+            dW = sc * (curr - past)
+            total_sq += float((dW * dW).sum().item())
+        return float(total_sq ** 0.5)
+
 
 
     # ------------------------------------------------------------------
@@ -1005,7 +1055,20 @@ class UIETrainer(Seq2SeqTrainer):
 
             # HF Trainer 已经包好 DDP/Accelerate：训练使用 self.model；读写权重用 unwrap 后的 model_plain
             train_dataloader = self.get_train_dataloader()
-            train_dataloader = self.accelerator.prepare(train_dataloader)
+
+            # 2) 确保模型被 Accelerate/DDP 包装（避免二次包装）
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            _wrapped = isinstance(self.model, DDP) or hasattr(self.model, "module")
+            if getattr(self, "accelerator", None) is not None:
+                if not _wrapped:
+                    self.model, train_dataloader = self.accelerator.prepare(self.model, train_dataloader)
+                else:
+                    train_dataloader = self.accelerator.prepare(train_dataloader)
+
+
+
+
+
             device = self.accelerator.device
             model = self.model
             model_plain = self.accelerator.unwrap_model(self.model)
@@ -1089,6 +1152,8 @@ class UIETrainer(Seq2SeqTrainer):
             #eta_save = []
             round_s = []
             Delta_s = []
+            diag_loss = []
+            diag_weff = []
             #eta_ori = []
             # 在训练循环开始前添加监控变量
             gradient_monitor = {
@@ -1137,7 +1202,7 @@ class UIETrainer(Seq2SeqTrainer):
                             f"Task {task_id} | Epoch [{epoch + 1}/{num_epochs}] | "
                             f"Batch [{step + 1}/{steps_per_epoch}] | Batch Loss: {raw_loss:.6f}"
                         )
-
+                        diag_loss.append(raw_loss)
 
                     # before_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
 
@@ -1153,43 +1218,48 @@ class UIETrainer(Seq2SeqTrainer):
                         device=device
                     )
 
-                    # global_norm = None
-                    # if any(p.grad is not None for p in model.parameters()):
-                    #     s = 0.0
-                    #     for p in model.parameters():
-                    #         if p.grad is not None:
-                    #             s += float(p.grad.detach().float().norm().item()) ** 2
-                    #     global_norm = (s ** 0.5)
+                    global_norm = None
+                    if any(p.grad is not None for p in model.parameters()):
+                        s = 0.0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                s += float(p.grad.detach().float().norm().item()) ** 2
+                        global_norm = (s ** 0.5)
 
                     # === [新增] 如有需要，打印可疑层的详细激活/反传统计 ===
                     # if getattr(self, "_act_probe", None) is not None:
                     #     clip_norm = float(getattr(self.args, "clip_grad_norm", 1.0))
-                    #     self._act_probe.report_if_needed(model, logger, global_norm, clip_norm)
+                    #     self._act_probe.report_if_needed(model_plain, logger, global_norm, clip_norm)
 
 
 
                     # 监控点1：梯度范数检查
-                    # grad_norms = {}
-                    # for name, p in model.named_parameters():
-                    #     if p.grad is not None:
-                    #         grad_norm = torch.norm(p.grad).item()
-                    #         grad_norms[name] = grad_norm
-                    #         if grad_norm > 1000:  # 梯度爆炸阈值
-                    #             logger.warning(f"梯度爆炸检测: {name}, 梯度范数: {grad_norm}")
-                    #
-                    # # 监控点2：Fisher值检查
-                    # fisher_values = {}
-                    # for name in F_curr:
-                    #     fisher_mean = torch.mean(F_curr[name]).item()
-                    #     fisher_values[name] = fisher_mean
-                    #     if fisher_mean < 1e-12 or fisher_mean > 1e6:
-                    #         logger.warning(f"Fisher值异常: {name}, 均值: {fisher_mean}")
-                    #
-                    # # 将监控数据保存
-                    # if self.accelerator.is_main_process:
-                    #     gradient_monitor['grad_norms'].append(grad_norms)
-                    #     gradient_monitor['fisher_values'].append(fisher_values)
-                    #     gradient_monitor['loss_values'].append(raw_loss)
+                    grad_norms = {}
+                    for name, p in model_plain.named_parameters():
+                        if p.grad is not None:
+                            grad_norm = torch.norm(p.grad).item()
+                            grad_norms[name] = grad_norm
+                            if grad_norm > 1000:  # 梯度爆炸阈值
+                                logger.warning(f"梯度爆炸检测: {name}, 梯度范数: {grad_norm}")
+
+                    # 监控点2：Fisher值检查
+                    fisher_values = {}
+                    for name in F_curr:
+                        fisher_mean = torch.mean(F_curr[name]).item()
+                        fisher_values[name] = fisher_mean
+                        if fisher_mean < 1e-12 or fisher_mean > 1e6:
+                            logger.warning(f"Fisher值异常: {name}, 均值: {fisher_mean}")
+
+                    # 将监控数据保存
+                    if self.accelerator.is_main_process:
+                        gradient_monitor['grad_norms'].append(grad_norms)
+                        gradient_monitor['fisher_values'].append(fisher_values)
+                        gradient_monitor['loss_values'].append(raw_loss)
+                        try:
+                            weff = self._compute_delta_weff_norm(model_plain, bar_theta)
+                            diag_weff.append(weff)
+                        except Exception:
+                            pass
 
 
                     ###########################################
@@ -1198,7 +1268,7 @@ class UIETrainer(Seq2SeqTrainer):
                     # 自适应学习率
                     with torch.no_grad():
                         if use_adaptive_logic:
-                            for name, p in model_plain.named_parameters():
+                            for name, p in model.named_parameters():
                                 if not p.requires_grad or p.grad is None:
                                     continue
 
@@ -1379,57 +1449,34 @@ class UIETrainer(Seq2SeqTrainer):
                                     a_safe = torch.clamp(a_raw_alg, min=v2_clip.mean() * v2_clip.numel() * 1e-4)
                                     Delta_eff = torch.clamp(Delta - self.tau, min=0.0)
 
-                                # 4. a_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * v_B^(ℓ)
-                                # a_raw_alg = (v_alg * f_past * v_alg).sum()
-
-                                # winsorized a using capped v^2 to suppress heavy tails
-                                # v2 = (v_alg * v_alg).detach()
-                                # try:
-                                #     cap = torch.quantile(v2, 0.99)
-                                # except Exception:
-                                #     cap = v2.mean() + 3.0 * v2.std()
-                                # v2_clip = torch.clamp(v2, max=cap)
-                                # a_raw_alg = (v2_clip * f_past).sum()
-                                #
-                                #
-                                # # 5. b_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * Δθ
-                                # b_raw_alg = (v_alg * f_past * delta_theta).sum()
-                                # # 6. 半径余量 Δ_ℓ = R² - r²_ℓ
-                                # Delta = (self.radius ** 2) - r2[name]
-                                # Delta_s.append(Delta)
-                                #
-                                # if Delta.item() <= self.tau:
-                                #     eta_alg = torch.zeros(1, device=device, dtype=p.dtype).squeeze()
-                                #     eta = eta_alg
-                                # else:
-                                #     a_safe = torch.clamp(a_raw_alg, min=1e-12)
-                                #     Delta_eff = torch.clamp(Delta - self.tau, min=0.0)
-
-                                    # --------------------------
-                                    # 算法步骤8：冲突判断与步长计算
-                                    # --------------------------
+                                    # 缩放
+                                    Delta_eff = (self.trust_radius_shrink ** 2) * Delta_eff
+                                    beta_eff = self.beta * self.beta_mul
                                     if b_raw_alg.item() < 0.0:  # 冲突层：b_B^(ℓ) < 0（新旧任务方向冲突）
                                         # 闭式步长公式（严格按算法）：
                                         #term_u = b_raw_alg - self.sigma
+                                        # term_u = b_raw_alg - torch.as_tensor(self.sigma, device=device, dtype=p.dtype)
                                         term_u = b_raw_alg - torch.as_tensor(self.sigma, device=device, dtype=p.dtype)
-                                        discriminant = term_u ** 2 + self.beta * a_safe * Delta_eff
+                                        discriminant = term_u ** 2 + beta_eff * a_safe * Delta_eff
                                         discriminant = torch.clamp(discriminant, min=0.0)  # 确保开方非负
                                         xx = (term_u + torch.sqrt(discriminant))
-                                        yy = (self.beta * a_safe)
+                                        yy = (beta_eff * a_safe)
                                         eta_closed = xx / yy
                                         eta_ori_step.append(eta_closed.detach().float().mean().cpu().clone())
                                         # 步长上限：不超过初始学习率 η₀
+                                        eta_alg = eta_closed * self.eta_shrink
                                         eta_alg = torch.minimum(
-                                            eta_closed,
+                                            eta_alg,
                                             torch.tensor(self.args.learning_rate, device=device, dtype=p.dtype),
                                         )
                                         if eta_alg.item() > 0:
                                             conf[cn] += 1
                                     else:
                                         eta_trust = torch.sqrt(Delta_eff / a_safe)
-                                        eta_save_step.append(eta_trust.detach().float().mean().cpu().clone())
+                                        eta_alg = eta_trust * self.eta_shrink
+                                        eta_save_step.append(eta_alg.detach().float().mean().cpu().clone())
                                         eta_alg = torch.clamp(
-                                            eta_trust,
+                                            eta_alg,
                                             max=torch.as_tensor(self.args.learning_rate, device=device, dtype=p.dtype),
                                         )
 
@@ -1471,23 +1518,43 @@ class UIETrainer(Seq2SeqTrainer):
                                 # --------------------------
                                 # 算法步骤11：更新参数 θ^(ℓ) = θ^(ℓ) - η·v_B^(ℓ)
                                 # --------------------------
+
+                                # #method 1: use SGD
+                                # if eta.item() != 0.0:
+                                #     p.add_(-eta * v_scaled)  # 修正：使用缩放后的v_scaled
+
+                                #method 2: use adawm
+                                # ---- 用 AdamW 替换手动 SGD（仍以 eta 为每层步长）----
                                 if eta.item() != 0.0:
-                                    p.add_(-eta * v_scaled)  # 修正：使用缩放后的v_scaled
-                                    # p.add_(-self.args.learning_rate * g)
-                                    # state = self.adam_states[name]
-                                    # state['t'] += 1
-                                    # t = state['t']
-                                    # state['m'] = self.beta1 * state['m'] + (1 - self.beta1) * v_scaled
-                                    # state['v'] = self.beta2 * state['v'] + (1 - self.beta2) * (v_scaled ** 2)
-                                    # # 偏差修正（抵消初始时刻动量和平方和接近0的影响）
-                                    # m_hat = state['m'] / (1 - self.beta1 ** t)  # 修正后的一阶矩
-                                    # v_hat = state['v'] / (1 - self.beta2 ** t)  # 修正后的二阶矩
-                                    # update = eta * (m_hat / (torch.sqrt(v_hat) + self.eps))
-                                    # p.add_(-update)
-                                # p.add_(-self.args.learning_rate * g)
+                                    state = self.adam_states.setdefault(cn, {
+                                        "m": torch.zeros_like(p, device=p.device, dtype=p.dtype),
+                                        "v": torch.zeros_like(p, device=p.device, dtype=p.dtype),
+                                        "t": 0,
+                                    })
+                                    state["t"] += 1
+                                    t = state["t"]
+                                    # 一阶/二阶动量在“预条件方向 v_scaled”上统计
+                                    state["m"] = self.beta1 * state["m"] + (1 - self.beta1) * v_scaled
+                                    state["v"] = self.beta2 * state["v"] + (1 - self.beta2) * (v_scaled * v_scaled)
+                                    # 偏置修正
+                                    m_hat = state["m"] / (1 - (self.beta1 ** t))
+                                    v_hat = state["v"] / (1 - (self.beta2 ** t))
+                                    # Adam 方向
+                                    adam_dir = m_hat / (torch.sqrt(v_hat) + self.eps)
+                                    # decoupled weight decay（与 Adam 方向解耦）
+                                    wd = float(self.adamw_weight_decay) if hasattr(self, "adamw_weight_decay") else 0.0
+                                    if wd > 0.0:
+                                        p.add_(-eta * wd * p)   # W ← W - η·wd·W
+                                    p.add_(-eta * adam_dir)    # W ← W - η·AdamDir
+
 
                                 if "lora_" in name:
                                     self.eta_per_layer[name].append(eta.item())
+
+
+
+
+
 
 
                         else:
@@ -1505,12 +1572,13 @@ class UIETrainer(Seq2SeqTrainer):
 
                     self.accelerator.wait_for_everyone()
 
-                    s = 0
-                    for i in eta_d:
-                        if i == self.args.learning_rate:
-                            s += 1
-                    if len(eta_d) == s:
-                        print('这个batch所有层都是统一学习率')
+                    if self.accelerator.is_main_process:
+                        s = 0
+                        for i in eta_d:
+                            if i == self.args.learning_rate:
+                                s += 1
+                        if len(eta_d) == s:
+                            print('这个batch所有层都是统一学习率')
 
                     # if step % 1 == 0:
                     #     health_report = monitor_gradient_health(step, model, F_curr, bar_F_raw, r2, B_round)
@@ -1572,14 +1640,16 @@ class UIETrainer(Seq2SeqTrainer):
                 # selected_flags = [True] * len(names)
                 selection_map = {n: f for n, f in zip(names, selected_flags)}
 
-
+                unwrapped_model = self.accelerator.unwrap_model(model)
+                state_dict_raw = unwrapped_model.state_dict()
 
 
                 # 1) 自适应模式：仅传输选中层的delta
-                state_dict = model.state_dict()
+                # state_dict = model.state_dict()
                 adaptive_delta = {}
                 for name in base_params:
-                    local_param = state_dict[name].detach().cpu()
+
+                    local_param = state_dict_raw[name].detach().cpu()
                     # 仅选中的层传输真实delta，未选中的层传输零（不实际传输，仅占位）
                     #adaptive_delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
                     if selection_map.get(name, True):
@@ -1615,14 +1685,14 @@ class UIETrainer(Seq2SeqTrainer):
 
                 # 3) 本轮Fisher计算
                 F_client = {
-                    k: F_curr.get(k, torch.zeros_like(state_dict[k])).detach().cpu()
+                    k: F_curr.get(k, torch.zeros_like(state_dict_raw[k])).detach().cpu()
                     for k in base_params
                 }
             else:
                 # 基线模式：传输所有可训练参数的delta
-                state_dict = unwrapped_model.state_dict()
+                state_dict = model.state_dict()
                 baseline_delta = {}
-                for name, p in unwrapped_model.named_parameters():
+                for name, p in model.named_parameters():
                     if name in base_params and p.requires_grad:
                         local_param = state_dict[name].detach().cpu()
                         baseline_delta[name] = base_params[name] - local_param
@@ -1639,10 +1709,57 @@ class UIETrainer(Seq2SeqTrainer):
                 F_client = {k: torch.zeros_like(v) for k, v in base_params.items()}
 
             # 4) 本轮结束时该客户端的θ*（只取可训练/LoRA参数）
-            theta_last = {k: state_dict[k].detach().cpu() for k in base_params.keys()}
+            theta_last = {k: state_dict_raw[k].detach().cpu() for k in base_params.keys()}
 
             # 返回值新增通信节省时间
             self.accelerator.wait_for_everyone()
+
+            # ====== 训练结束：在主进程画图并给出增长性判断 ======
+            if self.accelerator.is_main_process:
+                import os, json, numpy as _np, matplotlib.pyplot as _plt, time as _t
+                os.makedirs(self.args.output_dir, exist_ok=True)
+                # 持久化 step 级诊断
+                jpath = os.path.join(self.args.output_dir, f"step_metrics_task{task_id}.jsonl")
+                with open(jpath, "w", encoding="utf-8") as fw:
+                    for i,(lval, wv) in enumerate(zip(diag_loss, diag_weff)):
+                        fw.write(json.dumps({"step": i+1, "loss": float(lval), "delta_weff": float(wv)})+"\n")
+                # 画损失曲线
+                try:
+                    _plt.figure()
+                    _plt.plot(range(1, len(diag_loss)+1), diag_loss)
+                    _plt.xlabel("Step"); _plt.ylabel("Train Loss"); _plt.title(f"Task {task_id} - Loss Curve")
+                    _plt.tight_layout()
+                    _plt.savefig(os.path.join(self.args.output_dir, "loss_curve.png"), dpi=180)
+                    _plt.close()
+                except Exception:
+                    pass
+                # 画 ||ΔW_eff|| 曲线
+                try:
+                    _plt.figure()
+                    _plt.plot(range(1, len(diag_weff)+1), diag_weff)
+                    _plt.xlabel("Step"); _plt.ylabel(r"||$\Delta W_{\rm eff}$||$_F$")
+                    _plt.title(f"Task {task_id} - Effective LoRA ΔW Norm")
+                    _plt.tight_layout()
+                    _plt.savefig(os.path.join(self.args.output_dir, "delta_weff_curve.png"), dpi=180)
+                    _plt.close()
+                except Exception:
+                    pass
+                # 趋势判断（是否随步数增长）
+                trend = "unknown"
+                try:
+                    if len(diag_weff) >= 3:
+                        x = _np.arange(len(diag_weff))
+                        k = _np.polyfit(x, _np.array(diag_weff, dtype=float), 1)[0]  # 线性斜率
+                        # Spearman 相关（粗略 monotonic）
+                        from scipy.stats import spearmanr as _spr
+                        rho, _ = _spr(x, _np.array(diag_weff, dtype=float))
+                        trend = f"slope={k:.4e}, spearman_rho={rho:.3f}, increasing={bool(k>0 and rho>0.2)}"
+                except Exception:
+                    pass
+                with open(os.path.join(self.args.output_dir, "diagnostics_summary.txt"), "w", encoding="utf-8") as fw:
+                    fw.write(f"ΔW_eff trend: {trend}\n")
+                    fw.write(f"loss_points={len(diag_loss)}, weff_points={len(diag_weff)}\n")
+
             return delta, F_client, theta_last
 
 

@@ -9,7 +9,7 @@ method=cllora
 lora_rank=32
 lamda_2=0
 lamda_1=0
-# bash scripts/order_1.sh> logs_and_outputs/order_1/logs/train_and_infer.log 2>&1 &
+# bash scripts/order_1_adaptive.sh> logs_and_outputs/order_1/logs/train_and_infer.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
