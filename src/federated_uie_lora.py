@@ -11,6 +11,7 @@ import json
 import datasets
 import numpy as np
 import torch
+import gc,contextlib
 from accelerate.utils import wait_for_everyone
 import math
 from datasets import load_dataset, concatenate_datasets
@@ -37,6 +38,34 @@ CURRENT_DIR = os.path.dirname(__file__)
 
 def _trainer_accelerator(trainer):
     return getattr(trainer, "accelerator", None)
+
+
+def _free_after_local_train(trainer, model_to_keep=None):
+    if model_to_keep is not None:
+        # 把最新权重回填到你的持久对象，并迁回 CPU
+        model_to_keep.load_state_dict(trainer.model.state_dict(), strict=False)
+        model_to_keep.to("cpu")
+
+    with contextlib.suppress(Exception):
+        trainer.model.to("cpu")
+
+    with contextlib.suppress(Exception):
+        if getattr(trainer, "optimizer", None) is not None:
+            for s in trainer.optimizer.state.values():
+                for k, v in list(s.items()):
+                    if torch.is_tensor(v):
+                        s[k] = v.cpu()
+        trainer.optimizer = None
+        trainer.lr_scheduler = None
+        if hasattr(trainer, "scaler"):
+            delattr(trainer, "scaler")
+        if hasattr(trainer, "accelerator"):
+            trainer.accelerator.free_memory()
+
+    # 删除引用 + 清理缓存
+    del trainer
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _trainer_wait_for_everyone(trainer) -> None:
@@ -124,126 +153,6 @@ def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_
     return [dataset.select(idxs) for idxs in client_indices]
 
 
-
-# def partition_dataset(dataset, num_clients: int, alpha: float):
-#     label_key = "Dataset"
-#     label2indices = defaultdict(list)
-#     for idx, example in enumerate(dataset):
-#         label2indices[example[label_key]].append(idx)
-#
-#     client_indices = [[] for _ in range(num_clients)]
-#     for indices in label2indices.values():
-#         np.random.shuffle(indices)
-#         props = np.random.dirichlet([alpha] * num_clients)
-#         # 累计比例映射到具体的 split 位置
-#         bounds = (np.cumsum(props) * len(indices)).astype(int)[:-1]
-#         splits = np.split(np.array(indices), bounds)
-#         for cid, idxs in enumerate(splits):
-#             client_indices[cid].extend(idxs.tolist())
-#
-#     # 修复空 client：从样本最多的 client 那里“偷”一个
-#     for cid, idxs in enumerate(client_indices):
-#         if len(idxs) == 0:
-#             donor = max(range(num_clients), key=lambda x: len(client_indices[x]))
-#             stolen = client_indices[donor].pop()
-#             client_indices[cid].append(stolen)
-#
-#     return [dataset.select(idxs) for idxs in client_indices]
-
-# def build_model_and_tokenizer(model_args: ModelArguments):
-#     if 'adapter' in model_args.model_name_or_path:
-#         config = PeftConfig.from_pretrained(model_args.model_name_or_path)
-#         if 'llama' in model_args.model_name_or_path.lower():
-#             tokenizer = transformers.LlamaTokenizer.from_pretrained(config.base_model_name_or_path)
-#             config.bos_token_id = 1
-#             config.eos_token_id = 2
-#             config.pad_token_id = 1
-#             tokenizer.bos_token_id = 1
-#             tokenizer.eos_token_id = 2
-#             tokenizer.pad_token_id = 1
-#         else:
-#             tokenizer = transformers.AutoTokenizer.from_pretrained(config.base_model_name_or_path)
-#     elif 'llama' in model_args.model_name_or_path.lower():
-#         config = transformers.AutoConfig.from_pretrained(
-#             model_args.model_name_or_path,
-#             cache_dir=model_args.cache_dir,
-#             revision=model_args.model_revision,
-#             use_auth_token=True if model_args.use_auth_token else None,
-#         )
-#         config.bos_token_id = 1
-#         config.eos_token_id = 2
-#         config.pad_token_id = 1
-#         tokenizer = transformers.LlamaTokenizer.from_pretrained(
-#             model_args.model_name_or_path,
-#             cache_dir=model_args.cache_dir,
-#             use_fast=model_args.use_fast_tokenizer,
-#             revision=model_args.model_revision,
-#             use_auth_token=True if model_args.use_auth_token else None,
-#         )
-#         tokenizer.bos_token_id = 1
-#         tokenizer.eos_token_id = 2
-#         tokenizer.pad_token_id = 1
-#     else:
-#         config = transformers.AutoConfig.from_pretrained(
-#             model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-#             cache_dir=model_args.cache_dir,
-#             revision=model_args.model_revision,
-#             use_auth_token=True if model_args.use_auth_token else None,
-#         )
-#         tokenizer = transformers.AutoTokenizer.from_pretrained(
-#             model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-#             cache_dir=model_args.cache_dir,
-#             use_fast=model_args.use_fast_tokenizer,
-#             revision=model_args.model_revision,
-#             use_auth_token=True if model_args.use_auth_token else None,
-#         )
-#
-#     if 'llama' in model_args.model_name_or_path.lower():
-#         model_class = LlamaForCausalLM_with_lossmask
-#         tokenizer.padding_side = 'left'
-#     else:
-#         model_class = transformers.AutoModelForSeq2SeqLM
-#
-#     if 'adapter' in model_args.model_name_or_path:
-#         model = model_class.from_pretrained(config.base_model_name_or_path)
-#         model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
-#     elif 'llama' in model_args.model_name_or_path.lower():
-#         model = model_class.from_pretrained(
-#             model_args.model_name_or_path,
-#             from_tf=bool('.ckpt' in model_args.model_name_or_path),
-#             config=config,
-#             cache_dir=model_args.cache_dir,
-#             revision=model_args.model_revision,
-#             use_auth_token=True if model_args.use_auth_token else None
-#         )
-#         peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1)
-#         model = get_peft_model(model, peft_config)
-#     else:
-#         model = model_class.from_pretrained(
-#             model_args.model_name_or_path,
-#             from_tf=bool('.ckpt' in model_args.model_name_or_path),
-#             config=config,
-#             cache_dir=model_args.cache_dir,
-#             revision=model_args.model_revision,
-#             use_auth_token=True if model_args.use_auth_token else None,
-#         )
-#         peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1)
-#         model = get_peft_model(model, peft_config)
-#
-#     model.resize_token_embeddings(len(tokenizer))
-#
-#     if 'llama' in model_args.model_name_or_path.lower():
-#         model.generation_config.bos_token_id = 1
-#         model.generation_config.eos_token_id = 2
-#         model.generation_config.pad_token_id = 1
-#
-#     for name, param in model.named_parameters():
-#         if 'lora_' in name:
-#             param.requires_grad = True
-#         elif 'shared' in name:
-#             param.requires_grad = False
-#
-#     return model, tokenizer
 def build_model_and_tokenizer(model_args: ModelArguments):
     """
     Unified loader for T5 (seq2seq), LLaMA-2 (decoder-only), and LLaMA-3 (decoder-only).
@@ -367,8 +276,6 @@ def build_model_and_tokenizer(model_args: ModelArguments):
     return model, tokenizer
 
 
-
-
 def compute_fisher_diag(model, dataloader):
     """
     适配LoRA模型的对角线Fisher信息计算（修正版）
@@ -380,7 +287,7 @@ def compute_fisher_diag(model, dataloader):
 
     # 初始化Fisher累积器（仅跟踪LoRA可训练参数，用参数名作为键）
     fisher_diag = {
-        name: torch.zeros_like(param, device=device)
+        name: torch.zeros_like(param, device="cpu")  # <-- 修改
         for name, param in model.named_parameters()
         if param.requires_grad and "lora" in name  # 仅保留LoRA相关参数
     }
@@ -430,7 +337,8 @@ def compute_fisher_diag(model, dataloader):
             # 累积梯度平方到Fisher对角线
             for (name, param), grad in zip(fisher_diag.items(), grads):
                 if grad is not None:
-                    fisher_diag[name].add_(grad.detach() ** 2)
+                    # --- [修改点 2：将梯度移到 CPU 再累加] ---
+                    fisher_diag[name].add_(grad.detach().cpu() ** 2)  # <-- 修改
 
     # 计算平均Fisher（除以总样本数）
     if total_samples > 0:
@@ -450,9 +358,7 @@ def compute_fisher_diag(model, dataloader):
             normalized_fisher[name] = torch.zeros_like(fisher)
 
     # 转移到CPU并返回（与其他Fisher函数格式一致）
-    return {k: v.detach().cpu() for k, v in normalized_fisher.items()}
-
-
+    return {k: v.detach() for k, v in normalized_fisher.items()} # <-- 修改
 
 def filter_lora_parameters(fisher_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """过滤仅保留包含"lora"的参数（与compute_fisher_diag保持一致）"""
@@ -754,6 +660,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         if hasattr(base_model, "module"):
             base_model = base_model.module
 
+        # 跑LLAMA不需要
         return DataCollatorForUIE(
             tokenizer,
             model=base_model,
@@ -767,6 +674,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             num_examples=data_args.num_examples,
             input_record_file=data_args.input_record_file,
         )
+
+        #如果要跑T5，需要model=base_model
+
+        # return DataCollatorForUIE(
+        #     tokenizer,
+        #     model=base_model,
+        #     padding="longest",
+        #     max_source_length=data_args.max_source_length,
+        #     max_target_length=data_args.max_target_length,
+        #     label_pad_token_id=label_pad_token_id,
+        #     pad_to_multiple_of=8 if training_args.fp16 else None,
+        #     add_task_name=data_args.add_task_name,
+        #     add_dataset_name=data_args.add_dataset_name,
+        #     num_examples=data_args.num_examples,
+        #     input_record_file=data_args.input_record_file,
+        # )
 
     def get_lora_trainable_keys(model):
         """
@@ -812,6 +735,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     if _is_main():
         logger.info("Use method: {}".format(method))
     global_model = model
+    global_model.to("cpu")  # <--- 新增：将全局模型移至CPU
     device = next(global_model.parameters()).device
 
     # 加载过去任务的fisher信息
@@ -913,6 +837,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             local_args.logging_strategy = "no"
             local_args.evaluation_strategy = "no"
 
+            # local_model.to("cpu")
 
             # accelerate/DDP 由 Trainer 接管；这里不要手动 .cuda() 或 init pg
             if method == "lora_origin":
@@ -928,13 +853,41 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
                 trainer.train(task_id=data_args.task)
                 _trainer_wait_for_everyone(trainer)
+
                 trained_model = _trainer_unwrap_model(trainer)
-                state_dict = trained_model.state_dict()
-                delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
+
+                name_to_param = dict(trained_model.named_parameters())
+                delta = {}
+                for k in lora_keys:
+                    p = name_to_param.get(k, None)
+                    if p is None:
+                        continue  # 或者 log warning
+                    delta[k] = global_state_cpu[k] - p.detach().cpu()
+
                 w = len(client_datasets[cid])
                 for k in lora_keys:
                     aggregated[k] += delta[k] * w
                 total += w
+
+                # 3) 释放强引用（CPU内存也让位）
+                try:
+                    del name_to_param, trained_model
+                except Exception:
+                    pass
+
+                # 4) 强制释放本 client 的 Trainer/模型/优化器/加速器缓存
+                #    不保留本地模型 => model_to_keep=None
+                _free_after_local_train(trainer, model_to_keep=None)
+
+                # 5) 删除调用者作用域中的变量引用（很关键；否则外部仍持有引用）
+                try:
+                    del trainer
+                except Exception:
+                    pass
+                try:
+                    del local_model
+                except Exception:
+                    pass
 
 
             elif method == "adaptive":
@@ -955,33 +908,43 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         compute_metrics=None,
                         callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
                     )
-                    if torch.distributed.is_available() and torch.distributed.is_initialized():
-                        dl = trainer.get_train_dataloader()
-                        try:
-                            steps_local = len(dl)
-                        except TypeError:
-                            steps_local = -1
-                        t = torch.tensor([steps_local], device=trainer.args.device)
-                        gathered = [torch.zeros_like(t) for _ in range(dist.get_world_size())]
-                        dist.all_gather(gathered, t)
-                        steps_all = [int(x.item()) for x in gathered]
-                        if trainer.args.process_index == 0:
-                            print(f"[SANITY] num_batches_per_rank = {steps_all}")
-                        assert len(set(steps_all)) == 1, f"Dataloader length mismatch across ranks: {steps_all}"
 
                     trainer.train(task_id=data_args.task)
                     _trainer_wait_for_everyone(trainer)
+
                     trained_model = _trainer_unwrap_model(trainer)
-                    state_dict = trained_model.state_dict()
-                    delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
+                    if _is_main():
+                        fisher_dataloader = trainer.get_train_dataloader()
+
+
+
+                    name_to_param = dict(trained_model.named_parameters())
+                    delta = {}
+                    theta_last_cpu = {}  # <-- 同时为 theta_last 做准备
+                    for k in lora_keys:
+                        p = name_to_param.get(k, None)
+                        if p is None:
+                            continue
+                        p_cpu = p.detach().cpu()
+                        delta[k] = global_state_cpu[k] - p_cpu
+                        theta_last_cpu[k] = p_cpu  # 缓存CPU上的参数
+
                     w = len(client_datasets[cid])
                     for k in lora_keys:
                         aggregated[k] += delta[k] * w
                     total += w
 
+                    _free_after_local_train(trainer, model_to_keep=None)
+                    try:
+                        del trainer
+                    except Exception:
+                        pass
+
                     if _is_main():
-                        F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
-                        theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
+                        # --- [修改点 3：使用提前获取的 dataloader] ---
+                        F_client = compute_fisher_diag(trained_model, fisher_dataloader)
+
+                        theta_last = {k: theta_last_cpu[k] for k in F_client.keys() if k in theta_last_cpu}
                         acc = per_task_cache[cid]
                         acc["theta_last"] = theta_last
                         if reduce_mode == "last":
@@ -994,6 +957,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                                 for k in F_client:
                                     acc["F_sum"][k] += F_client[k]
                                 acc["count"] += 1
+
+                        # 清理 dataloader
+                        del fisher_dataloader
+
+                    try:
+                        del trained_model, name_to_param, delta, theta_last_cpu
+                        if _is_main():
+                            del F_client, theta_last
+                    except Exception:
+                        pass
+
+
+                    try:
+                        del local_model
+                    except Exception:
+                        pass
 
                 else:
                     trainer = UIETrainer(
@@ -1015,6 +994,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         cid=cid
                     )
                     _trainer_wait_for_everyone(trainer)
+
                     delta = {k: delta[k].detach().cpu() for k in lora_keys}
                     w = len(client_datasets[cid])
                     for k in lora_keys:
@@ -1035,20 +1015,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                                     acc["F_sum"][k] += F_client[k]
                                 acc["count"] += 1
 
-            else:
-                rank_payloads = []
-                if _is_main():
-                    trained_model = _trainer_unwrap_model(trainer)
-                    state_dict = trained_model.state_dict()
-                    delta = {k: global_state_cpu[k] - state_dict[k].detach().cpu() for k in lora_keys}
-                    F_client = compute_fisher_diag(trained_model, trainer.get_train_dataloader())
-                    theta_last = {k: state_dict[k].detach().cpu() for k in F_client.keys()}
-                    rank_payloads.append({
-                        "cid": cid,
-                        "weight": len(client_datasets[cid]),
-                        "delta": delta,
-                        "cache": None,
-                    })
+                    try:
+                        del delta, F_client, theta_last
+                    except Exception:
+                        pass
+                    _free_after_local_train(trainer, model_to_keep=None)
+                    try:
+                        del trainer
+                    except Exception:
+                        pass
+                    try:
+                        del local_model
+                    except Exception:
+                        pass
+
 
         for cid in selected:
             client_selection_tracker[cid]['count'] += 1
@@ -1061,9 +1041,16 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
         update_dict = {k: global_state_cpu[k].to(device) for k in lora_keys}
         global_model.load_state_dict(update_dict, strict=False)
+
+        global_model.to("cpu")  # <--- 新增：立即将全局模型移回CPU
+
         wait_for_everyone()
 
-
+        try:
+            del aggregated, global_state_cpu, update_dict
+        except Exception:
+            pass
+        gc.collect()
 
 
     # ===== 任务结束：将“本任务”信息并入历史 =====

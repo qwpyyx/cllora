@@ -10,7 +10,7 @@ from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.trainer import *
 from transformers.trainer_callback import TrainerCallback
 from fed_continual_state import ContinualState
-from uie_collator import SUPPORTED_DECODER_MODELS, check_model
+from uie_collator import SUPPORTED_DECODER_MODELS, _check_model_name as check_model
 from uie_dataset_lora import ANSWER_PREFIX
 from collections import defaultdict
 # logger = logging.getLogger(__name__)
@@ -281,111 +281,6 @@ def monitor_gradient_health(step, model, F_curr, bar_F_raw, r2, B_round):
             health_report['issues'].append(f"{name}: 收益值过大 ({b_round_val})")
 
     return health_report
-
-# def update_online_fisher(
-#         model: torch.nn.Module,
-#         batch: Dict[str, torch.Tensor],
-#         F_curr: Dict[str, torch.Tensor],
-#         alpha_ema: float,
-#         device: torch.device
-# ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-#     """
-#     修复版的在线Fisher更新函数，确保只对需要梯度的参数计算Fisher
-#     """
-#     # 保存当前梯度状态
-#     original_grads = {}
-#     for name, param in model.named_parameters():
-#         if param.requires_grad and param.grad is not None:
-#             original_grads[name] = param.grad.clone()
-#
-#     try:
-#         # 确保模型处于训练模式
-#         model.train()
-#
-#         # 数据移至设备
-#         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-#         inputs = {k: v for k, v in batch.items() if k != "labels"}
-#         labels = batch.get("labels", None)
-#
-#         if labels is None:
-#             return F_curr, {name: torch.zeros_like(v) for name, v in F_curr.items()}
-#
-#         # 只选择需要梯度的参数
-#         params_to_compute = []
-#         param_names = []
-#         for name, param in unwrap_model.named_parameters():
-#             if name in F_curr and param.requires_grad:
-#                 params_to_compute.append(param)
-#                 param_names.append(name)
-#
-#         if not params_to_compute:
-#
-#             return F_curr, {}
-#
-#         # 前向计算（需要计算梯度）
-#         model.zero_grad(set_to_none=True)
-#         outputs = model(**inputs)
-#         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-#         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-#
-#         # 初始化batch级梯度平方存储
-#         batch_grad_sum = {
-#             name: torch.zeros_like(param, device=device)
-#             for name, param in F_curr.items()
-#         }
-#
-#         batch_size = inputs["input_ids"].shape[0]
-#         valid_sample_count = 0
-#
-#         # 逐样本计算梯度
-#         for i in range(batch_size):
-#             sample_label = labels[i]
-#             valid_mask = sample_label != -100
-#             if not valid_mask.any():
-#                 continue
-#             valid_sample_count += 1
-#
-#             # 计算有效位置的log概率总和
-#             seq_len = log_probs[i].shape[0]
-#             sample_log_prob = log_probs[i, torch.arange(seq_len), sample_label]
-#             sample_log_prob = sample_log_prob[valid_mask].sum()
-#
-#             # 计算梯度
-#             grads = torch.autograd.grad(
-#                 sample_log_prob,
-#                 params_to_compute,
-#                 create_graph=False,  # 不需要创建计算图
-#                 retain_graph=(i < batch_size - 1),
-#                 allow_unused=True
-#             )
-#
-#             # 累积梯度平方
-#             for idx, name in enumerate(param_names):
-#                 if idx < len(grads) and grads[idx] is not None:
-#                     batch_grad_sum[name] += grads[idx].detach() ** 2
-#
-#         # 计算当前batch的Fisher
-#         F_batch = {}
-#         if valid_sample_count > 0:
-#             F_batch = {name: grad_sum / valid_sample_count for name, grad_sum in batch_grad_sum.items()}
-#         else:
-#             F_batch = {name: torch.zeros_like(v) for name, v in batch_grad_sum.items()}
-#
-#
-#         # EMA更新
-#         updated_F_curr = {
-#             name: alpha_ema * F_curr[name] + (1 - alpha_ema) * F_batch[name]
-#             for name in F_curr
-#         }
-#
-#
-#         return updated_F_curr, F_batch
-#
-#     finally:
-#         # 恢复原始梯度状态
-#         for name, param in model.named_parameters():
-#             if name in original_grads:
-#                 param.grad = original_grads[name]
 
 def update_online_fisher(
         model: torch.nn.Module,
@@ -1106,14 +1001,13 @@ class UIETrainer(Seq2SeqTrainer):
 
                     if self.continual_state.has_valid_history():
                         # 历史 F / θ 均以规范化键名存取
-                        bar_F_raw[cn] = self.continual_state.get_f_past(cn).to(device)
-                        bar_theta[cn] = self.continual_state.theta_last[cn].to(device)
+                        bar_F_raw[cn] = self.continual_state.get_f_past(cn)
+                        bar_theta[cn] = self.continual_state.theta_last[cn]
                     else:
-                        bar_F_raw[cn] = torch.zeros_like(p, device=device)
-                        bar_theta[cn] = torch.zeros_like(p, device=device)
+                        bar_F_raw[cn] = torch.zeros_like(p, device="cpu")  # 确保在CPU
+                        bar_theta[cn] = torch.zeros_like(p, device="cpu")  # 确保在CPU
 
                 # ---------- 算法态量 ----------
-
                 r2, r2_start = {}, {}
                 B_round, conf = {}, {}
 
@@ -1123,11 +1017,11 @@ class UIETrainer(Seq2SeqTrainer):
                         continue
                     cn = _canon_name(name)
                     # r²_ℓ = ‖θ^(ℓ) - bar_theta^(ℓ)‖²_{bar_F^(ℓ)}
-                    f_past = bar_F_raw[cn]
+                    f_past = bar_F_raw[cn].to(device)
                     hist_mean = torch.clamp(f_past.mean(), min=1e-12)
                     f_past_eff = f_past / hist_mean
                     theta_curr = p.detach()  # 当前层参数θ^(ℓ)
-                    theta_past = bar_theta[cn]
+                    theta_past = bar_theta[cn].to(device)
                     r2[cn] = ((theta_curr - theta_past).pow(2) * f_past_eff).sum()
                     # r²_ℓ,start = r²_ℓ（记录初始半径）
                     r2_start[cn] = r2[cn].clone()
@@ -1218,48 +1112,48 @@ class UIETrainer(Seq2SeqTrainer):
                         device=device
                     )
 
-                    global_norm = None
-                    if any(p.grad is not None for p in model.parameters()):
-                        s = 0.0
-                        for p in model.parameters():
-                            if p.grad is not None:
-                                s += float(p.grad.detach().float().norm().item()) ** 2
-                        global_norm = (s ** 0.5)
-
-                    # === [新增] 如有需要，打印可疑层的详细激活/反传统计 ===
+                    # global_norm = None
+                    # if any(p.grad is not None for p in model.parameters()):
+                    #     s = 0.0
+                    #     for p in model.parameters():
+                    #         if p.grad is not None:
+                    #             s += float(p.grad.detach().float().norm().item()) ** 2
+                    #     global_norm = (s ** 0.5)
+                    #
+                    # # === [新增] 如有需要，打印可疑层的详细激活/反传统计 ===
                     # if getattr(self, "_act_probe", None) is not None:
                     #     clip_norm = float(getattr(self.args, "clip_grad_norm", 1.0))
                     #     self._act_probe.report_if_needed(model_plain, logger, global_norm, clip_norm)
-
-
-
-                    # 监控点1：梯度范数检查
-                    grad_norms = {}
-                    for name, p in model_plain.named_parameters():
-                        if p.grad is not None:
-                            grad_norm = torch.norm(p.grad).item()
-                            grad_norms[name] = grad_norm
-                            if grad_norm > 1000:  # 梯度爆炸阈值
-                                logger.warning(f"梯度爆炸检测: {name}, 梯度范数: {grad_norm}")
-
-                    # 监控点2：Fisher值检查
-                    fisher_values = {}
-                    for name in F_curr:
-                        fisher_mean = torch.mean(F_curr[name]).item()
-                        fisher_values[name] = fisher_mean
-                        if fisher_mean < 1e-12 or fisher_mean > 1e6:
-                            logger.warning(f"Fisher值异常: {name}, 均值: {fisher_mean}")
-
-                    # 将监控数据保存
-                    if self.accelerator.is_main_process:
-                        gradient_monitor['grad_norms'].append(grad_norms)
-                        gradient_monitor['fisher_values'].append(fisher_values)
-                        gradient_monitor['loss_values'].append(raw_loss)
-                        try:
-                            weff = self._compute_delta_weff_norm(model_plain, bar_theta)
-                            diag_weff.append(weff)
-                        except Exception:
-                            pass
+                    #
+                    #
+                    #
+                    # # 监控点1：梯度范数检查
+                    # grad_norms = {}
+                    # for name, p in model_plain.named_parameters():
+                    #     if p.grad is not None:
+                    #         grad_norm = torch.norm(p.grad).item()
+                    #         grad_norms[name] = grad_norm
+                    #         if grad_norm > 1000:  # 梯度爆炸阈值
+                    #             logger.warning(f"梯度爆炸检测: {name}, 梯度范数: {grad_norm}")
+                    #
+                    # # 监控点2：Fisher值检查
+                    # fisher_values = {}
+                    # for name in F_curr:
+                    #     fisher_mean = torch.mean(F_curr[name]).item()
+                    #     fisher_values[name] = fisher_mean
+                    #     if fisher_mean < 1e-12 or fisher_mean > 1e6:
+                    #         logger.warning(f"Fisher值异常: {name}, 均值: {fisher_mean}")
+                    #
+                    # # 将监控数据保存
+                    # if self.accelerator.is_main_process:
+                    #     gradient_monitor['grad_norms'].append(grad_norms)
+                    #     gradient_monitor['fisher_values'].append(fisher_values)
+                    #     gradient_monitor['loss_values'].append(raw_loss)
+                    #     try:
+                    #         weff = self._compute_delta_weff_norm(model_plain, bar_theta)
+                    #         diag_weff.append(weff)
+                    #     except Exception:
+                    #         pass
 
 
                     ###########################################
@@ -1277,33 +1171,21 @@ class UIETrainer(Seq2SeqTrainer):
                                 # Step 1
                                 g = p.grad.detach()
 
-                                # # 添加梯度异常检测
-                                # if torch.any(torch.isnan(g)) or torch.any(torch.isinf(g)):
-                                #     logger.warning(f"梯度包含NaN或Inf: {name}")
-                                #     continue
-                                #
-                                # # 检查梯度范数是否异常
-                                # grad_norm = torch.norm(g)
-                                # if grad_norm > 10:  # 设置合理的阈值
-                                #     logger.warning(f"梯度范数异常: {name}, 范数: {grad_norm:.6f}")
-                                #     # 应用梯度裁剪
-                                #     g = torch.clamp(g, -10.0, 10.0)
-                                #     p.grad = g  # 更新梯度
-
-
-
-
                                 # F_batch = g * g
                                 # F_curr[name] = self.alpha * F_curr[name] + (1 - self.alpha) * F_batch
                                 F_curr_safe = F_curr[cn]
                                 # Step 2
                                 # v = g / F_curr_safe
                                 # 2. 过去任务Fisher（bar_F^(ℓ)）
-                                f_past = bar_F_raw.get(cn, torch.zeros_like(p))
-                                if torch.all(f_past <= 0) or f_past.mean() <= 1e-12:
-                                    f_past_eff = torch.ones_like(f_past)  # ← 关键：未见层按单位权重
+                                f_past_cpu = bar_F_raw.get(cn, None)  # 从 CPU 获取
+
+                                # 检查 CPU 上的 f_past 是否有效
+                                if f_past_cpu is None or torch.all(f_past_cpu <= 0) or f_past_cpu.mean() <= 1e-12:
+                                    f_past_eff = torch.ones_like(p)  # 在 GPU (p.device) 上创建
                                 else:
+                                    f_past = f_past_cpu.to(device)  # <-- 即时移至 GPU
                                     f_past_eff = f_past / f_past.mean()
+                                    del f_past  # <-- 可选：立即释放 f_past 的 GPU 显存
 
 
                                 # Fisher 信息的绝对量级不影响 “参数重要性的区分”，仅相对比例有意义
@@ -1399,8 +1281,11 @@ class UIETrainer(Seq2SeqTrainer):
                                 v_alg = v_scaled
 
                                 # 3. 当前参数与过去最优参数的差：Δθ = θ^(ℓ) - bar_theta^(ℓ)
-                                delta_theta = p - bar_theta.get(cn, torch.zeros_like(p))
-
+                                # delta_theta = p - bar_theta.get(cn, torch.zeros_like(p))
+                                theta_past = bar_theta.get(cn, torch.zeros_like(p, device="cpu")).to(
+                                    device)  # <-- 即时移至 GPU
+                                delta_theta = p - theta_past
+                                del theta_past  # <-- 立即释放 theta_past 的 GPU 显存
                                 # 4. a_B^(ℓ) = (v_B^(ℓ))^T * bar_F^(ℓ) * v_B^(ℓ)
                                 # a_raw_alg = (v_alg * f_past * v_alg).sum()
 
@@ -1502,19 +1387,9 @@ class UIETrainer(Seq2SeqTrainer):
                                                        dtype=p.dtype)
 
                                 B_round[cn] = B_round[cn] + gain
-                                if "model.encoder.block.1.layer.0.SelfAttention.v.lora_A.default" in name:
-                                    round_s.append(B_round[cn])
-                                # --------------------------
-                                # 算法步骤10：更新马氏半径 r²_ℓ
-                                # --------------------------
-                                if "base_model.model.decoder.block.3.layer.0.SelfAttention.q.lora_B.default.weight" in name:
-                                    pass
 
-                                if "base_model.model.encoder.block.3.layer.0.SelfAttention.q.lora_A.default.weight" in name:
-                                    pass
                                 r2[cn] = r2[cn] - 2.0 * eta_alg * b_raw_alg + (eta_alg * eta_alg) * a_raw_alg
-                                if r2[cn] > 1:
-                                    pass
+
                                 # --------------------------
                                 # 算法步骤11：更新参数 θ^(ℓ) = θ^(ℓ) - η·v_B^(ℓ)
                                 # --------------------------
@@ -1594,20 +1469,6 @@ class UIETrainer(Seq2SeqTrainer):
                         #     if 'grad_norm' in metric or 'b_round' in metric:
                         #         logger.info(f"  {metric}: {value:.6f}")
 
-            # 辅助函数：计算通信数据量（字节）和时间（秒）
-            def calculate_comm_metrics(param_dict: Dict[str, torch.Tensor]) -> Tuple[float, int]:
-                total_bytes = 0
-                for param in param_dict.values():
-                    # 计算参数总字节数（元素数 × 每个元素字节数，float32为4字节）
-                    total_bytes += param.numel() * param.element_size()
-                if total_bytes == 0:
-                    return 0.0, 0
-                # 转换带宽单位：MB/s → 字节/秒（1MB = 1024×1024字节）
-                bandwidth_bytes_per_sec = comm_bandwidth * 1024 * 1024
-                # 通信时间 = 数据传输时间 + 固定开销
-                comm_time = (total_bytes / bandwidth_bytes_per_sec) + comm_fixed_cost
-                return comm_time, total_bytes
-
             if use_adaptive_logic:
                 # ====== Step-3：选层与通信计算 ======
                 F_round = {n: 0.5 * torch.clamp(r2[n] - r2_start[n], min=0.0) for n in r2}
@@ -1636,12 +1497,12 @@ class UIETrainer(Seq2SeqTrainer):
                     selected_flags = obj[0]
 
 
-                # Test
-                # selected_flags = [True] * len(names)
+
                 selection_map = {n: f for n, f in zip(names, selected_flags)}
 
                 unwrapped_model = self.accelerator.unwrap_model(model)
-                state_dict_raw = unwrapped_model.state_dict()
+
+                name_to_param_raw = dict(unwrapped_model.named_parameters())
 
 
                 # 1) 自适应模式：仅传输选中层的delta
@@ -1649,7 +1510,11 @@ class UIETrainer(Seq2SeqTrainer):
                 adaptive_delta = {}
                 for name in base_params:
 
-                    local_param = state_dict_raw[name].detach().cpu()
+                    p_raw = name_to_param_raw.get(name, None)
+                    if p_raw is None:
+                        continue  # 或者 log warning
+                    local_param = p_raw.detach().cpu()
+
                     # 仅选中的层传输真实delta，未选中的层传输零（不实际传输，仅占位）
                     #adaptive_delta[name] = (base_params[name] - local_param) if sel else torch.zeros_like(local_param)
                     if selection_map.get(name, True):
@@ -1659,35 +1524,12 @@ class UIETrainer(Seq2SeqTrainer):
 
                 delta = adaptive_delta
 
-                # # 计算自适应模式通信时间
-                # adaptive_comm_time, adaptive_bytes = calculate_comm_metrics(
-                #     {k: v for k, v in delta.items() if torch.count_nonzero(v).item() > 0}
-                # )
-                #
-                # # 2) 计算基线模式通信时间（传输所有可训练参数的delta）
-                # baseline_delta = {}
-                # for name, p in model.named_parameters():
-                #     if name in base_params and p.requires_grad:
-                #         local_param = state_dict[name].detach().cpu()
-                #         baseline_delta[name] = base_params[name] - local_param
-                # baseline_comm_time, baseline_bytes = calculate_comm_metrics(baseline_delta)
-                #
-                # # 计算节省的通信时间
-                # save_time = baseline_comm_time - adaptive_comm_time
-                # save_ratio = (save_time / baseline_comm_time * 100.0) if baseline_comm_time > 0 else 0.0
-                #
-                # # 日志输出通信统计
-                # logger.info(
-                #     f"通信统计 - 自适应模式: {adaptive_bytes / (1024 * 1024):.2f} MB, 时间: {adaptive_comm_time:.4f}秒\n"
-                #     f"通信统计 - 基线模式: {baseline_bytes / (1024 * 1024):.2f} MB, 时间: {baseline_comm_time:.4f}秒\n"
-                #     f"通信节省时间: {save_time:.4f}秒 (节省比例: {save_ratio:.2f}%)"
-                # )
-
                 # 3) 本轮Fisher计算
-                F_client = {
-                    k: F_curr.get(k, torch.zeros_like(state_dict_raw[k])).detach().cpu()
-                    for k in base_params
-                }
+                F_client = {}
+                for k in base_params:
+                    if k in name_to_param_raw:  # 确保参数存在
+                        # 使用 name_to_param_raw 来获取形状
+                        F_client[k] = F_curr.get(k, torch.zeros_like(name_to_param_raw[k])).detach().cpu()
             else:
                 # 基线模式：传输所有可训练参数的delta
                 state_dict = model.state_dict()
@@ -1709,7 +1551,11 @@ class UIETrainer(Seq2SeqTrainer):
                 F_client = {k: torch.zeros_like(v) for k, v in base_params.items()}
 
             # 4) 本轮结束时该客户端的θ*（只取可训练/LoRA参数）
-            theta_last = {k: state_dict_raw[k].detach().cpu() for k in base_params.keys()}
+            theta_last = {}
+            for k in base_params.keys():
+                p_raw = name_to_param_raw.get(k, None)
+                if p_raw is not None:
+                    theta_last[k] = p_raw.detach().cpu()
 
             # 返回值新增通信节省时间
             self.accelerator.wait_for_everyone()
