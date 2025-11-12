@@ -9,6 +9,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="qiuwenqi@172.31.233.163:22 key (10)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="qiuwenqi@172.31.233.163:22 key (2)">
         <serverdata>
           <mappings>
@@ -62,6 +69,13 @@
         <serverdata>
           <mappings>
             <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.175:22 key">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

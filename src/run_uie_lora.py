@@ -186,10 +186,10 @@ class DataTrainingArguments:
         },
     )
     max_num_instances_per_task: int = field(
-        default=1000, metadata={"help": "The maximum number of instances we will consider for each training task."}
+        default=10000, metadata={"help": "The maximum number of instances we will consider for each training task."}
     )
     max_num_instances_per_eval_task: int = field(
-        default=1000,
+        default=200,
         metadata={"help": "The maximum number of instances we will consider for each validation/test task."}
     )
     max_train_samples: Optional[int] = field(
@@ -260,11 +260,11 @@ class FederatedArguments:
         metadata={"help": "Training mode: centralized or federated"},
     )
     num_clients: int = field(
-        default=20,
+        default=100,
         metadata={"help": "Total number of clients in federated learning."},
     )
     clients_per_round: int = field(
-        default=5,
+        default=10,
         metadata={"help": "Number of clients sampled in each round."},
     )
     global_rounds: int = field(
@@ -276,7 +276,7 @@ class FederatedArguments:
         metadata={"help": "Local training epochs for each selected client."},
     )
     dirichlet_alpha: float = field(
-        default=10,
+        default=50,
         metadata={"help": "Dirichlet alpha controlling data heterogeneity."},
     )
     # 新增：联邦采样专用的随机种子

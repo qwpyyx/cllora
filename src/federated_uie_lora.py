@@ -150,93 +150,214 @@ def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_
 #
 #     return [dataset.select(idxs) for idxs in client_indices]
 
+# def build_model_and_tokenizer(model_args: ModelArguments):
+#     if 'adapter' in model_args.model_name_or_path:
+#         config = PeftConfig.from_pretrained(model_args.model_name_or_path)
+#         if 'llama' in model_args.model_name_or_path.lower():
+#             tokenizer = transformers.LlamaTokenizer.from_pretrained(config.base_model_name_or_path)
+#             config.bos_token_id = 1
+#             config.eos_token_id = 2
+#             config.pad_token_id = 1
+#             tokenizer.bos_token_id = 1
+#             tokenizer.eos_token_id = 2
+#             tokenizer.pad_token_id = 1
+#         else:
+#             tokenizer = transformers.AutoTokenizer.from_pretrained(config.base_model_name_or_path)
+#     elif 'llama' in model_args.model_name_or_path.lower():
+#         config = transformers.AutoConfig.from_pretrained(
+#             model_args.model_name_or_path,
+#             cache_dir=model_args.cache_dir,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#         config.bos_token_id = 1
+#         config.eos_token_id = 2
+#         config.pad_token_id = 1
+#         tokenizer = transformers.LlamaTokenizer.from_pretrained(
+#             model_args.model_name_or_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast_tokenizer,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#         tokenizer.bos_token_id = 1
+#         tokenizer.eos_token_id = 2
+#         tokenizer.pad_token_id = 1
+#     else:
+#         config = transformers.AutoConfig.from_pretrained(
+#             model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+#             cache_dir=model_args.cache_dir,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#         tokenizer = transformers.AutoTokenizer.from_pretrained(
+#             model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast_tokenizer,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#
+#     if 'llama' in model_args.model_name_or_path.lower():
+#         model_class = LlamaForCausalLM_with_lossmask
+#         tokenizer.padding_side = 'left'
+#     else:
+#         model_class = transformers.AutoModelForSeq2SeqLM
+#
+#     if 'adapter' in model_args.model_name_or_path:
+#         model = model_class.from_pretrained(config.base_model_name_or_path)
+#         model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
+#     elif 'llama' in model_args.model_name_or_path.lower():
+#         model = model_class.from_pretrained(
+#             model_args.model_name_or_path,
+#             from_tf=bool('.ckpt' in model_args.model_name_or_path),
+#             config=config,
+#             cache_dir=model_args.cache_dir,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None
+#         )
+#         peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1)
+#         model = get_peft_model(model, peft_config)
+#     else:
+#         model = model_class.from_pretrained(
+#             model_args.model_name_or_path,
+#             from_tf=bool('.ckpt' in model_args.model_name_or_path),
+#             config=config,
+#             cache_dir=model_args.cache_dir,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#         peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1)
+#         model = get_peft_model(model, peft_config)
+#
+#     model.resize_token_embeddings(len(tokenizer))
+#
+#     if 'llama' in model_args.model_name_or_path.lower():
+#         model.generation_config.bos_token_id = 1
+#         model.generation_config.eos_token_id = 2
+#         model.generation_config.pad_token_id = 1
+#
+#     for name, param in model.named_parameters():
+#         if 'lora_' in name:
+#             param.requires_grad = True
+#         elif 'shared' in name:
+#             param.requires_grad = False
+#
+#     return model, tokenizer
 def build_model_and_tokenizer(model_args: ModelArguments):
-    if 'adapter' in model_args.model_name_or_path:
-        config = PeftConfig.from_pretrained(model_args.model_name_or_path)
-        if 'llama' in model_args.model_name_or_path.lower():
-            tokenizer = transformers.LlamaTokenizer.from_pretrained(config.base_model_name_or_path)
-            config.bos_token_id = 1
-            config.eos_token_id = 2
-            config.pad_token_id = 1
-            tokenizer.bos_token_id = 1
-            tokenizer.eos_token_id = 2
-            tokenizer.pad_token_id = 1
+    """
+    Unified loader for T5 (seq2seq), LLaMA-2 (decoder-only), and LLaMA-3 (decoder-only).
+    Keeps PEFT-LoRA behaviors consistent with your original code.
+    """
+
+    # --------- 1) 判别模型族 ----------
+    name_lower = model_args.model_name_or_path.lower()
+    is_adapter = ("adapter" in name_lower)  # peft adapter 路径
+    is_llama = ("llama" in name_lower)
+    is_llama3 = ("llama-3" in name_lower) or ("llama3" in name_lower)
+    # 只要不是 llama，就按 seq2seq（T5/FLAN-T5 等）处理
+    is_seq2seq = (not is_llama)
+
+    # --------- 2) 配置与 tokenizer ----------
+    # adapter 的 base 模型名需要先从 peft config 里取出来
+    if is_adapter:
+        peft_cfg = PeftConfig.from_pretrained(model_args.model_name_or_path)
+        base_model = peft_cfg.base_model_name_or_path
+    else:
+        base_model = model_args.model_name_or_path
+
+    config = transformers.AutoConfig.from_pretrained(
+        base_model,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+
+    if is_llama:
+        # LLaMA-3 推荐走 AutoTokenizer；LLaMA-2 兼容 LlamaTokenizer
+        if is_llama3:
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                base_model,
+                cache_dir=model_args.cache_dir,
+                use_fast=model_args.use_fast_tokenizer,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
         else:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(config.base_model_name_or_path)
-    elif 'llama' in model_args.model_name_or_path.lower():
-        config = transformers.AutoConfig.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+            tokenizer = transformers.LlamaTokenizer.from_pretrained(
+                base_model,
+                cache_dir=model_args.cache_dir,
+                use_fast=model_args.use_fast_tokenizer,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+        # 与你/他脚本一致：显式设置 special ids
         config.bos_token_id = 1
         config.eos_token_id = 2
         config.pad_token_id = 1
-        tokenizer = transformers.LlamaTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
         tokenizer.bos_token_id = 1
         tokenizer.eos_token_id = 2
         tokenizer.pad_token_id = 1
+        tokenizer.padding_side = "left"  # decoder-only 左填充，与你原来一致
     else:
-        config = transformers.AutoConfig.from_pretrained(
-            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+        # T5/FLAN-T5 等
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            base_model,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
-    if 'llama' in model_args.model_name_or_path.lower():
+    # --------- 3) 选择 model class ----------
+    if is_llama:
+        # 你自己的自定义 LLaMA 类（保持不变）
         model_class = LlamaForCausalLM_with_lossmask
-        tokenizer.padding_side = 'left'
+        lora_task = TaskType.CAUSAL_LM
     else:
         model_class = transformers.AutoModelForSeq2SeqLM
+        lora_task = TaskType.SEQ_2_SEQ_LM
 
-    if 'adapter' in model_args.model_name_or_path:
-        model = model_class.from_pretrained(config.base_model_name_or_path)
-        model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
-    elif 'llama' in model_args.model_name_or_path.lower():
+    # --------- 4) 加载模型 + 应用 LoRA/PEFT ----------
+    if is_adapter:
+        # 先加载 base，再把 peft adapter 套上
         model = model_class.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool('.ckpt' in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None
-        )
-        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1)
-        model = get_peft_model(model, peft_config)
-    else:
-        model = model_class.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool('.ckpt' in model_args.model_name_or_path),
+            base_model,
+            from_tf=bool(".ckpt" in base_model),
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1)
+        model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
+    else:
+        # 直接加载预训练模型，再用 LoRAConfig 注入训练参数
+        model = model_class.from_pretrained(
+            base_model,
+            from_tf=bool(".ckpt" in base_model),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+        peft_config = LoraConfig(
+            task_type=lora_task,
+            inference_mode=False,
+            r=model_args.lora_dim,
+            lora_alpha=32,
+            lora_dropout=0.1,
+        )
         model = get_peft_model(model, peft_config)
 
+    # --------- 5) 统一一些生成与 embedding 细节 ----------
     model.resize_token_embeddings(len(tokenizer))
-
-    if 'llama' in model_args.model_name_or_path.lower():
+    if is_llama:
+        # 和你原来的做法一致
         model.generation_config.bos_token_id = 1
         model.generation_config.eos_token_id = 2
         model.generation_config.pad_token_id = 1
 
+    # 只训练 LoRA 权重（沿用你原来的规则）
     for name, param in model.named_parameters():
         if 'lora_' in name:
             param.requires_grad = True
