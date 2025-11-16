@@ -12,11 +12,11 @@ export PYTHONUNBUFFERED=1
 
 
 port=$(shuf -i25000-30000 -n1)
-method=lora_origin
+method=adaptive
 lora_rank=8
 lamda_2=0
 lamda_1=0
-lr=2e-04
+lr=1e-03
 # bash scripts/order_1_adaptive.sh> logs_and_outputs/order_1/logs/train_and_infer.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
@@ -75,7 +75,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -99,12 +99,14 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 2
+   
 
 sleep 5
 
 # Task 3: task1590
 CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
+   --mixed_precision bf16 \
    src/run_uie_lora.py \
    --do_train \
    --do_predict \
@@ -118,7 +120,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -142,6 +144,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 3
+
+
 sleep 5
 
 # Task 4: task639
@@ -160,7 +164,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -184,6 +188,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 4
+   
 sleep 5
 
 # Task 5: task1572
@@ -202,7 +207,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -226,6 +231,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 5
+   
 sleep 5
 
 # Task 6: task1687
@@ -244,7 +250,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -268,6 +274,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 6
+   
 sleep 5
 
  Task 7: task591
@@ -286,7 +293,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -310,6 +317,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 7
+   
 sleep 5
 
 # Task 8: task363
@@ -328,7 +336,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -352,6 +360,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 8
+   
 sleep 5
 
 # Task 9: task1510
@@ -370,7 +379,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -394,6 +403,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 9
+   
 sleep 5
 
 # Task 10: task1729
@@ -412,7 +422,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -436,6 +446,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 10
+   
 sleep 5
 
 # Task 11: task181
@@ -454,7 +465,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -478,6 +489,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 11
+   
 sleep 5
 
 # Task 12: task511
@@ -496,7 +508,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -520,6 +532,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 12
+   
 sleep 5
 
 # Task 13: task002
@@ -538,7 +551,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -562,6 +575,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 13
+   
 sleep 5
 
 # Task 14: task1290
@@ -580,7 +594,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -604,6 +618,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 14
+   
 sleep 5
 
 # Task 15: task875
@@ -622,7 +637,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
-   --local_epochs 20 \
+   --local_epochs 10 \
    --dirichlet_alpha 10 \
    --comm_budget 300 \
    --learning_rate $lr \
@@ -646,3 +661,4 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --federated_seed 42 \
    --method $method \
    --task 15
+   

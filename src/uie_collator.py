@@ -163,7 +163,11 @@ class DataCollatorForUIE:
             else:
                 # 只有当无法获取 decoder_start_token_id 时（非常罕见），尝试回退或报警
                 # 对于 T5/BART，decoder_start_token_id 是必须的
-                pass
+                logger.warning(
+                    f"无法获取 decoder_start_token_id（模型: {self.model_name_or_path}）。"
+                    f"Seq2Seq 模型（如 T5/BART）的 decoder_input_ids 可能不正确。"
+                )
+                # pass
 
             self._save_samples(model_inputs, sources, labels)
 

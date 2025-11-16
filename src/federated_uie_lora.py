@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
 """Federated learning training loop for UIE LoRA models."""
-
 import copy
 import logging
 import os
@@ -39,35 +38,6 @@ CURRENT_DIR = os.path.dirname(__file__)
 def _trainer_accelerator(trainer):
     return getattr(trainer, "accelerator", None)
 
-
-def _free_after_local_train(trainer, model_to_keep=None):
-    if model_to_keep is not None:
-        # 把最新权重回填到你的持久对象，并迁回 CPU
-        model_to_keep.load_state_dict(trainer.model.state_dict(), strict=False)
-        model_to_keep.to("cpu")
-
-    with contextlib.suppress(Exception):
-        trainer.model.to("cpu")
-
-    with contextlib.suppress(Exception):
-        if getattr(trainer, "optimizer", None) is not None:
-            for s in trainer.optimizer.state.values():
-                for k, v in list(s.items()):
-                    if torch.is_tensor(v):
-                        s[k] = v.cpu()
-        trainer.optimizer = None
-        trainer.lr_scheduler = None
-        if hasattr(trainer, "scaler"):
-            delattr(trainer, "scaler")
-        if hasattr(trainer, "accelerator"):
-            trainer.accelerator.free_memory()
-
-    # 删除引用 + 清理缓存
-    del trainer
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def _trainer_wait_for_everyone(trainer) -> None:
     accel = _trainer_accelerator(trainer)
     if accel is not None:
@@ -76,7 +46,6 @@ def _trainer_wait_for_everyone(trainer) -> None:
         dist.barrier()
     else:  # fallback for single-process execution
         wait_for_everyone()
-
 
 def _trainer_unwrap_model(trainer):
     accel = _trainer_accelerator(trainer)
@@ -151,7 +120,6 @@ def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_
             sizes[cid] += 1
 
     return [dataset.select(idxs) for idxs in client_indices]
-
 
 def build_model_and_tokenizer(model_args: ModelArguments):
     """
@@ -275,7 +243,6 @@ def build_model_and_tokenizer(model_args: ModelArguments):
 
     return model, tokenizer
 
-
 def compute_fisher_diag(model, dataloader):
     """
     适配LoRA模型的对角线Fisher信息计算（修正版）
@@ -360,156 +327,6 @@ def compute_fisher_diag(model, dataloader):
     # 转移到CPU并返回（与其他Fisher函数格式一致）
     return {k: v.detach() for k, v in normalized_fisher.items()} # <-- 修改
 
-def filter_lora_parameters(fisher_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """过滤仅保留包含"lora"的参数（与compute_fisher_diag保持一致）"""
-    return {
-        name: tensor for name, tensor in fisher_dict.items()
-        if "lora" in name.lower()
-    }
-
-
-def normalize_fisher(fisher_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """对compute_fisher的结果执行min-max归一化（与compute_fisher_diag对齐）"""
-    normalized = {}
-    for name, tensor in fisher_dict.items():
-        x_min = tensor.min()
-        x_max = tensor.max()
-        if x_max - x_min > 1e-8:
-            normalized[name] = (tensor - x_min) / (x_max - x_min)
-        else:
-            normalized[name] = torch.zeros_like(tensor)
-    return normalized
-
-
-def compute_difference_metrics(
-        f1: Dict[str, torch.Tensor],
-        f2: Dict[str, torch.Tensor]
-) -> Tuple[Dict[str, float], float, float, float, float]:
-    """计算两个Fisher结果的差异指标（支持字典格式输入）"""
-    per_layer_metrics = {}
-    all_f1 = []
-    all_f2 = []
-
-    # 获取共有的参数名（确保对比的是相同参数）
-    common_keys = f1.keys() & f2.keys()
-    if not common_keys:
-        logging.warning("未找到共有的LoRA参数，无法计算差异指标")
-        return {}, 0.0, 0.0, 0.0, 0.0
-
-    for name in common_keys:
-        tensor1 = f1[name].flatten().cpu().numpy()
-        tensor2 = f2[name].flatten().cpu().numpy()
-
-        # 层级指标
-        abs_error = np.mean(np.abs(tensor1 - tensor2))
-        rel_error = np.mean(np.abs(tensor1 - tensor2) / (np.abs(tensor1) + 1e-8))  # 避免除零
-        per_layer_metrics[name] = {"abs_error": abs_error, "rel_error": rel_error}
-
-        # 收集全局数据
-        all_f1.extend(tensor1)
-        all_f2.extend(tensor2)
-
-    # 全局指标
-    all_f1 = np.array(all_f1)
-    all_f2 = np.array(all_f2)
-    mean_abs_error = np.mean(np.abs(all_f1 - all_f2))
-    mean_rel_error = np.mean(np.abs(all_f1 - all_f2) / (np.abs(all_f1) + 1e-8))
-    l2_distance = np.sqrt(np.sum((all_f1 - all_f2) ** 2))
-    pearson_corr, _ = pearsonr(all_f1, all_f2) if len(all_f1) > 1 else (0.0, 0.0)
-
-    return per_layer_metrics, mean_abs_error, mean_rel_error, l2_distance, pearson_corr
-
-
-def visualize_comparison(
-        f1: Dict[str, torch.Tensor],
-        f2: Dict[str, torch.Tensor],
-        sample_layers: int = 3,
-        save_dir: str = "."
-) -> None:
-    """可视化对比结果（直方图和散点图）"""
-    common_keys = list(f1.keys() & f2.keys())
-    if not common_keys:
-        logging.warning("无共有的LoRA参数，跳过可视化")
-        return
-
-    # 随机选择样本层（最多sample_layers个）
-    layers_to_plot = common_keys[:min(sample_layers, len(common_keys))]
-
-    # 1. 直方图对比
-    plt.figure(figsize=(15, 5))
-    for i, name in enumerate(layers_to_plot):
-        plt.subplot(1, sample_layers, i + 1)
-        tensor1 = f1[name].flatten().cpu().numpy()
-        tensor2 = f2[name].flatten().cpu().numpy()
-        plt.hist(tensor1, bins=50, alpha=0.5, label="compute_fisher")
-        plt.hist(tensor2, bins=50, alpha=0.5, label="compute_fisher_diag")
-        plt.title(f"Layer: {name.split('.')[-1]}")  # 显示短名称
-        plt.xlabel("Fisher Value")
-        plt.ylabel("Count")
-        plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{save_dir}/fisher_histogram_comparison.png")
-    plt.close()
-
-    # 2. 散点图（全局分布）
-    plt.figure(figsize=(8, 8))
-    all_f1 = np.concatenate([f1[name].flatten().cpu().numpy() for name in common_keys])
-    all_f2 = np.concatenate([f2[name].flatten().cpu().numpy() for name in common_keys])
-    plt.scatter(all_f1, all_f2, alpha=0.5, s=1)
-    plt.plot([0, 1], [0, 1], 'r--')  # 归一化后的理想对角线（0-1范围）
-    plt.xlabel("compute_fisher (Normalized)")
-    plt.ylabel("compute_fisher_diag (Normalized)")
-    plt.title("Fisher Value Scatter Plot (LoRA Parameters Only)")
-    plt.savefig(f"{save_dir}/fisher_scatter_comparison.png")
-    plt.close()
-
-
-def compare_fishers(
-        model: torch.nn.Module,
-        dataloader: DataLoader,
-        alpha: float = 0.5,
-        save_dir: str = ".",
-        sample_layers: int = 3
-) -> None:
-    """主函数：对比两个Fisher计算函数的结果"""
-    # 1. 计算两个Fisher矩阵
-    logging.info("开始计算Fisher矩阵...")
-    fisher = compute_fisher(model, dataloader, alpha=alpha)  # EMA版本（所有可训练参数）
-    fisher_diag = compute_fisher_diag(model, dataloader)  # 样本平均版本（仅LoRA参数）
-
-    # 2. 过滤compute_fisher的结果：仅保留LoRA参数（与fisher_diag对齐）
-    fisher_lora = filter_lora_parameters(fisher)
-    logging.info(f"compute_fisher中LoRA参数数量: {len(fisher_lora)}")
-    logging.info(f"compute_fisher_diag中LoRA参数数量: {len(fisher_diag)}")
-
-    # 3. 归一化compute_fisher的LoRA参数（与fisher_diag的归一化方式一致）
-    # fisher_lora_norm = normalize_fisher(fisher_lora)
-
-    # 4. 计算差异指标
-    per_layer_metrics, mean_abs, mean_rel, l2, corr = compute_difference_metrics(
-        fisher_lora, fisher_diag
-    )
-
-    # 5. 输出量化结果
-    logging.info("\n===== Fisher对比量化指标 =====")
-    logging.info(f"共有的LoRA参数数量: {len(per_layer_metrics)}")
-    logging.info(f"全局平均绝对误差: {mean_abs:.6f}")
-    logging.info(f"全局平均相对误差: {mean_rel:.6f}")
-    logging.info(f"全局L2距离: {l2:.6f}")
-    logging.info(f"全局Pearson相关系数: {corr:.6f}")
-
-    # 打印前5层的详细误差
-    if per_layer_metrics:
-        logging.info("\n===== 部分LoRA层的误差详情 =====")
-        for name in list(per_layer_metrics.keys())[:5]:
-            logging.info(
-                f"层 {name}: 绝对误差={per_layer_metrics[name]['abs_error']:.6f}, "
-                f"相对误差={per_layer_metrics[name]['rel_error']:.6f}"
-            )
-
-    # 6. 可视化
-    visualize_comparison(fisher_lora, fisher_diag, sample_layers, save_dir)
-    logging.info(f"可视化结果已保存至 {save_dir}")
 
 
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
@@ -768,19 +585,41 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     # —— 任务级缓存：只记录“本任务”的 Fisher 与该任务最后一次的 θ*
     reduce_mode = getattr(fed_args, "fisher_reduce_mode", "last")  # "last" 或 "mean"
     per_task_cache = {
-        cid: {"F_sum": None, "count": 0, "F_last": None, "theta_last": None}
+        cid: None  # 初始为 None，被选中后将存入 ContinualState 对象
         for cid in range(fed_args.num_clients)
     }
 
     lora_params = {k: p for k, p in global_model.named_parameters() if "lora" in k}
-    # 预计算所有LoRA层的成本（只需要计算一次，全局共享）
     layer_costs = {
         k: calculate_layer_packet_cost(p)
         for k, p in lora_params.items()
     }
-    # if _is_main():
-    #     logger.info(f"预计算的LoRA层通信成本: "
-    #             f"{layer_costs['69']}")
+
+    base_args.num_train_epochs = fed_args.local_epochs
+    base_args.save_strategy = "no"
+    base_args.logging_strategy = "no"
+    base_args.evaluation_strategy = "no"
+
+    if _is_main():
+        logger.info("Initializing persistent DeepSpeed Trainer...")
+
+    trainer = UIETrainer(
+        model=global_model,
+        args=base_args,
+        train_dataset=client_datasets[0],  # <--- 占位符
+        tokenizer=tokenizer,
+        data_collator=collator_for(global_model),  # <--- 只创建一次
+        compute_metrics=None,
+        callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
+        state=None,
+        comm_budget=None,
+        layer_costs=None,
+    )
+    if _is_main():
+        logger.info("DeepSpeed Trainer initialized.")
+
+
+
 
     for rnd in range(fed_args.global_rounds):
         if _is_main():
@@ -809,53 +648,48 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             logger.info(f"Selected client {selected}")
 
         lora_keys = get_lora_trainable_keys(global_model)
-        global_state_cpu = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
+
+        global_state_cpu = {
+            k: v.detach().cpu()
+            for k, v in global_model.state_dict().items()
+            if k in lora_keys  # 只需要 LoRA 键
+        }
+
+        # 2. 将其转换为 GPU 字典，用于快速加载
+        global_state_gpu = {
+            k: v.to(device) for k, v in global_state_cpu.items()
+        }
+
         aggregated = {k: torch.zeros_like(global_state_cpu[k]) for k in lora_keys}
         total = 0
 
         for cid in selected:
             if _is_main():
                 logger.info(f"Client ID: {cid}")
-            # local_model = copy.deepcopy(global_model)
+                logger.info(f"Client {cid}: Resetting persistent trainer...")
 
-            # 解包：获取未被 DDP/accelerator 包装的原始 PeftModel
-            if hasattr(global_model, 'module'):
-                global_peft_model = global_model.module  # 原始模型，未绑定分布式状态
-            else:
-                global_peft_model = global_model
+            trainer.model.load_state_dict(global_state_gpu, strict=False)
+            trainer.train_dataset = client_datasets[cid]
 
-            # 深拷贝原始模型（此时拷贝的是纯模型结构和参数，无分布式状态）
-            local_model = copy.deepcopy(global_peft_model)
+            trainer.optimizer = None
+            trainer.lr_scheduler = None
+            train_dataloader = trainer.get_train_dataloader()
+            steps_per_epoch = len(train_dataloader) // trainer.args.gradient_accumulation_steps
+            steps_per_epoch = max(steps_per_epoch, 1)  # 至少 1 步
+            num_training_steps = math.ceil(trainer.args.num_train_epochs * steps_per_epoch)
+            trainer.create_optimizer_and_scheduler(num_training_steps=num_training_steps)
+            if hasattr(trainer, "adam_states"):
+                trainer.adam_states = {}
 
-            # 重新用 accelerator 准备（适配本地分布式环境）
-            # local_model = accelerator.prepare(local_model)
-            # local_model = local_model.to(accelerator.device)
-            local_args = copy.deepcopy(base_args)
-            local_args.resume_from_checkpoint = None
-            local_args.num_train_epochs = fed_args.local_epochs
-            local_args.save_strategy = "no"
-            local_args.logging_strategy = "no"
-            local_args.evaluation_strategy = "no"
-
-            # local_model.to("cpu")
-
-            # accelerate/DDP 由 Trainer 接管；这里不要手动 .cuda() 或 init pg
             if method == "lora_origin":
-                trainer = UIETrainer(
-                    model=local_model,
-                    args=local_args,
-                    train_dataset=client_datasets[cid],
-                    tokenizer=tokenizer,
-                    data_collator=collator_for(local_model),
-                    compute_metrics=None,
-                    callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-                )
+                if _is_main():
+                    logger.info(f"Client {cid}: Starting training (lora_origin)...")
+
 
                 trainer.train(task_id=data_args.task)
                 _trainer_wait_for_everyone(trainer)
 
                 trained_model = _trainer_unwrap_model(trainer)
-
                 name_to_param = dict(trained_model.named_parameters())
                 delta = {}
                 for k in lora_keys:
@@ -869,54 +703,34 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     aggregated[k] += delta[k] * w
                 total += w
 
-                # 3) 释放强引用（CPU内存也让位）
                 try:
                     del name_to_param, trained_model
                 except Exception:
                     pass
-
-                # 4) 强制释放本 client 的 Trainer/模型/优化器/加速器缓存
-                #    不保留本地模型 => model_to_keep=None
-                _free_after_local_train(trainer, model_to_keep=None)
-
-                # 5) 删除调用者作用域中的变量引用（很关键；否则外部仍持有引用）
-                try:
-                    del trainer
-                except Exception:
-                    pass
-                try:
-                    del local_model
-                except Exception:
-                    pass
-
 
             elif method == "adaptive":
                 client_state = ContinualState()
                 if prev_task_dir is not None:
                     prev_state_path = os.path.join(prev_task_dir, "client_states", f"client_{cid}_state.pt")
                     if os.path.exists(prev_state_path):
+                        if _is_main():
+                            logger.info(f"Client {cid}: Loading previous state from {prev_state_path}")
                         client_state = ContinualState.load(prev_state_path)
-
+                    else:
+                        if _is_main():
+                            logger.info(f"Client {cid}: No previous state found at {prev_state_path}. Starting fresh.")
+                else:
+                    if _is_main():
+                        logger.info(f"Client {cid}: prev_task_dir is None (Task {data_args.task}). Starting fresh.")
 
                 if data_args.task == 1:
-                    trainer = UIETrainer(
-                        model=local_model,
-                        args=local_args,
-                        train_dataset=client_datasets[cid],
-                        tokenizer=tokenizer,
-                        data_collator=collator_for(local_model),
-                        compute_metrics=None,
-                        callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-                    )
+                    logger.info(f"Client {cid}: Starting training (adaptive task 1)...")
 
                     trainer.train(task_id=data_args.task)
                     _trainer_wait_for_everyone(trainer)
-
                     trained_model = _trainer_unwrap_model(trainer)
                     if _is_main():
                         fisher_dataloader = trainer.get_train_dataloader()
-
-
 
                     name_to_param = dict(trained_model.named_parameters())
                     delta = {}
@@ -934,29 +748,15 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         aggregated[k] += delta[k] * w
                     total += w
 
-                    _free_after_local_train(trainer, model_to_keep=None)
-                    try:
-                        del trainer
-                    except Exception:
-                        pass
-
                     if _is_main():
                         # --- [修改点 3：使用提前获取的 dataloader] ---
                         F_client = compute_fisher_diag(trained_model, fisher_dataloader)
 
                         theta_last = {k: theta_last_cpu[k] for k in F_client.keys() if k in theta_last_cpu}
-                        acc = per_task_cache[cid]
-                        acc["theta_last"] = theta_last
-                        if reduce_mode == "last":
-                            acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
-                        else:
-                            if acc["F_sum"] is None:
-                                acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
-                                acc["count"] = 1
-                            else:
-                                for k in F_client:
-                                    acc["F_sum"][k] += F_client[k]
-                                acc["count"] += 1
+
+                        # [!!! 修复 2/3: 更新 client_state 并存入 cache !!!]
+                        client_state.update(F_client, theta_last)  # 此处 client_state 为空，被更新为 T=1 的状态
+                        per_task_cache[cid] = client_state  # 将包含 T=1 状态的 *完整对象* 存入 cache
 
                         # 清理 dataloader
                         del fisher_dataloader
@@ -967,27 +767,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                             del F_client, theta_last
                     except Exception:
                         pass
-
-
-                    try:
-                        del local_model
-                    except Exception:
-                        pass
-
                 else:
-                    trainer = UIETrainer(
-                        model=local_model,
-                        args=local_args,
-                        train_dataset=client_datasets[cid],
-                        tokenizer=tokenizer,
-                        data_collator=collator_for(local_model),
-                        compute_metrics=None,
-                        callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None,
-                        state=client_state,
-                        comm_budget=fed_args.comm_budget,
-                        layer_costs=layer_costs,
-                    )
-
+                    trainer.continual_state = client_state
+                    trainer.comm_budget = fed_args.comm_budget
+                    trainer.layer_costs = layer_costs
+                    logger.info(f"Client {cid}: Starting training (adaptive task > 1)...")
                     delta, F_client, theta_last = trainer.train(
                         task_id=data_args.task,
                         base_params={k: global_state_cpu[k] for k in lora_keys},
@@ -1002,30 +786,12 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     total += w
 
                     if _is_main():
-                        acc = per_task_cache[cid]
-                        acc["theta_last"] = theta_last
-                        if reduce_mode == "last":
-                            acc["F_last"] = {k: v.clone() for k, v in F_client.items()}
-                        else:
-                            if acc["F_sum"] is None:
-                                acc["F_sum"] = {k: v.clone() for k, v in F_client.items()}
-                                acc["count"] = 1
-                            else:
-                                for k in F_client:
-                                    acc["F_sum"][k] += F_client[k]
-                                acc["count"] += 1
+                        # [!!! 修复 2/3: 更新 client_state 并存入 cache !!!]
+                        client_state.update(F_client, theta_last)  # 此处 client_state 包含 T-1 历史，被更新为 T 的状态
+                        per_task_cache[cid] = client_state  # 将包含 T 状态的 *完整对象* 存入 cache
 
                     try:
                         del delta, F_client, theta_last
-                    except Exception:
-                        pass
-                    _free_after_local_train(trainer, model_to_keep=None)
-                    try:
-                        del trainer
-                    except Exception:
-                        pass
-                    try:
-                        del local_model
                     except Exception:
                         pass
 
@@ -1039,15 +805,12 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             mu = aggregated[k] / max(total, 1)
             global_state_cpu[k] = global_state_cpu[k] - mu
 
-        update_dict = {k: global_state_cpu[k].to(device) for k in lora_keys}
-        global_model.load_state_dict(update_dict, strict=False)
-
-        global_model.to("cpu")  # <--- 新增：立即将全局模型移回CPU
+        global_model.load_state_dict(global_state_cpu, strict=False)
 
         wait_for_everyone()
 
         try:
-            del aggregated, global_state_cpu, update_dict
+            del aggregated, global_state_cpu, global_state_gpu
         except Exception:
             pass
         gc.collect()
@@ -1055,31 +818,24 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # ===== 任务结束：将“本任务”信息并入历史 =====
     if method == "adaptive" and data_args.task >= 1:
-        gamma = 0.9
-        for cid in current_task_selected_clients:
-            cache = per_task_cache[cid]
+        # [!!! 修复 3/3: 直接从 cache 保存已更新的 state !!!]
+        # (原有的 gamma 和 reduce_mode 逻辑现在由 client_state.update() 内部处理，这里不再需要)
 
-            # 没被选中的客户端：跳过
-            if (reduce_mode == "last" and cache["F_last"] is None) or \
-                    (reduce_mode == "mean" and (cache["F_sum"] is None or cache["count"] == 0)):
+        for cid in current_task_selected_clients:
+            client_state_updated = per_task_cache[cid]  # 获取已更新的完整状态对象 (T=1, or T=2, ...)
+
+            # 没被选中的客户端，或 (仅 main 进程) 状态未被正确更新
+            if client_state_updated is None:
                 continue
 
-            # 生成该客户端的 F_task 与 θ*
-            if reduce_mode == "last":
-                F_task = cache["F_last"]
-            else:  # mean
-                F_task = {k: cache["F_sum"][k] / cache["count"] for k in cache["F_sum"]}
-
-            theta_star = cache["theta_last"]  # 该客户端本任务最后一次的本地参数
-
-            # 载入历史（若有），执行指数累计
+            # 直接保存这个已包含(历史+当前)所有信息的对象
+            # client_state_dir 是在 (约 647 行) 定义的 *当前任务* 输出目录
             client_state_path = os.path.join(client_state_dir, f"client_{cid}_state.pt")
-            client_state = ContinualState.load(client_state_path)
-            client_state.update(F_task, theta_star)
-            # client_state.save(client_state_path)
 
             if _is_main():
-                client_state.save(client_state_path)
+                logger.info(f"Saving updated state for client {cid} to {client_state_path}")
+                client_state_updated.save(client_state_path)
+
         wait_for_everyone()
 
 
@@ -1096,6 +852,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # ========== 最终预测 & 指标记录 ==========
     if training_args.do_predict:
+        if _is_main():
+            logger.info("Initializing evaluator trainer for final prediction...")
+            global_model.to(device)  # <--- 将最终的 CPU 模型移到 GPU
         eval_trainer = UIETrainer(
             model=global_model,
             args=training_args,

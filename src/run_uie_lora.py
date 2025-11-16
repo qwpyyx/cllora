@@ -260,11 +260,11 @@ class FederatedArguments:
         metadata={"help": "Training mode: centralized or federated"},
     )
     num_clients: int = field(
-        default=100,
+        default=50,
         metadata={"help": "Total number of clients in federated learning."},
     )
     clients_per_round: int = field(
-        default=10,
+        default=5,
         metadata={"help": "Number of clients sampled in each round."},
     )
     global_rounds: int = field(
