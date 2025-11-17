@@ -752,26 +752,16 @@ class UIETrainer(Seq2SeqTrainer):
                     actual_steps += 1
                     model.train()
 
-                    # 1. 前向 (使用父类的 training_step)
-                    # training_step 内部处理了 autocast, loss 计算, 和 gradient_accumulation
+
                     loss = self.training_step(model, batch)
 
-                    # 2. 反向 (training_step 已经处理了)
-                    # self.accelerator.backward(loss) # (已在 training_step 中完成)
 
-                    # 3. [核心] 优化器步骤
-                    # 检查是否需要执行优化器步骤（处理梯度累积）
                     if actual_steps % self.args.gradient_accumulation_steps == 0:
 
-                        # (可选：梯度裁剪)
-                        # if self.args.max_grad_norm is not None:
-                        #     self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
-
-                        # 这 ONE line 替换了你所有的 Python 循环！
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
-                    # 4. [日志] (现在可以安全地高频调用 .item() 了)
+
                     if self.accelerator.is_main_process:
                         # (我们保持你之前的日志逻辑，每 5 个 epoch 打印一次)
                         if (epoch + 1) % 5 == 0 or (epoch + 1) == 1:
@@ -800,7 +790,7 @@ class UIETrainer(Seq2SeqTrainer):
                     r2_end_val = state['r2'].detach().cpu()
                     F_round[name] = 0.5 * torch.clamp(r2_end_val - r2_start_val, min=0.0)
                 else:
-                    # (参数可能没有被优化，例如没有梯度)
+
                     F_client[name] = torch.zeros_like(p).cpu()
                     B_round[name] = torch.tensor(0.0)
                     conf[name] = 0
@@ -845,67 +835,8 @@ class UIETrainer(Seq2SeqTrainer):
 
             delta = adaptive_delta
 
-
-
-
             return delta, F_client, theta_last
 
-    def _pad_across_processes(self, tensor, pad_index=-100):
-        """
-        Pad a tensor so this process has the same number of examples as the process with the largest number of examples.
-        """
-        if getattr(self.args, "parallel_mode", ParallelMode.NOT_DISTRIBUTED) != ParallelMode.DISTRIBUTED:
-            return tensor
-
-        if self.accelerator.distributed_type == "DEEPSPEED":
-            return tensor
-
-        if tensor.ndim < 2:
-            return tensor
-
-        world_size = self.accelerator.num_processes
-        if world_size <= 1:
-            return tensor
-
-        (
-            tensor_row_size,
-            tensor_col_size,
-        ) = tensor.shape
-
-        # Gather all tensor row sizes
-        # `gather_object` is a bottleneck, so we gather the shapes on minimum number of gpus
-        # This is a bit complicated because we want to gather the shapes on a minimum number of gpus
-        # then broadcast the maximum shape to all gpus to save time
-        # We only need to know the maximum shape on all gpus, so we can just use `all_gather` on the shape
-        # and take the maximum
-        shapes_list = [0] * world_size
-        torch.distributed.all_gather_object(shapes_list, tensor_row_size)
-
-        max_row_size = max(shapes_list)
-
-        if tensor_row_size == max_row_size:
-            return tensor
-
-        # Pad the tensor
-        padded_tensor = torch.full(
-            (max_row_size, tensor_col_size), pad_index, dtype=tensor.dtype, device=tensor.device
-        )
-        padded_tensor[:tensor_row_size, :] = tensor
-        return padded_tensor
-
-    def get_parameter_names(model, forbidden_layer_types):
-        """
-        Returns the names of the model parameters that are not inside a forbidden layer.
-        """
-        result = []
-        for name, module in model.named_modules():
-            if any(isinstance(module, t) for t in forbidden_layer_types):
-                continue
-
-            for n, p in module.named_parameters(recurse=False):
-                if p.requires_grad:
-                    result.append(f"{name}.{n}" if name else n)
-        return result
 
     def evaluation_loop(
         self,
