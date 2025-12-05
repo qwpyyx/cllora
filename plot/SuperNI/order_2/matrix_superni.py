@@ -7,13 +7,14 @@ import re
 # --- 用户配置 ---
 # 请根据您的设置修改这些变量
 BENCHMARK = "SuperNI"
-ORDER = "order_2"
-METHOD = "nlora"
-LR = "2e-04"
+ORDER = "order_2_llama"
+METHOD = "lora_origin"
+LR = "1e-04"
 
 # 基础路径，指向包含 '1-task748...', '2-task073...' 等的目录
-# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/olora/results/{BENCHMARK}/{ORDER}/{METHOD}/outputs/{LR}/"
-BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/{BENCHMARK}/{ORDER}/outputs/{LR}/"
+# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}/"
+BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}/"
+# /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_1_llama/lora_origin/llama/outputs/5e-05
 # *** 新增：SuperNI 任务 ID 到指标的映射 ***
 # (根据 image_3843e3.png)
 SUPERNI_METRIC_MAP = {

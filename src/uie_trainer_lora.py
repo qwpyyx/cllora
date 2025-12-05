@@ -16,6 +16,18 @@ from collections import defaultdict
 # logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
 from accelerate import Accelerator
+from transformers.trainer_pt_utils import (
+    find_batch_size,
+    nested_concat,
+    nested_numpify,
+    nested_truncate,
+    IterableDatasetShard,
+)
+from transformers.trainer_utils import (
+    denumpify_detensorize,
+    has_length,
+    speed_metrics,
+)
 import logging
 import time
 import torch
@@ -23,6 +35,26 @@ import torch.nn as nn
 from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 import re
+try:
+    # 新版 Transformers (4.40+) 路径
+    from transformers.integrations import is_deepspeed_zero3_enabled
+except ImportError:
+    try:
+        # 旧版 Transformers 路径
+        from transformers.deepspeed import is_deepspeed_zero3_enabled
+    except ImportError:
+        # 兜底：如果没有安装 DeepSpeed 或版本太老
+        def is_deepspeed_zero3_enabled():
+            return False
+
+
+
+
+
+
+
+
+
 # logger = logging.getLogger(__name__)
 from torch.optim.optimizer import Optimizer
 
@@ -148,116 +180,29 @@ def _knapsack(values: List[float], costs: List[int], budget: int) -> List[bool]:
     return sel
 
 
-def compute_fisher_arithmetic(
-        model: torch.nn.Module,
-        dataloader: DataLoader,
-        device: torch.device = None
-) -> Dict[str, torch.Tensor]:
-    """
-    算术平均版本的Fisher信息计算（替代原有compute_fisher）
-    适配联邦学习客户端训练流程，仅计算LoRA可训练参数的Fisher
-    """
-    if device is None:
-        device = next(model.parameters()).device
-
-    # 初始化Fisher累积器（仅跟踪LoRA可训练参数）
-    fisher = {
-        n: torch.zeros_like(p, device=device)
-        for n, p in model.named_parameters()
-        if p.requires_grad and "lora" in n
-    }
-    total_steps = 0  # 累计训练步数（用于算术平均）
-
-    model.train()
-    for batch in dataloader:
-        # 数据移至设备
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        model.zero_grad(set_to_none=True)
-
-        # 前向+反向传播（与客户端训练逻辑一致）
-        outputs = model(**batch)
-        loss = outputs[0] if isinstance(outputs, (list, tuple)) else outputs["loss"]
-        loss.backward()
-
-        # 累积梯度平方（算术平均核心：每步累加，最后除以总步数）
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None and "lora" in name:
-                fisher[name] += param.grad.detach() ** 2  # 梯度平方累加
-                total_steps += 1  # 仅计数有梯度的参数步骤
-
-    # 计算算术平均：总累积 / 总步数（避免除零）
-    # 分布式环境下同步梯度平方和计数
-    if dist.is_available() and dist.is_initialized():
-        world_size = dist.get_world_size()
-        for tensor in fisher.values():
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        total_steps_tensor = torch.tensor(float(total_steps), device=device)
-        dist.all_reduce(total_steps_tensor, op=dist.ReduceOp.SUM)
-        total_steps = max(int(total_steps_tensor.item()), 0)
-        if world_size > 1 and total_steps == 0:
-            logger.warning("分布式Fisher计算中统计步数为0，返回零矩阵")
-    if total_steps > 0:
-        for name in fisher:
-            fisher[name] = fisher[name] / total_steps
-    else:
-        logger.warning("未记录到有效梯度步骤，Fisher保持初始零值")
-
-    # 转移到CPU并与base_params对齐（兼容原有返回格式）
-    return {k: v.detach().cpu() for k, v in fisher.items()}
-
-
-def compute_fisher(model, dataloader, alpha: float = 0.5, engine=None):
-    """Compute EMA-based diagonal Fisher information for model parameters."""
-    device = next(model.parameters()).device
-    F_curr = {
-        n: torch.zeros_like(p, device=device)
-        for n, p in model.named_parameters()
-        if p.requires_grad
-    }
-    model.train()
-    for batch in dataloader:
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(device)
-        if engine is not None:
-            engine.zero_grad()
-        else:
-            model.zero_grad()
-        outputs = model(**batch)
-        loss = outputs[0] if isinstance(outputs, (list, tuple)) else outputs["loss"]
-        if engine is not None:
-            engine.backward(loss)
-        else:
-            loss.backward()
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                F_batch = param.grad * param.grad
-                F_curr[name] = alpha * F_curr[name] + (1 - alpha) * F_batch
-
-    if dist.is_available() and dist.is_initialized():
-        world_size = dist.get_world_size()
-        for tensor in F_curr.values():
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            tensor /= world_size
-
-    return {k: v.detach().cpu() for k, v in F_curr.items()}
-
 def skip_instructions(model, predictions_ids, tokenizer, ignore_idx=-100):
     predictions_ids = np.where(predictions_ids == ignore_idx, tokenizer.pad_token_id, predictions_ids)
-    # 将预测的 ID 序列解码为字符串
+
+    # [修改] 增加 skip_special_tokens=True，防止特殊字符干扰 split
     predictions = tokenizer.batch_decode(
         predictions_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
     )
 
     final_predictions = []
+    # 只有 Decoder 模型 (Llama) 需要切分，T5 不需要
     if check_model(model.config._name_or_path, SUPPORTED_DECODER_MODELS):
         for pred in predictions:
-
+            # [关键修复] 使用正确的分割符
             if ANSWER_PREFIX in pred:
+                # 取最后一个分割符之后的内容，防止 Input 里也有 "Output:"
                 splits = pred.split(ANSWER_PREFIX)
                 final_predictions.append(splits[-1].strip())
             else:
-                final_predictions.append('')
+                # [兜底逻辑] 如果没找到分割符（模型没生成 Output:），
+                # 不要返回空字符串，而是返回原始预测，万一模型直接输出了答案呢？
+                # 或者仅仅是打印出来方便排查
+                # print(f"[DEBUG Warning] Prefix '{ANSWER_PREFIX}' not found in: {pred[:50]}...")
+                final_predictions.append(pred.strip())
     else:
         final_predictions = predictions
 
@@ -297,7 +242,7 @@ class AdaptiveAdamW(Optimizer):
                  # AdamW 超参
                  lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
                  # 你的 Adaptive 超参 (从 Trainer 传入)
-                 radius=1.0, sigma=0.0, tau=0.0, beta=10.0, alpha_ema=0.9,
+                 radius=5.0, sigma=0.0, tau=0.0, beta=10.0, alpha_ema=0.9,
                  eta_shrink=1.0, trust_radius_shrink=1e-3, beta_mul=1.0,
                  # Fisher 修正超参
                  fisher_floor_quantile=0.02, fisher_floor_min=1e-12,
@@ -342,6 +287,7 @@ class AdaptiveAdamW(Optimizer):
         self._eta_scale_rho = eta_scale_rho
         self._eta_smin = eta_smin
         self._eta_smax = eta_smax
+        self._step_idx = 0
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -349,6 +295,14 @@ class AdaptiveAdamW(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        self._step_idx += 1
+        debug_eta_min = None
+        debug_eta_max = None
+        debug_eta_sum = 0.0
+        debug_eta_cnt = 0
+
+
         # 遍历所有参数组 (例如，一组有 wd，一组没有 wd)
         for group in self.param_groups:
             # AdamW 超参
@@ -470,6 +424,17 @@ class AdaptiveAdamW(Optimizer):
                     if torch.isnan(eta):
                         eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
 
+                eta_scalar = float(eta.detach())
+                debug_eta_sum += eta_scalar
+                debug_eta_cnt += 1
+                if debug_eta_min is None or eta_scalar < debug_eta_min:
+                    debug_eta_min = eta_scalar
+                if debug_eta_max is None or eta_scalar > debug_eta_max:
+                    debug_eta_max = eta_scalar
+                # 把最后一次 eta 存进 state，方便 Trainer 里离线分析
+                state['eta_last'] = eta_scalar
+
+
                     # --- AdamW 状态更新 (在 v_scaled 上) ---
                 adam_m.mul_(beta1).add_(v_scaled, alpha=1.0 - beta1)
                 adam_v.mul_(beta2).addcmul_(v_scaled, v_scaled, value=1.0 - beta2)
@@ -491,6 +456,22 @@ class AdaptiveAdamW(Optimizer):
 
                 # AdamW 步长 (使用 adam_dir)
                 p.add_(adam_dir, alpha=-eta)  # p = p - eta * adam_dir
+
+        if debug_eta_cnt > 0:
+            try:
+                is_main = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+            except Exception:
+                is_main = True
+
+            # 只打印前若干个 step，避免日志爆炸，你可以按需改这个阈值
+            if is_main and self._step_idx <= 20:
+                eta_mean = debug_eta_sum / debug_eta_cnt
+                logger.info(
+                    f"[AdaptiveAdamW] step {self._step_idx}: "
+                    f"eta_min={debug_eta_min:.3e}, eta_max={debug_eta_max:.3e}, eta_mean={eta_mean:.3e}, "
+                    f"count={debug_eta_cnt}"
+                )
+
 
         return loss
 
@@ -515,12 +496,24 @@ class UIETrainer(Seq2SeqTrainer):
         self.continual_state = kwargs.pop("state", None)  # 这里直接赋值给 continual_state
         super().__init__(*args, **kwargs)  # 此时 kwargs 中已无 state，父类不会报错
 
+
+
+        # 🤗 Transformers 在 ``Trainer`` 基类内部已经会根据 ``TrainingArguments``
+        # 初始化一个 ``Accelerator`` 实例，并在数据加载、梯度累积和同步等
+        # 关键路径中复用它。如果我们在子类里无条件地再创建一个新的
+        # ``Accelerator``，就会触发第二套分布式状态 —— 这在 ``accelerate
+        # launch`` 的场景下会造成进程间握手的不一致，从而出现首轮训练
+        # 卡住的现象。这里通过读取父类已经准备好的 ``accelerator``（若存在）
+        # 并在用户显式传入时才覆写，确保我们始终引用同一个分布式上下文。
         base_accelerator = getattr(self, "accelerator", None)
         if accelerator is not None:
             self.accelerator = accelerator
         elif base_accelerator is not None:
+            # Trainer 可能通过属性而非实例属性暴露 accelerator，这里将其缓存
+            # 到实例字典中，方便子类内部统一访问。
             self.accelerator = base_accelerator
         else:
+            # 兼容某些 Transformers 版本：__init__ 尚未设置 .accelerator
             try:
                 from accelerate import Accelerator
                 report_to = list(self.args.report_to) if getattr(self.args, "report_to", None) else []
@@ -530,6 +523,7 @@ class UIETrainer(Seq2SeqTrainer):
                     project_dir=self.args.output_dir if len(report_to) > 0 else None,
                 )
             except Exception:
+                # 极限兜底（无 accelerate 环境也不崩）
                 import torch, torch.distributed as _dist
                 class _Shim:
                     def __init__(self, device):
@@ -568,6 +562,7 @@ class UIETrainer(Seq2SeqTrainer):
 
 
         self.radius = radius
+        print(f"DEBUG: UIETrainer initialized with radius = {self.radius}")
         self.comm_bandwidth = comm_bandwidth  # MB/s
         self.comm_fixed_cost = comm_fixed_cost  # 固定开销（秒）
         self.sigma = sigma
@@ -595,15 +590,21 @@ class UIETrainer(Seq2SeqTrainer):
         return decay_parameters
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        """添加详细调试信息的 training_step"""
+        """
+        复用 Seq2SeqTrainer 的 training_step，仅在“完成一个梯度累积周期”
+        且满足 logging_steps 时打印一次 loss，避免每个 micro-batch 都打 log。
+        """
 
-        # 调试信息
-        if hasattr(self, 'accelerator') and self.accelerator.is_main_process:
-            logger.info(f"[DEBUG] training_step 开始, 进程: {self.accelerator.process_index}")
+        # 1) 兼容 decoder-only（LLaMA）多出来的字段，防止 model(**inputs) 报错
+        if "input_ids_wo_label" in inputs:
+            # 拷一份，避免修改到 Trainer 外部的原始 dict
+            inputs = dict(inputs)
+            inputs.pop("input_ids_wo_label", None)
 
+        # 2) 交给父类做真正的前向 + 反向（包括 Deepspeed / Accelerate 逻辑）
         try:
             loss = super().training_step(model, inputs)
-        except Exception as exc:  # pragma: no cover - debug safeguard
+        except Exception as exc:  # 防御性兜底，避免训练直接崩溃
             logger.error(f"training_step 错误: {exc}")
             return torch.tensor(
                 0.0,
@@ -611,16 +612,50 @@ class UIETrainer(Seq2SeqTrainer):
                 requires_grad=False,
             )
 
+        # 3) 只在主进程上做 logging
         if hasattr(self, "accelerator") and self.accelerator.is_main_process:
+            # 维护一个 micro-step 计数器，用来和 gradient_accumulation_steps 对齐
+            if not hasattr(self, "_micro_step"):
+                self._micro_step = 0
+            self._micro_step += 1
+
+            # 当前梯度累积配置
             try:
-                loss_value = loss.item()
+                ga = max(1, int(getattr(self.args, "gradient_accumulation_steps", 1)))
             except Exception:
-                loss_value = float("nan")
-            print(f"[DEBUG] 反向传播完成, loss: {loss_value:.6f}")
+                ga = 1
+
+            # 是否完成了一个梯度累积周期（即将进行一次 optimizer.step）
+            is_block_end = (self._micro_step % ga == 0)
+
+            if is_block_end:
+                # Trainer 外层在 optimizer.step 之后才会 self.state.global_step += 1
+                # 这里先预估一下“下一个 global_step”
+                current_step = getattr(self.state, "global_step", 0)
+                next_step = current_step + 1
+
+                # logging_steps 配置（保证 >=1）
+                try:
+                    log_every = max(1, int(getattr(self.args, "logging_steps", 1)))
+                except Exception:
+                    log_every = 1
+
+                # 只在满足 logging_steps 的时候打一次 log
+                if next_step % log_every == 0:
+                    # 参考 Trainer 内部的 nan/inf 过滤逻辑
+                    if (not getattr(self.args, "logging_nan_inf_filter", False)) or (
+                            loss is not None and torch.isfinite(loss)
+                    ):
+                        try:
+                            loss_value = loss.item()
+                        except Exception:
+                            loss_value = float("nan")
+                        logger.info(f"[global_step {next_step}] 反向传播完成, loss: {loss_value:.6f}")
 
         return loss
 
-
+    def _pad_across_processes(self, tensor, pad_index=-100):
+        return self.accelerator.pad_across_processes(tensor, dim=1, pad_index=pad_index)
 
     def train(
         self,
@@ -628,7 +663,10 @@ class UIETrainer(Seq2SeqTrainer):
         base_params: Dict[str, torch.Tensor] = None,
         cid: int = -1,
         **kwargs,
-    ):
+    ):  # type: ignore[override]
+
+
+
         if self.method == "lora_origin" or (self.method == "adaptive" and task_id == 1):
             logger.info(f"[Task {task_id}] 调用标准 super().train() (lora_origin 或 task 1)")
             return super().train(**kwargs)
@@ -637,42 +675,6 @@ class UIETrainer(Seq2SeqTrainer):
 
             def _canon_name(name: str) -> str:
                 return name[7:] if name.startswith("module.") else name
-
-            state_has_history = self.continual_state.has_valid_history() if self.continual_state is not None else False
-
-            # ========== 冷启动：该 client 没有历史 -> 走一次常规训练 + Fisher ==========
-            if self.continual_state is None or base_params is None or (
-                    self.continual_state is not None and not state_has_history
-            ):
-                logger.info(f"[Task {task_id}] 调用标准 super().train() (冷启动)")
-                output = super().train(**kwargs)
-
-                model_plain = self.accelerator.unwrap_model(self.model)
-                sdict = model_plain.state_dict()
-
-                # delta: 使用 base_params 的键集合（已是 LoRA 子集）
-                delta = {k: (base_params[k] - sdict[k].detach().cpu()) for k in base_params}
-
-                # Fisher：仅 main 进程用“全量 client 数据”计算，其它进程置零
-                if self.accelerator.is_main_process:
-                    from torch.utils.data import DataLoader, SequentialSampler
-                    full_dl = DataLoader(
-                        dataset=self.train_dataset,
-                        sampler=SequentialSampler(self.train_dataset),
-                        batch_size=self.args.per_device_train_batch_size,
-                        collate_fn=self.data_collator,
-                        drop_last=False,
-                    )
-                    F_raw = compute_fisher(model_plain, full_dl)
-                else:
-                    F_raw = {k: torch.zeros_like(v) for k, v in base_params.items()}
-
-                # 统一规范化 + 放 CPU
-                F_client = {_canon_name(k): v.detach().cpu() for k, v in F_raw.items()}
-                theta_last = {_canon_name(k): sdict[k].detach().cpu() for k in F_client.keys()}
-
-                self.accelerator.wait_for_everyone()
-                return delta, F_client, theta_last
 
             # ==================== 有历史：自适应训练路径 ====================
             use_adaptive_logic = True
@@ -697,7 +699,7 @@ class UIETrainer(Seq2SeqTrainer):
 
             model.train()
             logger.info(f"Moving historical tensors (F_past, theta_past) to device: {device}...")
-            name_to_p = {_canon_name(n): p for n, p in model_plain.named_parameters() if p.requires_grad}
+            name_to_p = {_canon_name(n): p for n, p in model.named_parameters() if p.requires_grad}
             p_to_hist_F = {}
             p_to_hist_theta = {}
 
@@ -752,16 +754,26 @@ class UIETrainer(Seq2SeqTrainer):
                     actual_steps += 1
                     model.train()
 
-
+                    # 1. 前向 (使用父类的 training_step)
+                    # training_step 内部处理了 autocast, loss 计算, 和 gradient_accumulation
                     loss = self.training_step(model, batch)
 
+                    # 2. 反向 (training_step 已经处理了)
+                    # self.accelerator.backward(loss) # (已在 training_step 中完成)
 
+                    # 3. [核心] 优化器步骤
+                    # 检查是否需要执行优化器步骤（处理梯度累积）
                     if actual_steps % self.args.gradient_accumulation_steps == 0:
 
+                        # (可选：梯度裁剪)
+                        # if self.args.max_grad_norm is not None:
+                        #     self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+
+                        # 这 ONE line 替换了你所有的 Python 循环！
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
-
+                    # 4. [日志] (现在可以安全地高频调用 .item() 了)
                     if self.accelerator.is_main_process:
                         # (我们保持你之前的日志逻辑，每 5 个 epoch 打印一次)
                         if (epoch + 1) % 5 == 0 or (epoch + 1) == 1:
@@ -778,7 +790,8 @@ class UIETrainer(Seq2SeqTrainer):
             B_round = {}
             F_round = {}
             conf = {}
-            name_to_p = {_canon_name(n): p for n, p in model_plain.named_parameters() if p.requires_grad}
+            name_to_p = {_canon_name(n): p for n, p in model.named_parameters() if p.requires_grad}
+            eta_vals = []
 
             for name, p in name_to_p.items():
                 if p in self.optimizer.state:  # 检查优化器是否跟踪了此参数
@@ -789,8 +802,10 @@ class UIETrainer(Seq2SeqTrainer):
                     r2_start_val = state['r2_start'].detach().cpu()
                     r2_end_val = state['r2'].detach().cpu()
                     F_round[name] = 0.5 * torch.clamp(r2_end_val - r2_start_val, min=0.0)
+                    if 'eta_last' in state:
+                        eta_vals.append(float(state['eta_last']))
                 else:
-
+                    # (参数可能没有被优化，例如没有梯度)
                     F_client[name] = torch.zeros_like(p).cpu()
                     B_round[name] = torch.tensor(0.0)
                     conf[name] = 0
@@ -799,6 +814,16 @@ class UIETrainer(Seq2SeqTrainer):
                 # 这些总是被更新
                 theta_last[name] = p.detach().cpu()
                 delta[name] = base_params[name] - theta_last[name]
+
+            if eta_vals and self.accelerator.is_main_process:
+                eta_min = min(eta_vals)
+                eta_max = max(eta_vals)
+                eta_mean = sum(eta_vals) / len(eta_vals)
+                logger.info(
+                    f"[Task {task_id}] AdaptiveAdamW 最后一轮各层 eta_last 统计: "
+                    f"min={eta_min:.3e}, max={eta_max:.3e}, mean={eta_mean:.3e}, count={len(eta_vals)}"
+                )
+
 
             p_round = {n: conf[n] / max(actual_steps, 1) for n in conf}
 
@@ -835,7 +860,13 @@ class UIETrainer(Seq2SeqTrainer):
 
             delta = adaptive_delta
 
+
+
+
             return delta, F_client, theta_last
+
+
+
 
 
     def evaluation_loop(
@@ -1008,35 +1039,18 @@ class UIETrainer(Seq2SeqTrainer):
 
         return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
 
-
     def prediction_step(
-        self,
-        model: nn.Module,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
-        prediction_loss_only: bool,
-        ignore_keys: Optional[List[str]] = None,
+            self,
+            model: nn.Module,
+            inputs: Dict[str, Union[torch.Tensor, Any]],
+            prediction_loss_only: bool,
+            ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Perform an evaluation step on `model` using `inputs`.
 
-        Subclass and override to inject custom behavior.
-
-        Args:
-            model (`nn.Module`):
-                The model to evaluate.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
-                The inputs and targets of the model.
-
-                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-                argument `labels`. Check your model's documentation for all accepted arguments.
-            prediction_loss_only (`bool`):
-                Whether or not to return the loss only.
-
-        Return:
-            Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss, logits and
-            labels (each being optional).
-        """
         if not self.args.predict_with_generate or prediction_loss_only:
+            # 移除不兼容参数，防止调用 super().forward 报错
+            if "input_ids_wo_label" in inputs:
+                inputs.pop("input_ids_wo_label")
             return super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
             )
@@ -1044,52 +1058,78 @@ class UIETrainer(Seq2SeqTrainer):
         has_labels = "labels" in inputs
         inputs = self._prepare_inputs(inputs)
 
-        # XXX: adapt synced_gpus for fairscale as well
-        gen_kwargs = self._gen_kwargs
-        gen_kwargs["synced_gpus"] = True if is_deepspeed_zero3_enabled() else False
+        # 配置 Generation
+        gen_max_new_tokens = getattr(self.args, "generation_max_length", None)
+        if gen_max_new_tokens is None:
+            # 向前兼容：如果 args 里（将来）也挂了 max_target_length，就用它；
+            # 再不行就退回一个安全默认值 50（对应 DataTrainingArguments 的默认）
+            gen_max_new_tokens = getattr(self.args, "max_target_length", 50)
 
-        if "attention_mask" in inputs:
-            gen_kwargs["attention_mask"] = inputs.get("attention_mask", None)
+        gen_kwargs = {
+            "max_new_tokens": gen_max_new_tokens,
+            "num_beams": 1,
+            "do_sample": False,
+        }
+
+        # 针对 Llama 的特殊配置
+        if inputs.get("input_ids_wo_label", None) is not None:
+            gen_kwargs.update({
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "pad_token_id": 0,
+            })
+        else:
+            # T5 配置
+            gen_kwargs.update({
+                "decoder_start_token_id": 0,
+                "eos_token_id": 1,
+                "pad_token_id": 0,
+            })
 
         generation_config = GenerationConfig(**gen_kwargs)
 
-        # prepare generation inputs
-        # some encoder-decoder models can have varying encder's and thus
-        # varying model input names
+        # 生成逻辑
         if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
+            # [T5]
             generation_inputs = inputs[self.model.encoder.main_input_name]
+            generated_tokens = self.model.generate(
+                input_ids=generation_inputs,
+                generation_config=generation_config,
+            )
         else:
-            generation_inputs = inputs[self.model.main_input_name]
+            # [Llama] 使用 input_ids_wo_label 进行生成
+            input_ids_wo_label = inputs.get("input_ids_wo_label", inputs[self.model.main_input_name])
 
-        generated_tokens = self.model.generate(
-            input_ids=generation_inputs,
-            generation_config=generation_config
-        )
+            generated_tokens = self.model.generate(
+                input_ids=input_ids_wo_label,
+                generation_config=generation_config,
+            )
 
-        bs, source_len = inputs['input_ids'].shape
-        # in case the batch is shorter than max length, the output should be padded
-        if check_model(self.model.config._name_or_path, SUPPORTED_DECODER_MODELS):
-            max_length = source_len + gen_kwargs["max_new_tokens"]
-        else:
-            max_length = gen_kwargs["max_new_tokens"]
+            # [截断] 别人代码里可能在 collator 处理了，或者这里处理
+            # 标准 AutoModel 生成会包含 input，必须截断
+            input_len = input_ids_wo_label.shape[1]
+            generated_tokens = generated_tokens[:, input_len:]
 
-        if generated_tokens.shape[-1] < max_length:
-            generated_tokens = self._pad_tensors_to_max_len(generated_tokens, max_length)
+        # 计算 Loss (如果需要)
+        # 在计算 Loss 前必须把 input_ids_wo_label 移除，否则标准模型会报错
+        if "input_ids_wo_label" in inputs:
+            inputs.pop("input_ids_wo_label")
 
         with torch.no_grad():
             if has_labels:
                 with self.autocast_smart_context_manager():
-                    # 跳到lora的forward
                     outputs = model(**inputs)
-                if self.label_smoother is not None:
-                    loss = self.label_smoother(outputs, inputs["labels"]).mean().detach()
-                else:
-                    loss = (outputs["loss"] if isinstance(outputs, dict) else outputs[0]).mean().detach()
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                loss = loss.mean().detach()
             else:
                 loss = None
 
         if self.args.prediction_loss_only:
             return (loss, None, None)
+
+        # Padding 对齐逻辑 (保持不变)
+        if generated_tokens.shape[-1] < gen_kwargs["max_new_tokens"]:
+            generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_new_tokens"])
 
         if has_labels:
             labels = inputs["labels"]

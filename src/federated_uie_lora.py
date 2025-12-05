@@ -10,28 +10,33 @@ import json
 import datasets
 import numpy as np
 import torch
-import gc,contextlib
+import gc
 from accelerate.utils import wait_for_everyone
 import math
-from datasets import load_dataset, concatenate_datasets
-import pandas as pd
-import matplotlib.pyplot as plt
+from datasets import load_dataset
 import transformers
 import torch.distributed as dist
 from transformers.trainer_utils import get_last_checkpoint
 from uie_collator import DataCollatorForUIE
-from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions, compute_fisher, compute_fisher_arithmetic
+from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
 from compute_metrics import compute_metrics, compute_grouped_metrics
-from model.llama import LlamaForCausalLM_with_lossmask
+# from model.llama import LlamaForCausalLM_with_lossmask
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
 from uie_dataset_lora import gen_cache_path
-#from plot.data_distribution import compare
 from run_uie_lora import ModelArguments, DataTrainingArguments, UIETrainingArguments, FederatedArguments
-from torch.utils.data import DataLoader
-from continual_fisher_client import ContinualFisherClient, ClientState
 from fed_continual_state import ContinualState
-from scipy.stats import pearsonr
-from typing import Dict, Tuple, List
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,  # <-- 确保引入这个
+    LlamaTokenizer,
+    DataCollatorForSeq2Seq,
+    Seq2SeqTrainingArguments,
+    GenerationConfig
+)
+
+os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger("federated_training")
 CURRENT_DIR = os.path.dirname(__file__)
 
@@ -121,211 +126,296 @@ def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_
 
     return [dataset.select(idxs) for idxs in client_indices]
 
-def build_model_and_tokenizer(model_args: ModelArguments):
+
+def build_model_and_tokenizer(model_args):
     """
-    Unified loader for T5 (seq2seq), LLaMA-2 (decoder-only), and LLaMA-3 (decoder-only).
-    Keeps PEFT-LoRA behaviors consistent with your original code.
+    Unified loader for T5 and Llama in Federated Learning.
+    - T5: Uses standard loading.
+    - Llama: Uses Flash Attention 2 + BF16 + Custom Tokenizer Settings.
     """
 
     # --------- 1) 判别模型族 ----------
     name_lower = model_args.model_name_or_path.lower()
-    is_adapter = ("adapter" in name_lower)  # peft adapter 路径
-    is_llama = ("llama" in name_lower)
-    is_llama3 = ("llama-3" in name_lower) or ("llama3" in name_lower)
-    # 只要不是 llama，就按 seq2seq（T5/FLAN-T5 等）处理
-    is_seq2seq = (not is_llama)
+    is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
+    is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
 
-    # --------- 2) 配置与 tokenizer ----------
-    # adapter 的 base 模型名需要先从 peft config 里取出来
+    print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
+
+    # --------- 2) 准备 Config 和 Tokenizer ----------
     if is_adapter:
         peft_cfg = PeftConfig.from_pretrained(model_args.model_name_or_path)
-        base_model = peft_cfg.base_model_name_or_path
+        base_model_path = peft_cfg.base_model_name_or_path
     else:
-        base_model = model_args.model_name_or_path
+        base_model_path = model_args.model_name_or_path
 
-    config = transformers.AutoConfig.from_pretrained(
-        base_model,
+    config = AutoConfig.from_pretrained(
+        base_model_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
+    # [通用设置] 训练时关闭 cache 以节省显存
+    config.use_cache = False
+
     if is_llama:
-        # LLaMA-3 推荐走 AutoTokenizer；LLaMA-2 兼容 LlamaTokenizer
-        if is_llama3:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(
-                base_model,
-                cache_dir=model_args.cache_dir,
-                use_fast=model_args.use_fast_tokenizer,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-            )
-        else:
-            tokenizer = transformers.LlamaTokenizer.from_pretrained(
-                base_model,
-                cache_dir=model_args.cache_dir,
-                use_fast=model_args.use_fast_tokenizer,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-            )
-        # 与你/他脚本一致：显式设置 special ids
-        config.bos_token_id = 1
-        config.eos_token_id = 2
-        config.pad_token_id = 1
-        tokenizer.bos_token_id = 1
-        tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 1
-        tokenizer.padding_side = "left"  # decoder-only 左填充，与你原来一致
-    else:
-        # T5/FLAN-T5 等
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            base_model,
+        # Llama Tokenizer (新环境/旧环境都兼容)
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_path,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
-    # --------- 3) 选择 model class ----------
-    if is_llama:
-        # 你自己的自定义 LLaMA 类（保持不变）
-        model_class = LlamaForCausalLM_with_lossmask
-        lora_task = TaskType.CAUSAL_LM
-    else:
-        model_class = transformers.AutoModelForSeq2SeqLM
-        lora_task = TaskType.SEQ_2_SEQ_LM
+        # 1. 补全 pad_token (如果缺失)
+        # Llama 原生通常没有 pad_token，优先使用 unk_token (id=0)
+        if tokenizer.pad_token is None:
+            if tokenizer.unk_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.unk_token_id
+                tokenizer.pad_token = tokenizer.unk_token
+            else:
+                # 兜底策略
+                tokenizer.pad_token_id = 0
+                tokenizer.pad_token = "<unk>"
 
-    # --------- 4) 加载模型 + 应用 LoRA/PEFT ----------
-    if is_adapter:
-        # 先加载 base，再把 peft adapter 套上
-        model = model_class.from_pretrained(
-            base_model,
-            from_tf=bool(".ckpt" in base_model),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
+        # 2. 强制修正 ID (避免 Pad=1 与 BOS=1 冲突)
+        # 这是解决训练不收敛和预测乱码的关键
+        tokenizer.bos_token_id = 1
+        tokenizer.eos_token_id = 2
+        tokenizer.pad_token_id = 0  # 必须是 0
+
+        # 3. 设置左填充 (Left Padding)
+        # Decoder-only 模型做生成任务时必须左填充，否则输出不对齐
+        tokenizer.padding_side = "left"
+
+        # 同步更新 Config，防止生成时报 Warning
+        config.bos_token_id = tokenizer.bos_token_id
+        config.eos_token_id = tokenizer.eos_token_id
+        config.pad_token_id = tokenizer.pad_token_id
+
     else:
-        # 直接加载预训练模型，再用 LoRAConfig 注入训练参数
-        model = model_class.from_pretrained(
-            base_model,
-            from_tf=bool(".ckpt" in base_model),
-            config=config,
+        # [T5 路径] 标准加载，完全兼容旧环境
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_path,
             cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
+        # T5 默认 pad_token_id=0, padding_side='right'，无需修改
+
+    # --------- 3) 准备模型加载参数 ----------
+    model_load_kwargs = {
+        "config": config,
+        "cache_dir": model_args.cache_dir,
+        "revision": model_args.model_revision,
+        "use_auth_token": True if model_args.use_auth_token else None,
+    }
+
+    # [Llama 专属优化]
+    if is_llama:
+        # 1. 精度选择: 优先 BF16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            model_load_kwargs["torch_dtype"] = torch.bfloat16
+            print("[Build Model] Using bfloat16 for Llama.")
+        else:
+            model_load_kwargs["torch_dtype"] = torch.float16
+            print("[Build Model] Using float16 for Llama.")
+
+        # 2. Flash Attention 2 加速 (如果安装了)
+        try:
+            import flash_attn
+            config._attn_implementation = "flash_attention_2"
+            print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
+        except ImportError:
+            print("[Build Model] Flash Attention 2 not found, using default attention.")
+
+    # --------- 4) 加载模型 ----------
+    if is_llama:
+        model_class = AutoModelForCausalLM
+        lora_task_type = TaskType.CAUSAL_LM
+    else:
+        # T5 使用标准 Seq2Seq 类
+        model_class = AutoModelForSeq2SeqLM
+        lora_task_type = TaskType.SEQ_2_SEQ_LM
+
+    # 加载 Base Model
+    model = model_class.from_pretrained(
+        base_model_path,
+        from_tf=bool(".ckpt" in base_model_path),
+        **model_load_kwargs
+    )
+
+    # [梯度检查点支持]
+    # 开启 input_require_grads 以支持 gradient_checkpointing
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    # --------- 5) 应用 PEFT / LoRA ----------
+    if is_adapter:
+        print(f"[Build Model] Loading existing adapter: {model_args.model_name_or_path}")
+        model = PeftModel.from_pretrained(
+            model,
+            model_args.model_name_or_path,
+            torch_dtype=model_load_kwargs.get("torch_dtype", "auto")
+        )
+    else:
+        print(f"[Build Model] Initializing new LoRA adapter (r={model_args.lora_dim})")
         peft_config = LoraConfig(
-            task_type=lora_task,
+            task_type=lora_task_type,
             inference_mode=False,
             r=model_args.lora_dim,
             lora_alpha=32,
             lora_dropout=0.1,
+            # Llama 需要指定 target_modules，T5 通常不需要(默认q,v)
+            target_modules=["q_proj", "v_proj"] if is_llama else None
         )
         model = get_peft_model(model, peft_config)
 
-    # --------- 5) 统一一些生成与 embedding 细节 ----------
+    # --------- 6) 后处理 ----------
+    # 调整 Embedding 大小以匹配 Tokenizer (防止 special tokens 越界)
     model.resize_token_embeddings(len(tokenizer))
-    if is_llama:
-        # 和你原来的做法一致
-        model.generation_config.bos_token_id = 1
-        model.generation_config.eos_token_id = 2
-        model.generation_config.pad_token_id = 1
 
-    # 只训练 LoRA 权重（沿用你原来的规则）
+    # 确保 LoRA 参数可训练 (双重保险)
     for name, param in model.named_parameters():
         if 'lora_' in name:
             param.requires_grad = True
-        elif 'shared' in name:
-            param.requires_grad = False
 
+    # 打印可训练参数
+    model.print_trainable_parameters()
     return model, tokenizer
+
 
 def compute_fisher_diag(model, dataloader):
     """
-    适配LoRA模型的对角线Fisher信息计算（修正版）
-    仅计算带"lora"的可训练参数，返回字典格式
+    适配LoRA模型的对角线Fisher信息计算（显存优化修正版）
+    修复了 LlamaModel 不接受 input_ids_wo_label 的问题
     """
-    # 自动获取模型所在设备（与模型参数一致）
+    # 自动获取模型所在设备
     device = next(model.parameters()).device
-    model.eval()  # 计算梯度时使用训练模式
+    model.eval()
 
-    # 初始化Fisher累积器（仅跟踪LoRA可训练参数，用参数名作为键）
+    # 初始化Fisher累积器 (CPU上)
     fisher_diag = {
-        name: torch.zeros_like(param, device="cpu")  # <-- 修改
+        name: torch.zeros_like(param, device="cpu")
         for name, param in model.named_parameters()
-        if param.requires_grad and "lora" in name  # 仅保留LoRA相关参数
+        if param.requires_grad and "lora" in name
     }
 
-    total_samples = 0  # 累计样本数用于平均
+    total_samples = 0
 
     for batch in dataloader:
-        # 适配字典形式的输入批次（如包含input_ids、labels等键）
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        inputs = {k: v for k, v in batch.items() if k != "labels"}  # 输入特征
+        # --- [修改点 1] 数据清洗与迁移 ---
+        # 定义模型 forward 不接受的参数列表
+        keys_to_ignore = ["input_ids_wo_label", "loss_mask", "labels"]
+
+        # 构建 inputs：只包含模型 forward 需要的参数 (input_ids, attention_mask 等)
+        inputs = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+            if k not in keys_to_ignore
+        }
+
+        # 获取 labels 并移至设备 (计算 log_prob 需要)
         labels = batch.get("labels", None)
-
         if labels is None:
-            continue  # 无标签数据不参与计算
+            continue
+        labels = labels.to(device)
 
-        # 前向计算获取logits
+        # ---------------------------------
+
+        # 前向传播 (构造计算图)
+        # 现在 inputs 里已经没有 input_ids_wo_label 了，不会报错
         outputs = model(**inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
-        # 计算log概率（适配seq2seq模型的标签维度）
+        # 计算 Log Softmax
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-        # 对每个样本计算梯度并累积Fisher
         batch_size = logits.size(0)
         total_samples += batch_size
 
         for i in range(batch_size):
-            # 提取当前样本的标签（忽略填充值-100）
             sample_label = labels[i]
+            # 忽略 padding 部分 (-100)
             valid_mask = sample_label != -100
             if not valid_mask.any():
-                continue  # 跳过全填充的样本
+                continue
 
-            # 计算当前样本的log概率（仅有效标签部分）
-            sample_log_prob = log_probs[i, torch.arange(log_probs.size(1)), sample_label]
-            sample_log_prob = sample_log_prob[valid_mask].sum()  # 累加有效位置的log概率
+            # 提取单个样本的 Log Prob
+            # 注意：这里假设 log_probs 和 labels 长度是对齐的
+            # 对于 CausalLM，通常 labels 会发生 shift，但如果你的 collator 已经处理好了对齐，这里就不动
+            # 如果是标准 HuggingFace 输出，logits 长度通常等于 input_ids 长度
 
-            # 计算梯度（创建计算图用于二阶导数）
+            # 截取有效长度防止越界
+            seq_len = min(log_probs.size(1), sample_label.size(0))
+            sample_log_prob_seq = log_probs[i, :seq_len, :]
+            sample_label_seq = sample_label[:seq_len]
+            valid_mask_seq = valid_mask[:seq_len]
+
+            # Gather 正确类别的概率
+            # sample_log_prob_seq: [seq_len, vocab_size] -> 选出 target token 的概率
+            selected_log_probs = sample_log_prob_seq[torch.arange(seq_len, device=device), sample_label_seq]
+
+            # 求和得到该样本的 log(p(y|x))
+            sample_total_log_prob = selected_log_probs[valid_mask_seq].sum()
+
             model.zero_grad(set_to_none=True)
-            grads = torch.autograd.grad(
-                sample_log_prob,
-                [param for name, param in model.named_parameters() if param.requires_grad and "lora" in name],
-                create_graph=True,
-                retain_graph=True
-            )
 
-            # 累积梯度平方到Fisher对角线
-            for (name, param), grad in zip(fisher_diag.items(), grads):
-                if grad is not None:
-                    # --- [修改点 2：将梯度移到 CPU 再累加] ---
-                    fisher_diag[name].add_(grad.detach().cpu() ** 2)  # <-- 修改
+            # [显存优化关键点]
+            # 1. create_graph=False: 我们只需要梯度值，不需要二阶导
+            # 2. retain_graph: 只有在处理 Batch 中非最后一个样本时才需要保留图
+            retain_graph = (i < batch_size - 1)
 
-    # 计算平均Fisher（除以总样本数）
+            try:
+                grads = torch.autograd.grad(
+                    sample_total_log_prob,
+                    [param for name, param in model.named_parameters() if param.requires_grad and "lora" in name],
+                    create_graph=False,
+                    retain_graph=retain_graph,
+                    allow_unused=True  # 防止部分 LoRA 层未参与计算报错
+                )
+
+                # 累积到 CPU
+                for (name, param), grad in zip(fisher_diag.items(), grads):
+                    if grad is not None:
+                        # Fisher = E[grad^2]
+                        fisher_diag[name].add_(grad.detach().cpu().pow(2))
+
+            except RuntimeError as e:
+                # 捕获可能的 OOM 或计算图错误，防止整个训练中断
+                logger.warning(f"Skipping sample due to error: {e}")
+                continue
+
+        # 显式清理，防止显存碎片
+        del outputs, logits, log_probs
+        if 'grads' in locals(): del grads
+        torch.cuda.empty_cache()
+
+    # 平均化
     if total_samples > 0:
         for name in fisher_diag:
             fisher_diag[name] /= total_samples
     else:
         logger.warning("未处理有效样本，Fisher保持初始零值")
 
-    # 归一化处理（保留原min-max归一化逻辑）
+    # 归一化
     normalized_fisher = {}
     for name, fisher in fisher_diag.items():
         x_min = fisher.min()
         x_max = fisher.max()
-        if x_max - x_min > 1e-8:  # 避免除零
+        if x_max - x_min > 1e-8:
             normalized_fisher[name] = (fisher - x_min) / (x_max - x_min)
         else:
             normalized_fisher[name] = torch.zeros_like(fisher)
 
-    # 转移到CPU并返回（与其他Fisher函数格式一致）
-    return {k: v.detach() for k, v in normalized_fisher.items()} # <-- 修改
+    return {k: v.detach() for k, v in normalized_fisher.items()}
 
 
 
@@ -360,17 +450,21 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     # accelerator.seed_everything(fed_args.federated_seed)
 
     data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
-    raw_datasets = load_dataset(
-        os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
-        data_dir=data_args.data_dir,
-        task_config_dir=data_args.task_config_dir,
-        instruction_file=data_args.instruction_file,
-        instruction_strategy=data_args.instruction_strategy,
-        cache_dir=data_cache_dir,
-        max_num_instances_per_task=data_args.max_num_instances_per_task,
-        max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-        num_examples=data_args.num_examples
-    )
+    # === 修改开始: 使用上下文管理器确保只有主进程先执行数据生成 ===
+    with training_args.main_process_first(desc="loading dataset"):
+        raw_datasets = load_dataset(
+            os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
+            data_dir=data_args.data_dir,
+            task_config_dir=data_args.task_config_dir,
+            instruction_file=data_args.instruction_file,
+            instruction_strategy=data_args.instruction_strategy,
+            cache_dir=data_cache_dir,
+            max_num_instances_per_task=data_args.max_num_instances_per_task,
+            max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
+            num_examples=data_args.num_examples
+        )
+    # === 修改结束 ===
+
     raw_datasets.cleanup_cache_files()
 
     # Detecting last checkpoint (复用集中式逻辑)
@@ -435,6 +529,30 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # compare(client_datasets,fed_args.dirichlet_alpha)
     model, tokenizer = build_model_and_tokenizer(model_args)
+
+    # [修改] 集中管理 Gradient Checkpointing 逻辑
+    if training_args.gradient_checkpointing:
+        logger.info("Gradient Checkpointing enabled.")
+
+        # 1. 开启 GC
+        if hasattr(model, "gradient_checkpointing_enable"):
+            # [修改] 旧版 API 不接受参数，直接调用
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient Checkpointing enabled (Legacy Mode).")
+
+        # 2. [关键补充] 只有开 GC 时，才强制开启输入层梯度
+        # 这解决了 "does not have a grad_fn" 报错，同时不影响不开 GC 的情况
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    else:
+        logger.info("Gradient Checkpointing DISABLED (per arguments).")
+
 
     # model = accelerator.prepare(model)
 
@@ -542,6 +660,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         for cid in range(fed_args.num_clients)
     }
 
+
+
     # -----Begin Training------
     training_args.remove_unused_columns = False
     base_args = copy.deepcopy(training_args)
@@ -614,6 +734,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         state=None,
         comm_budget=None,
         layer_costs=None,
+        radius=training_args.radius,
     )
     if _is_main():
         logger.info("DeepSpeed Trainer initialized.")

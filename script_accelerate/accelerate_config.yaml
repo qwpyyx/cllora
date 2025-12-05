@@ -3,7 +3,7 @@ distributed_type: MULTI_GPU
 downcast_bf16: 'no'
 dynamo_backend: 'NO'
 machine_rank: 0
-mixed_precision: no
+mixed_precision: bf16
 num_machines: 1
 num_processes: 3
 gpu_ids: all

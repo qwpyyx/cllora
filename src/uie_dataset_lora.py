@@ -25,7 +25,7 @@ from hashlib import md5
 logger = datasets.logging.get_logger(__name__)
 TASK_CONFIG_FILES = {"train": "train_tasks.json", "dev": "dev_tasks.json", "test": "test_tasks.json"}
 INSTRUCTION_STRATEGIES = ['single', 'multiple']
-ANSWER_PREFIX = "Answer:"
+ANSWER_PREFIX = "Output:"
 SINGLE_QUOTES_SUBSTITUTE = "#$%#"
 AUX_PROB = 0.3
 
@@ -305,215 +305,215 @@ class UIEInstructions(datasets.GeneratorBasedBuilder):
         return instances
 
 
-    def load_SC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-        # sentiment classification
-        # you should first modify the original dataset to the standard format (json):
-        # {"label": xxx, "sentence": "Title" + xxx + "\nText: " + xxx + "\n"}
-        
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "SC", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('SC')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:" # value of "sentence" will be filled in {0}
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-
-
-    def load_TC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-        # text classification
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "TC", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('TC')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-
-
-    def load_NLI_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "NLI", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('NLI')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-
-
-    def load_QQP_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "QQP", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('QQP')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-    
-
-    def load_BoolQA_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "BoolQA", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('BoolQA')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-            
-
-    def load_COPA_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "COPA", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-
-
-    def load_MultiRC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "MultiRC", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('MultiRC')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
-
-
-    def load_WiC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
-
-        instances, labels = self._load_dataset(dataset_path, labels_path)
-
-        sample_template = {"Task": "WiC", "Dataset": dataset_name, "Samples": [], "subset": subset}
-
-        labels_str = ', '.join(labels)
-        instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
-
-        for idx, instance in enumerate(instances):
-            example = sample_template.copy()
-            instruction = self._get_instruction('WiC')
-            instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
-            label = instance['label']
-
-            example["Instance"] = {
-                "id": str(idx),
-                "sentence": instance['sentence'],
-                "label": label,
-                "ground_truth": label,
-                "instruction": instruction
-            }
-
-            yield example
+    # def load_SC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #     # sentiment classification
+    #     # you should first modify the original dataset to the standard format (json):
+    #     # {"label": xxx, "sentence": "Title" + xxx + "\nText: " + xxx + "\n"}
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "SC", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('SC')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:" # value of "sentence" will be filled in {0}
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_TC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #     # text classification
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "TC", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('TC')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_NLI_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "NLI", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('NLI')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_QQP_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "QQP", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('QQP')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_BoolQA_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "BoolQA", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('BoolQA')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_COPA_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "COPA", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_MultiRC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "MultiRC", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('MultiRC')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
+    #
+    #
+    # def load_WiC_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances, subset):
+    #
+    #     instances, labels = self._load_dataset(dataset_path, labels_path)
+    #
+    #     sample_template = {"Task": "WiC", "Dataset": dataset_name, "Samples": [], "subset": subset}
+    #
+    #     labels_str = ', '.join(labels)
+    #     instances = self._sampling_dataset(instances, sampling_strategy, max_num_instances)
+    #
+    #     for idx, instance in enumerate(instances):
+    #         example = sample_template.copy()
+    #         instruction = self._get_instruction('WiC')
+    #         instruction += "Option: " + labels_str + " \n" + "{0}" + "\nAnswer:"
+    #         label = instance['label']
+    #
+    #         example["Instance"] = {
+    #             "id": str(idx),
+    #             "sentence": instance['sentence'],
+    #             "label": label,
+    #             "ground_truth": label,
+    #             "instruction": instruction
+    #         }
+    #
+    #         yield example
 
     def load_LongSeq_dataset(self, dataset_path, labels_path, dataset_name, sampling_strategy, max_num_instances,
                              subset):
@@ -655,8 +655,8 @@ class UIEInstructions(datasets.GeneratorBasedBuilder):
 
         # 允许的老任务（你的原有目录结构：<Task>/<Dataset>/<split>.json + labels.json）
         LEGACY_TASKS = {"SC", "TC", "NLI", "QQP", "BoolQA", "COPA", "MultiRC", "WiC"}
-        print("开始生成样本。。。。。")
-        print(f"task config is:{task_config}")
+        # print("开始生成样本。。。。。")
+        # print(f"task config is:{task_config}")
         for task in task_config:
             # 1) 传统任务：仍然按你原来的加载函数和路径组织来做
             if task in LEGACY_TASKS:

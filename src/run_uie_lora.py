@@ -30,7 +30,6 @@ import nltk
 import numpy as np
 from datasets import load_dataset
 import transformers
-import schedulefree
 from filelock import FileLock
 from transformers import (
     AutoConfig,
@@ -42,7 +41,7 @@ from transformers import (
     set_seed, )
 from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint
-from peft import  get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
 
 # privacy
 from uie_collator import DataCollatorForUIE
@@ -51,13 +50,11 @@ from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
 from compute_metrics import compute_metrics, compute_grouped_metrics
 from model.llama import LlamaForCausalLM_with_lossmask
 
-
 # ignore all warning
-#warnings.filterwarnings("ignore")
+# warnings.filterwarnings("ignore")
 os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger(__name__)
 CURRENT_DIR = os.path.dirname(__file__)
-
 
 try:
     nltk.data.find("tokenizers/punkt")
@@ -121,11 +118,12 @@ class ModelArguments:
         },
     )
 
-    #original LoRA setting
+    # original LoRA setting
     use_baseline_lora: bool = field(
         default=False,
         metadata={"help": "Whether to use a single LoRA configuration for all tasks (baseline LoRA)."}
     )
+
 
 @dataclass
 class DataTrainingArguments:
@@ -234,6 +232,7 @@ class DataTrainingArguments:
     task: int = field(default=1, metadata={
         "help": "Current task index starting from 1; first task runs without continual constraints."})
 
+
 @dataclass
 class UIETrainingArguments(Seq2SeqTrainingArguments):
     gradient_checkpointing: Optional[bool] = field(
@@ -250,7 +249,9 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     method: str = field(default="lora_origin", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
     uplink_mbps: str = field(default="10,100", metadata={"help": "逗号分隔的上行带宽(Mbps)，用于计算通信节省时间下界"})
     packet_bytes: int = field(default=1500, metadata={"help": "每个传输包的有效负载字节数"})
+    radius: float = field(default=1.0, metadata={"help": "Constraint radius for adaptive optimizer."})
     # optim: str = field(default="sgd", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
+
 
 @dataclass
 class FederatedArguments:
@@ -284,7 +285,7 @@ class FederatedArguments:
         default=None,
         metadata={"help": "Seed for client sampling in federated rounds (independent of training_args.seed)."}
     )
-# ---------- Continual FL hyperparameters ----------
+    # ---------- Continual FL hyperparameters ----------
     comm_budget: Optional[int] = field(
         default=1200,
         metadata={
@@ -306,15 +307,22 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script, and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args, federated_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, federated_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args, federated_args = parser.parse_args_into_dataclasses()
 
-
+    # T5 / LLama
     if federated_args.mode == "federated":
         from federated_uie_lora import run_federated_training
         run_federated_training(model_args, data_args, training_args, federated_args)
         return
+
+    # # LLAMA
+    # if federated_args.mode == "federated":
+    #     from federated_uie_lora_llama import run_federated_training
+    #     run_federated_training(model_args, data_args, training_args, federated_args)
+    #     return
 
     # Setup logging
     logging.basicConfig(
@@ -354,7 +362,6 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-
     data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
 
     # Get the UIE dataset
@@ -371,15 +378,12 @@ def main():
     )
     raw_datasets.cleanup_cache_files()
 
-
-
-
     # Load pretrained model and tokenizer
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    if 'adapter' in model_args.model_name_or_path: # load lora-config
+    if 'adapter' in model_args.model_name_or_path:  # load lora-config
         config = PeftConfig.from_pretrained(model_args.model_name_or_path)
         if 'llama' in model_args.model_name_or_path.lower():
             tokenizer = transformers.LlamaTokenizer.from_pretrained(config.base_model_name_or_path)
@@ -403,15 +407,15 @@ def main():
         config.pad_token_id = 1
         tokenizer = transformers.LlamaTokenizer.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir = model_args.cache_dir,
-            use_fast = model_args.use_fast_tokenizer,
-            revision = model_args.model_revision,
-            use_auth_token = True if model_args.use_auth_token else None,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
         )
         tokenizer.bos_token_id = 1
         tokenizer.eos_token_id = 2
         tokenizer.pad_token_id = 1
-    else: # load original config
+    else:  # load original config
         config = AutoConfig.from_pretrained(
             model_args.config_name if model_args.config_name else model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
@@ -430,11 +434,11 @@ def main():
     if 'llama' in model_args.model_name_or_path.lower():  # add llama
         model_class = LlamaForCausalLM_with_lossmask
         tokenizer.padding_side = 'left'
-    else: 
+    else:
         model_class = AutoModelForSeq2SeqLM
 
     # 已经有了训练好的 LoRA 适配器参数，此时只需要把这些参数加载进模型中
-    if 'adapter' in model_args.model_name_or_path: # add lora-adapter to the original model
+    if 'adapter' in model_args.model_name_or_path:  # add lora-adapter to the original model
         model = model_class.from_pretrained(config.base_model_name_or_path)
         # 加载 LoRA 适配器，里面有个函数load_adapter
         model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
@@ -449,7 +453,7 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None
         )
 
-    # 这里修改其他PEFT方法
+        # 这里修改其他PEFT方法
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1
         )
@@ -474,9 +478,10 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
         peft_config = LoraConfig(
-            task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1
+            task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32,
+            lora_dropout=0.1
         )
-        #应该是修改这部分
+        # 应该是修改这部分
         model = get_peft_model(model, peft_config)
 
     # 确保模型的词嵌入矩阵与 tokenizer 的词汇表大小一致
@@ -486,7 +491,7 @@ def main():
         model.generation_config.bos_token_id = 1
         model.generation_config.eos_token_id = 2
         model.generation_config.pad_token_id = 1
-        
+
     # fix lora_A/B (bases of previous LoRA parameters, loaded in "load_adapter"[peft_momdel.py])
     # fine-tune loranew_A/B (initialized in "update_layer"[lora.py])
     # optional: lora_A/B is trainable but should not move too far from lorapre_A/B
@@ -547,7 +552,8 @@ def main():
             task_datasets = []
             for task in unique_tasks:
                 task_data = predict_dataset.filter(lambda example: example['Dataset'] == task)
-                task_data = task_data.shuffle(seed=training_args.seed).select(range(min(samples_per_task, len(task_data))))
+                task_data = task_data.shuffle(seed=training_args.seed).select(
+                    range(min(samples_per_task, len(task_data))))
                 task_datasets.append(task_data)
 
             # 将不同任务的数据集拼接成最终的预测数据集
