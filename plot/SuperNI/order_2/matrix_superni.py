@@ -8,8 +8,8 @@ import re
 # 请根据您的设置修改这些变量
 BENCHMARK = "SuperNI"
 ORDER = "order_2_llama"
-METHOD = "lora_origin"
-LR = "1e-04"
+METHOD = "adaptive"
+LR = "1e-04-budget11264"
 
 # 基础路径，指向包含 '1-task748...', '2-task073...' 等的目录
 # BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}/"

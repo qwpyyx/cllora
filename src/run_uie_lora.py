@@ -251,6 +251,11 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     packet_bytes: int = field(default=1500, metadata={"help": "每个传输包的有效负载字节数"})
     radius: float = field(default=1.0, metadata={"help": "Constraint radius for adaptive optimizer."})
     # optim: str = field(default="sgd", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
+    random_layer_selection: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, select uploaded layers randomly within budget instead of using knapsack optimization."}
+    )
 
 
 @dataclass

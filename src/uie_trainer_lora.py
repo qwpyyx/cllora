@@ -838,10 +838,45 @@ class UIETrainer(Seq2SeqTrainer):
 
             total_cost = sum(costs)
             budget = self.comm_budget if self.comm_budget is not None else total_cost
-            if budget >= total_cost:
-                selected_flags = [True] * len(names)
+            # ========== 修改开始：随机层选择逻辑 ==========
+            if getattr(self.args, "random_layer_selection", False):
+                import random
+
+                # 核心修改：利用现有的 seed 构造局部随机源，确保复现性
+                # self.args.seed 是全局种子
+                # task_id 区分不同任务
+                # actual_steps 区分同一任务中的不同轮次 (Train Loop中的计数器)
+                # 这样既利用了你的 seed，又避免了不同轮次选一样的层
+                local_seed = self.args.seed + task_id + actual_steps
+                rng = random.Random(local_seed)
+
+                # 创建索引并随机打乱
+                indices = list(range(len(names)))
+                rng.shuffle(indices)
+
+                selected_flags = [False] * len(names)
+                current_cost = 0
+
+                # 贪心填充：打乱后依次尝试放入，直到塞满 Budget
+                for idx in indices:
+                    cost = costs[idx]
+                    if current_cost + cost <= budget:
+                        selected_flags[idx] = True
+                        current_cost += cost
+
+                # 仅在主进程打印日志，避免刷屏
+                if self.accelerator.is_main_process:
+                    # 偶尔打印一下（比如每100步），或者只打印简单的 info
+                    logger.info(
+                        f"[Task {task_id} | Step {actual_steps}] Random Selection: Budget {budget}, Used {current_cost}")
+
             else:
-                selected_flags = _knapsack(values, costs, budget)
+                # 原有的背包算法 (Ours)
+                if budget >= total_cost:
+                    selected_flags = [True] * len(names)
+                else:
+                    selected_flags = _knapsack(values, costs, budget)
+            # ========== 修改结束 ==========
 
             if self.accelerator.num_processes > 1:
                 import torch.distributed as dist
