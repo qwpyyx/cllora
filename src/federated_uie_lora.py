@@ -35,7 +35,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     GenerationConfig
 )
-
+from datasets import concatenate_datasets
 os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger("federated_training")
 CURRENT_DIR = os.path.dirname(__file__)
@@ -137,8 +137,11 @@ def build_model_and_tokenizer(model_args):
     # --------- 1) 判别模型族 ----------
     name_lower = model_args.model_name_or_path.lower()
     is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
-    is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
-
+    # is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+    if "t5" in name_lower:
+        is_llama = False
+    else:
+        is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
     print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
 
     # --------- 2) 准备 Config 和 Tokenizer ----------
@@ -294,130 +297,121 @@ def build_model_and_tokenizer(model_args):
 
 def compute_fisher_diag(model, dataloader):
     """
-    适配LoRA模型的对角线Fisher信息计算（显存优化修正版）
-    修复了 LlamaModel 不接受 input_ids_wo_label 的问题
+    [修改版] DDP 专用 Fisher 计算：
+    1. 只计算本地数据的梯度平方和，不平均，不归一化。
+    2. 包含 Llama/GPT 的 Logits Shift 修正。
     """
-    # 自动获取模型所在设备
     device = next(model.parameters()).device
     model.eval()
 
-    # 初始化Fisher累积器 (CPU上)
-    fisher_diag = {
+    # 初始化累积矩阵 (CPU)
+    fisher_sum = {
         name: torch.zeros_like(param, device="cpu")
         for name, param in model.named_parameters()
         if param.requires_grad and "lora" in name
     }
 
-    total_samples = 0
+    local_samples = 0
+    model.zero_grad()
 
-    for batch in dataloader:
-        # --- [修改点 1] 数据清洗与迁移 ---
-        # 定义模型 forward 不接受的参数列表
-        keys_to_ignore = ["input_ids_wo_label", "loss_mask", "labels"]
+    for step, batch in enumerate(dataloader):
+        # 1. 数据移到 GPU
+        inputs = {k: v.to(device) for k, v in batch.items() if k not in ["input_ids_wo_label", "labels"]}
+        if "labels" in batch:
+            labels = batch["labels"].to(device)
 
-        # 构建 inputs：只包含模型 forward 需要的参数 (input_ids, attention_mask 等)
-        inputs = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-            if k not in keys_to_ignore
-        }
-
-        # 获取 labels 并移至设备 (计算 log_prob 需要)
-        labels = batch.get("labels", None)
-        if labels is None:
-            continue
-        labels = labels.to(device)
-
-        # ---------------------------------
-
-        # 前向传播 (构造计算图)
-        # 现在 inputs 里已经没有 input_ids_wo_label 了，不会报错
         outputs = model(**inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
-        # 计算 Log Softmax
+        # 2. [关键] Logits Shift (针对 Llama/GPT)
+        is_causal = False
+        if "llama" in getattr(model.config, "_name_or_path", "").lower() or getattr(model.config, "is_decoder", False):
+            if not getattr(model.config, "is_encoder_decoder", False):
+                is_causal = True
+
+        if is_causal:
+            logits = logits[..., :-1, :].contiguous()
+            labels = labels[..., 1:].contiguous()
+
+        # 3. 计算梯度
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-
         batch_size = logits.size(0)
-        total_samples += batch_size
+        local_samples += batch_size
 
+        # 假设 dataloader batch_size=1，直接取 [0]
+        # 如果 batch_size > 1，这里需要循环处理，但为了显存通常设为 1
         for i in range(batch_size):
             sample_label = labels[i]
-            # 忽略 padding 部分 (-100)
             valid_mask = sample_label != -100
-            if not valid_mask.any():
-                continue
+            if not valid_mask.any(): continue
 
-            # 提取单个样本的 Log Prob
-            # 注意：这里假设 log_probs 和 labels 长度是对齐的
-            # 对于 CausalLM，通常 labels 会发生 shift，但如果你的 collator 已经处理好了对齐，这里就不动
-            # 如果是标准 HuggingFace 输出，logits 长度通常等于 input_ids 长度
-
-            # 截取有效长度防止越界
             seq_len = min(log_probs.size(1), sample_label.size(0))
             sample_log_prob_seq = log_probs[i, :seq_len, :]
             sample_label_seq = sample_label[:seq_len]
-            valid_mask_seq = valid_mask[:seq_len]
 
-            # Gather 正确类别的概率
-            # sample_log_prob_seq: [seq_len, vocab_size] -> 选出 target token 的概率
+            # Gather log probs
             selected_log_probs = sample_log_prob_seq[torch.arange(seq_len, device=device), sample_label_seq]
+            sample_total_log_prob = selected_log_probs[valid_mask[:seq_len]].sum()
 
-            # 求和得到该样本的 log(p(y|x))
-            sample_total_log_prob = selected_log_probs[valid_mask_seq].sum()
+            model.zero_grad()
+            sample_total_log_prob.backward()
+
+            # 4. [关键] 累积到 CPU
+            for name, param in model.named_parameters():
+                if param.requires_grad and "lora" in name and param.grad is not None:
+                    fisher_sum[name] += param.grad.detach().cpu().pow(2)
 
             model.zero_grad(set_to_none=True)
 
-            # [显存优化关键点]
-            # 1. create_graph=False: 我们只需要梯度值，不需要二阶导
-            # 2. retain_graph: 只有在处理 Batch 中非最后一个样本时才需要保留图
-            retain_graph = (i < batch_size - 1)
+    # 返回 原始平方和 和 样本数量
+    return fisher_sum, local_samples
 
-            try:
-                grads = torch.autograd.grad(
-                    sample_total_log_prob,
-                    [param for name, param in model.named_parameters() if param.requires_grad and "lora" in name],
-                    create_graph=False,
-                    retain_graph=retain_graph,
-                    allow_unused=True  # 防止部分 LoRA 层未参与计算报错
-                )
+def select_layers_random(layer_names, layer_costs, budget, seed):
+    """
+    Randomly select layers until budget is exhausted.
+    """
+    rng = random.Random(seed)
+    # Shuffle indices
+    indices = list(range(len(layer_names)))
+    rng.shuffle(indices)
 
-                # 累积到 CPU
-                for (name, param), grad in zip(fisher_diag.items(), grads):
-                    if grad is not None:
-                        # Fisher = E[grad^2]
-                        fisher_diag[name].add_(grad.detach().cpu().pow(2))
+    selected_layers = set()
+    current_cost = 0
 
-            except RuntimeError as e:
-                # 捕获可能的 OOM 或计算图错误，防止整个训练中断
-                logger.warning(f"Skipping sample due to error: {e}")
-                continue
+    for idx in indices:
+        name = layer_names[idx]
+        cost = layer_costs.get(name, 0)
+        if current_cost + cost <= budget:
+            selected_layers.add(name)
+            current_cost += cost
 
-        # 显式清理，防止显存碎片
-        del outputs, logits, log_probs
-        if 'grads' in locals(): del grads
-        torch.cuda.empty_cache()
-
-    # 平均化
-    if total_samples > 0:
-        for name in fisher_diag:
-            fisher_diag[name] /= total_samples
-    else:
-        logger.warning("未处理有效样本，Fisher保持初始零值")
-
-    # 归一化
-    normalized_fisher = {}
-    for name, fisher in fisher_diag.items():
-        x_min = fisher.min()
-        x_max = fisher.max()
-        if x_max - x_min > 1e-8:
-            normalized_fisher[name] = (fisher - x_min) / (x_max - x_min)
-        else:
-            normalized_fisher[name] = torch.zeros_like(fisher)
-
-    return {k: v.detach() for k, v in normalized_fisher.items()}
+    return selected_layers, current_cost
 
 
+def select_layers_topk(delta_dict, layer_costs, budget):
+    """
+    Select layers based on L2 norm of the update (Top-K importance) until budget is exhausted.
+    """
+    # 1. Calculate Importance Score (L2 Norm of Delta)
+    layer_scores = []
+    for name, tensor in delta_dict.items():
+        score = torch.norm(tensor.float()).item()
+        layer_scores.append((name, score))
+
+    # 2. Sort by score descending
+    layer_scores.sort(key=lambda x: x[1], reverse=True)
+
+    # 3. Greedy selection
+    selected_layers = set()
+    current_cost = 0
+
+    for name, score in layer_scores:
+        cost = layer_costs.get(name, 0)
+        if current_cost + cost <= budget:
+            selected_layers.add(name)
+            current_cost += cost
+
+    return selected_layers, current_cost
 
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
     world = max(getattr(training_args, "world_size", 1), 1)
@@ -512,7 +506,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 task_data = predict_dataset.filter(lambda ex: ex["Dataset"] == task)
                 task_data = task_data.shuffle(seed=training_args.seed).select(range(min(samples_per_task, len(task_data))))
                 task_datasets.append(task_data)
-            from datasets import concatenate_datasets
+
             predict_dataset = concatenate_datasets(task_datasets)
 
     all_metrics = {"run_name": training_args.run_name}
@@ -696,6 +690,43 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         if prev_task_dir and not os.path.isdir(prev_task_dir):
             prev_task_dir = None
 
+    client_ewc_states = None
+    client_replay_buffers = None
+    baseline_save_dir = os.path.join(current_output_dir, "baseline_states")
+
+    if method == "ewc":
+        client_ewc_states = defaultdict(lambda: {"fisher": None, "params": None})
+        # 如果找到了上个任务目录，尝试加载 EWC 状态
+        if prev_task_dir:
+            prev_baseline_dir = os.path.join(prev_task_dir, "baseline_states")
+            if os.path.exists(prev_baseline_dir):
+                if _is_main(): logger.info(f"Loading EWC states from {prev_baseline_dir}")
+                for cid in range(fed_args.num_clients):
+                    p = os.path.join(prev_baseline_dir, f"ewc_{cid}.pt")
+                    if os.path.exists(p):
+                        client_ewc_states[cid] = torch.load(p, map_location="cpu")
+            else:
+                if _is_main(): logger.warning(f"Previous task found but no baseline_states dir at {prev_baseline_dir}")
+
+    elif method == "replay":
+        client_replay_buffers = defaultdict(list)
+        # 如果找到了上个任务目录，尝试加载 Replay Buffer
+        if prev_task_dir:
+            prev_baseline_dir = os.path.join(prev_task_dir, "baseline_states")
+            if os.path.exists(prev_baseline_dir):
+                from datasets import load_from_disk
+                if _is_main(): logger.info(f"Loading Replay buffers from {prev_baseline_dir}")
+                for cid in range(fed_args.num_clients):
+                    p = os.path.join(prev_baseline_dir, f"replay_{cid}")
+                    if os.path.exists(p):
+                        try:
+                            ds = load_from_disk(p)
+                            client_replay_buffers[cid] = [ds]
+                        except Exception as e:
+                            logger.warning(f"Failed to load replay buffer for client {cid}: {e}")
+
+
+
     # 新增：记录当前任务中被选中的客户端
     current_task_selected_clients = set()
 
@@ -722,6 +753,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     if _is_main():
         logger.info("Initializing persistent DeepSpeed Trainer...")
+
+    current_task_ewc_cache = {}
+    current_task_replay_cache = {}
 
     trainer = UIETrainer(
         model=global_model,
@@ -802,22 +836,195 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             if hasattr(trainer, "adam_states"):
                 trainer.adam_states = {}
 
-            if method == "lora_origin":
+            if method in ["lora_origin", "ewc", "replay"]:
                 if _is_main():
                     logger.info(f"Client {cid}: Starting training (lora_origin)...")
 
+                # --- [Replay] 数据增强: 拼接旧数据 ---
+                if method == "replay" and client_replay_buffers is not None:
+                    if len(client_replay_buffers[cid]) > 0:
+                        # 拼接所有历史 buffer
+                        replay_ds = concatenate_datasets(client_replay_buffers[cid])
+                        # 混合当前数据 + 回放数据
+                        combined_ds = concatenate_datasets([client_datasets[cid], replay_ds])
+                        # 打乱并赋值给 trainer
+                        trainer.train_dataset = combined_ds.shuffle(seed=training_args.seed)
+                        if _is_main():
+                            logger.info(
+                                f"Client {cid} [Replay]: Merged buffer. Size {len(client_datasets[cid])} -> {len(trainer.train_dataset)}")
+                    else:
+                        if _is_main(): logger.info(
+                            f"Client {cid} [Replay]: Buffer empty, training on current task only.")
+
+                # --- [EWC] 注入状态: 设置 Fisher 和 Theta_star ---
+                if method == "ewc" and client_ewc_states is not None:
+                    state = client_ewc_states[cid]
+
+                    # =========== [新增 Log 开始] ===========
+                    if _is_main():
+                        if state["fisher"] is None:
+                            # 只有 Task 1 应该是这种情况
+                            logger.info(f"Client {cid} [EWC Status]: ⚪ No Fisher matrix found (Normal for Task 1).")
+                        else:
+                            # 检查 Fisher 是否全为 0，或者是否有值
+                            fisher_keys = list(state["fisher"].keys())
+                            sample_key = fisher_keys[0]
+                            sample_val = state["fisher"][sample_key].mean().item()
+                            total_params = len(fisher_keys)
+                            logger.info(f"Client {cid} [EWC Status]: 🟢 Fisher Loaded! "
+                                        f"Count: {total_params} layers | "
+                                        f"Sample Layer ({sample_key}) Mean: {sample_val:.6f}")
+                            # 再次确认 params 是否存在
+                            if state["params"] is None:
+                                logger.error(
+                                    f"Client {cid} [EWC Error]: 🔴 Fisher exists but Reference Params (theta*) is None!")
+                            # =========== [新增 Log 结束] ===========
+
+                            # 将状态注入 Trainer (Trainer.compute_loss 会用到)
+                    trainer.ewc_fisher = state["fisher"]
+                    trainer.ewc_params = state["params"]
+                    if state["fisher"] is not None and _is_main():
+                        logger.info(f"Client {cid} [EWC]: Loaded regularization constraints.")
 
                 trainer.train(task_id=data_args.task)
                 _trainer_wait_for_everyone(trainer)
-
                 trained_model = _trainer_unwrap_model(trainer)
+
+                if method == "ewc":
+                    if _is_main():
+                        logger.info(
+                            f"Client {cid} [EWC]: Computing Fisher Matrix (Round {rnd + 1}) [Accelerate Distributed]...")
+
+                    # 1. 数据采样 (所有 Rank 必须一致)
+                    FISHER_SAMPLE_LIMIT = 500
+                    fisher_ds = client_datasets[cid]
+                    if len(fisher_ds) > FISHER_SAMPLE_LIMIT:
+                        rng = np.random.RandomState(fed_args.federated_seed + cid + rnd)
+                        indices = rng.choice(len(fisher_ds), FISHER_SAMPLE_LIMIT, replace=False)
+                        fisher_ds = fisher_ds.select(indices)
+
+                    # 2. 分布式 DataLoader (batch_size=1 保显存)
+                    fisher_sampler = torch.utils.data.distributed.DistributedSampler(
+                        fisher_ds, shuffle=False, drop_last=False
+                    )
+                    fisher_collator = collator_for(trained_model)
+                    fisher_loader = torch.utils.data.DataLoader(
+                        fisher_ds, batch_size=1, sampler=fisher_sampler, collate_fn=fisher_collator
+                    )
+
+                    # 3. 并行计算局部 Fisher
+                    local_fisher_sum, local_count = compute_fisher_diag(trained_model, fisher_loader)
+
+                    # 4. 聚合 (Reduce Sum)
+                    local_count_tensor = torch.tensor(local_count, device=trainer.accelerator.device)
+                    total_count_tensor = trainer.accelerator.reduce(local_count_tensor, reduction="sum")
+                    total_samples = total_count_tensor.item()
+
+                    sorted_keys = sorted(local_fisher_sum.keys())
+                    final_fisher = {}
+
+                    for name in sorted_keys:
+                        local_tensor = local_fisher_sum[name].to(trainer.accelerator.device)
+                        global_sum_tensor = trainer.accelerator.reduce(local_tensor, reduction="sum")
+
+                        # 计算平均值
+                        if total_samples > 0:
+                            avg_fisher = global_sum_tensor / total_samples
+                        else:
+                            avg_fisher = global_sum_tensor
+
+                        final_fisher[name] = avg_fisher.cpu()
+
+                    # 5. 归一化 & 存入缓存 (仅主进程)
+                    if _is_main():
+                        all_values = torch.cat([f.flatten() for f in final_fisher.values()])
+                        x_min, x_max = all_values.min(), all_values.max()
+
+                        normalized_fisher = {}
+                        for k, v in final_fisher.items():
+                            if x_max - x_min > 1e-8:
+                                normalized_fisher[k] = (v - x_min) / (x_max - x_min)
+                            else:
+                                normalized_fisher[k] = torch.zeros_like(v)
+
+                        # [关键] 覆写缓存：保留该 Client 在本任务最后一次的状态
+                        curr_params = {k: p.detach().cpu().clone() for k, p in trained_model.named_parameters() if
+                                       p.requires_grad and "lora" in k}
+                        current_task_ewc_cache[cid] = {
+                            "fisher": normalized_fisher,
+                            "params": curr_params
+                        }
+                        logger.info(f"Client {cid} [EWC]: Distributed Fisher finished. Total samples: {total_samples}")
+
+                    # 清理
+                    del fisher_loader, local_fisher_sum, final_fisher
+                    torch.cuda.empty_cache()
+                    trainer.accelerator.wait_for_everyone()
+
+                # --- [Replay] 后处理: 采样并存入 Buffer ---
+                if method == "replay" and client_replay_buffers is not None:
+                    current_ds = client_datasets[cid]
+                    buffer_size = training_args.replay_buffer_size
+
+                    # 1. 采样逻辑 (保持不变)
+                    if len(current_ds) > buffer_size:
+                        # 使用 seed 确保可复现，这里加上 rnd 防止每一轮采的一模一样(虽然后面会覆写，但保持随机性更好)
+                        rng = np.random.RandomState(fed_args.federated_seed + rnd + cid)
+                        indices = rng.choice(len(current_ds), buffer_size, replace=False)
+                        sampled_ds = current_ds.select(indices)
+                    else:
+                        sampled_ds = current_ds
+
+                    # 2. [关键修改] 存入 Cache，而不是直接 append 到持久化 buffer
+                    # 效果：
+                    # A. 如果 Client 在本任务中多次被选中，旧的采样会被新的覆盖 -> 保证每个任务只存一份数据
+                    # B. 只要被选中过一次，就会被记录 -> 解决了遗漏问题
+                    current_task_replay_cache[cid] = sampled_ds
+
+                    if _is_main():
+                        logger.info(f"Client {cid} [Replay]: Cached {len(sampled_ds)} examples for current task.")
+
+
                 name_to_param = dict(trained_model.named_parameters())
                 delta = {}
+
+                # 1. Calculate Full Delta first
                 for k in lora_keys:
                     p = name_to_param.get(k, None)
                     if p is None:
                         continue  # 或者 log warning
                     delta[k] = global_state_cpu[k] - p.detach().cpu()
+
+                # 2. Apply Selection Strategy (Compressed Upload)
+                if fed_args.comm_budget is not None and fed_args.comm_budget > 0:
+                    selected_layers = set()
+                    selection_cost = 0
+
+                    if training_args.random_layer_selection:
+                        # Random Selection
+                        seed = fed_args.federated_seed + rnd + cid
+                        selected_layers, selection_cost = select_layers_random(
+                            lora_keys, layer_costs, fed_args.comm_budget, seed
+                        )
+                        if _is_main():
+                            logger.info(
+                                f"Client {cid} [Random]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+                    else:
+                        # Top-K (Norm-based) Selection
+                        selected_layers, selection_cost = select_layers_topk(
+                            delta, layer_costs, fed_args.comm_budget
+                        )
+                        if _is_main():
+                            logger.info(
+                                f"Client {cid} [Top-K]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+
+                    # 3. Mask unselected layers (set delta to 0)
+                    for k in delta:
+                        if k not in selected_layers:
+                            delta[k] = torch.zeros_like(delta[k])
+
+
+
 
                 w = len(client_datasets[cid])
                 for k in lora_keys:
@@ -850,8 +1057,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     trainer.train(task_id=data_args.task)
                     _trainer_wait_for_everyone(trainer)
                     trained_model = _trainer_unwrap_model(trainer)
-                    if _is_main():
-                        fisher_dataloader = trainer.get_train_dataloader()
 
                     name_to_param = dict(trained_model.named_parameters())
                     delta = {}
@@ -869,25 +1074,89 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         aggregated[k] += delta[k] * w
                     total += w
 
+                    # =========================================================================
+                    # [修改点] Adaptive Task 1: 分布式 Fisher 计算 (替换原有的 _is_main 块)
+                    # =========================================================================
                     if _is_main():
-                        # --- [修改点 3：使用提前获取的 dataloader] ---
-                        F_client = compute_fisher_diag(trained_model, fisher_dataloader)
+                        logger.info(f"Client {cid} [Adaptive Task 1]: Computing Fisher (Distributed)...")
 
-                        theta_last = {k: theta_last_cpu[k] for k in F_client.keys() if k in theta_last_cpu}
+                    ADAPTIVE_SAMPLE_LIMIT = 500
+                    fisher_ds = client_datasets[cid]
+                    if len(fisher_ds) > ADAPTIVE_SAMPLE_LIMIT:
+                        # 确保所有 rank 随机种子一致，这样大家看到的“全集”是一样的
+                        rng = np.random.RandomState(fed_args.federated_seed + cid + 1)
+                        indices = rng.choice(len(fisher_ds), ADAPTIVE_SAMPLE_LIMIT, replace=False)
+                        fisher_ds = fisher_ds.select(indices)
 
-                        # [!!! 修复 2/3: 更新 client_state 并存入 cache !!!]
-                        client_state.update(F_client, theta_last)  # 此处 client_state 为空，被更新为 T=1 的状态
-                        per_task_cache[cid] = client_state  # 将包含 T=1 状态的 *完整对象* 存入 cache
+                    # 2. 分布式 DataLoader (所有进程都执行 !!!)
+                    # DistributedSampler 会根据当前 rank 自动分发属于它的数据切片
+                    fisher_sampler = torch.utils.data.distributed.DistributedSampler(
+                        fisher_ds, shuffle=False, drop_last=False
+                    )
+                    fisher_collator = collator_for(trained_model)
+                    fisher_loader = torch.utils.data.DataLoader(
+                        fisher_ds,
+                        batch_size=1,
+                        sampler=fisher_sampler,
+                        collate_fn=fisher_collator
+                    )
 
-                        # 清理 dataloader
-                        del fisher_dataloader
+                    # 3. 并行计算局部 Fisher (所有进程都执行 !!!)
+                    local_fisher_sum, local_count = compute_fisher_diag(trained_model, fisher_loader)
 
-                    try:
-                        del trained_model, name_to_param, delta, theta_last_cpu
-                        if _is_main():
-                            del F_client, theta_last
-                    except Exception:
-                        pass
+                    # 4. 使用 Accelerate 聚合结果 (所有进程都执行 !!!)
+                    # A. 聚合样本总数
+                    local_count_tensor = torch.tensor(local_count, device=trainer.accelerator.device)
+                    # reduce 是集合通信操作，所有进程必须同时到达这里
+                    total_count_tensor = trainer.accelerator.reduce(local_count_tensor, reduction="sum")
+                    total_samples = total_count_tensor.item()
+
+                    # B. 聚合 Fisher 矩阵 (所有进程都执行 !!!)
+                    sorted_keys = sorted(local_fisher_sum.keys())
+                    final_fisher = {}
+
+                    for name in sorted_keys:
+                        local_tensor = local_fisher_sum[name].to(trainer.accelerator.device)
+                        # reduce 是集合通信操作
+                        global_sum_tensor = trainer.accelerator.reduce(local_tensor, reduction="sum")
+
+                        # 计算平均值 (每个进程都算一份，虽然最后只有 Rank 0 用，但为了逻辑对称没问题)
+                        if total_samples > 0:
+                            avg_fisher = (global_sum_tensor / total_samples).cpu()
+                        else:
+                            avg_fisher = global_sum_tensor.cpu()
+
+                        final_fisher[name] = avg_fisher
+
+                    # 5. [仅主进程] 归一化 -> 更新状态 -> 存入 Cache
+                    # 这里才需要缩进
+                    if _is_main():
+                        # =========== [关键补丁] 手动执行 Min-Max 归一化 ===========
+                        all_values = torch.cat([f.flatten() for f in final_fisher.values()])
+                        x_min, x_max = all_values.min(), all_values.max()
+
+                        normalized_fisher = {}
+                        for k, v in final_fisher.items():
+                            if x_max - x_min > 1e-8:
+                                normalized_fisher[k] = (v - x_min) / (x_max - x_min)
+                            else:
+                                normalized_fisher[k] = torch.zeros_like(v)
+                        # ========================================================
+
+                        theta_last = {k: theta_last_cpu[k] for k in normalized_fisher.keys() if k in theta_last_cpu}
+
+                        client_state.update(normalized_fisher, theta_last)
+                        per_task_cache[cid] = client_state
+
+                        logger.info(
+                            f"Client {cid} [Adaptive Task 1]: State initialized (Normalized) and cached. Samples: {total_samples}")
+
+                    # 6. 清理资源 & 同步
+                    del fisher_loader, local_fisher_sum, final_fisher, fisher_sampler
+                    torch.cuda.empty_cache()
+                    # 必须等待 Rank 0 存完 Cache
+                    trainer.accelerator.wait_for_everyone()
+
                 else:
                     trainer.continual_state = client_state
                     trainer.comm_budget = fed_args.comm_budget
@@ -959,6 +1228,91 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
         wait_for_everyone()
 
+
+    if _is_main() and (method == "ewc" or method == "replay"):
+        # baseline_save_dir 在循环外已定义 (current_output_dir/baseline_states)
+        os.makedirs(baseline_save_dir, exist_ok=True)
+
+        # [EWC 保存逻辑重写]
+        if method == "ewc":
+            logger.info(f"Saving EWC states to {baseline_save_dir}...")
+
+            # 遍历所有客户端
+            for cid in range(fed_args.num_clients):
+
+                # 1. 获取旧状态 (Task T-1)
+                # 如果 client_ewc_states 是 None (Task 1)，则视为全空
+                old_state = {"fisher": None, "params": None}
+                if client_ewc_states is not None and cid in client_ewc_states:
+                    old_state = client_ewc_states[cid]
+
+                # 2. 获取当前任务的新状态 (Task T)
+                new_update = current_task_ewc_cache.get(cid, None)
+
+                # 3. 合并逻辑
+                final_fisher = None
+                final_params = None
+
+                # 如果该 Client 在本轮任务中从未被选中 (new_update is None)
+                # 则它没有学到新知识，保留旧的约束（或者你可以决定是否要衰减）
+                # 这里我们假设保留旧约束
+
+                if new_update is not None:
+                    # Client 参与了当前任务，更新状态
+                    curr_fisher = new_update["fisher"]
+                    curr_params = new_update["params"]
+
+                    # Fisher 累加: F_total = F_old + F_new
+                    if old_state["fisher"] is None:
+                        final_fisher = curr_fisher
+                    else:
+                        final_fisher = {}
+                        # 确保 keys 对齐 (LoRA 结构不变)
+                        for k in curr_fisher:
+                            if k in old_state["fisher"]:
+                                final_fisher[k] = old_state["fisher"][k] + curr_fisher[k]
+                            else:
+                                final_fisher[k] = curr_fisher[k]
+
+                    # Params 更新: θ* 更新为当前任务的最优解
+                    final_params = curr_params
+
+                else:
+                    # Client 未参与当前任务，保持原样
+                    final_fisher = old_state["fisher"]
+                    final_params = old_state["params"]
+
+                # 4. 保存到磁盘
+                if final_fisher is not None:
+                    save_dict = {"fisher": final_fisher, "params": final_params}
+                    torch.save(save_dict, os.path.join(baseline_save_dir, f"ewc_{cid}.pt"))
+
+            logger.info("EWC states saved successfully.")
+
+
+        elif method == "replay" and client_replay_buffers is not None:
+
+            logger.info(f"Saving Replay buffers to {baseline_save_dir}...")
+            # 遍历所有客户端
+            for cid in range(fed_args.num_clients):
+                # 1. 获取该 Client 在当前任务中的采样数据
+                new_data = current_task_replay_cache.get(cid, None)
+                # 2. 如果存在新数据，将其加入该 Client 的历史 Buffer 列表
+                if new_data is not None:
+                    client_replay_buffers[cid].append(new_data)
+                # 3. 保存到磁盘
+                # 注意：即使当前任务没被选中(new_data is None)，也需要把旧的 Buffer 保存下来传递给下一个任务
+                buffers = client_replay_buffers[cid]
+                if buffers:
+                    try:
+                        # 合并所有历史任务的 buffer (Task 1 + Task 2 + ... + Task T)
+                        full_replay_ds = concatenate_datasets(buffers)
+                        full_replay_ds.save_to_disk(os.path.join(baseline_save_dir, f"replay_{cid}"))
+                    except Exception as e:
+                        logger.error(f"Error saving replay buffer for client {cid}: {e}")
+            logger.info("Replay buffers saved successfully.")
+
+    wait_for_everyone()
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")

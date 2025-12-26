@@ -242,7 +242,7 @@ class AdaptiveAdamW(Optimizer):
                  # AdamW 超参
                  lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
                  # 你的 Adaptive 超参 (从 Trainer 传入)
-                 radius=5.0, sigma=0.0, tau=0.0, beta=10.0, alpha_ema=0.9,
+                 radius=1.0, sigma=0.0, tau=0.0, beta=10.0, alpha_ema=0.9,
                  eta_shrink=1.0, trust_radius_shrink=1e-3, beta_mul=1.0,
                  # Fisher 修正超参
                  fisher_floor_quantile=0.02, fisher_floor_min=1e-12,
@@ -491,6 +491,8 @@ class UIETrainer(Seq2SeqTrainer):
         comm_budget: int = 0,
         layer_costs: Dict[str, int] = None,
         accelerator: Accelerator = None,
+        ewc_fisher: Dict[str, torch.Tensor] = None,
+        ewc_params: Dict[str, torch.Tensor] = None,
         **kwargs,
     ):
         self.continual_state = kwargs.pop("state", None)  # 这里直接赋值给 continual_state
@@ -581,6 +583,16 @@ class UIETrainer(Seq2SeqTrainer):
         self.trust_radius_shrink = float(getattr(self.args, "trust_radius_shrink", 1e-3))
         self.beta_mul = float(getattr(self.args, "beta_mul", 1.0))
 
+        self.ewc_fisher = ewc_fisher
+        self.ewc_params = ewc_params
+        self.ewc_lambda = getattr(self.args, "ewc_lambda", 0.0)
+
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # 还原为只调用父类，不要在这里算 EWC
+        return super().compute_loss(model, inputs, return_outputs)
+
+
     def get_decay_parameter_names(self, model) -> List[str]:
         """
         Get all parameter names that weight decay will be applied to.
@@ -591,8 +603,8 @@ class UIETrainer(Seq2SeqTrainer):
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
-        复用 Seq2SeqTrainer 的 training_step，仅在“完成一个梯度累积周期”
-        且满足 logging_steps 时打印一次 loss，避免每个 micro-batch 都打 log。
+        1. 执行标准的前向+反向传播 (Super Class Logic)
+        2. [EWC核心修复] 在反向传播结束后，手动计算并叠加 EWC 梯度
         """
 
         # 1) 兼容 decoder-only（LLaMA）多出来的字段，防止 model(**inputs) 报错
@@ -611,6 +623,59 @@ class UIETrainer(Seq2SeqTrainer):
                 device=self.accelerator.device if hasattr(self, "accelerator") else None,
                 requires_grad=False,
             )
+
+        if self.args.method == "ewc" and getattr(self, "ewc_fisher", None) is not None:
+            ewc_lambda = getattr(self.args, "ewc_lambda", 0.0)
+
+            # 用于 Log 显示的 Loss 值 (仅记录，不参与反向传播)
+            ewc_loss_val = 0.0
+
+            # 使用 no_grad 确保不建立任何计算图，这是解决 DDP 报错的关键
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    # 去除 DDP 可能加上的 module. 前缀以匹配 key
+                    clean_name = name.replace("module.", "")
+
+                    if param.requires_grad and clean_name in self.ewc_fisher:
+                        # 确保 tensor 在同一设备
+                        f_val = self.ewc_fisher[clean_name].to(param.device)
+                        star_val = self.ewc_params[clean_name].to(param.device)
+
+                        # --- A. 计算梯度 ---
+                        # EWC Loss 公式: L = (lambda/2) * F * (theta - theta*)^2
+                        # 对 theta 求导: Grad = lambda * F * (theta - theta*)
+                        ewc_grad = ewc_lambda * f_val * (param.data - star_val)
+
+                        # --- B. 叠加梯度 ---
+                        # 直接加到现有的 Task Gradient 上
+                        if param.grad is not None:
+                            param.grad.add_(ewc_grad)
+
+                        # --- C. 计算 Loss 值用于打印 (可选) ---
+                        # 仅做记录，方便你看 Log 确认 EWC 生效了
+                        current_ewc_loss = (f_val * (param.data - star_val).pow(2)).sum()
+                        ewc_loss_val += current_ewc_loss.item()
+
+            # [Log] 打印调试信息 (仅主进程，且每 10 个 micro steps 打一次，避免刷屏)
+            if hasattr(self, "accelerator") and self.accelerator.is_main_process:
+                # 随便用个计数器判断一下，或者直接复用下面的 logging 逻辑
+                # 这里简单处理，每次调 training_step 都累加，取模打印
+                if not hasattr(self, "_ewc_log_step"): self._ewc_log_step = 0
+                self._ewc_log_step += 1
+                if self._ewc_log_step % 10 == 0:
+                    final_ewc_loss_display = (ewc_lambda / 2.0) * ewc_loss_val
+                    logger.info(f"[DEBUG EWC] Task Loss: {loss.item():.4f} | EWC Term: {final_ewc_loss_display:.4f}")
+
+            # 注意：我们不需要修改返回的 'loss' 变量，因为 backward 已经结束了。
+            # 修改返回的 loss 只会影响 Tensorboard 上的显示，不会影响训练。
+            # 如果你想在 Tensorboard 上看到总 loss，可以这样加（不影响梯度）：
+            loss += (ewc_lambda / 2.0) * ewc_loss_val
+
+        # ============================================================
+        # 4) 原有的 Logging 逻辑 (保持不变)
+        # ============================================================
+
+
 
         # 3) 只在主进程上做 logging
         if hasattr(self, "accelerator") and self.accelerator.is_main_process:
@@ -667,8 +732,8 @@ class UIETrainer(Seq2SeqTrainer):
 
 
 
-        if self.method == "lora_origin" or (self.method == "adaptive" and task_id == 1):
-            logger.info(f"[Task {task_id}] 调用标准 super().train() (lora_origin 或 task 1)")
+        if self.method in ["lora_origin", "ewc", "replay"] or (self.method == "adaptive" and task_id == 1):
+            logger.info(f"[Task {task_id}] Method '{self.method}': 调用标准 super().train()")
             return super().train(**kwargs)
 
         elif self.method == "adaptive" and task_id > 1:
@@ -1123,16 +1188,21 @@ class UIETrainer(Seq2SeqTrainer):
 
         generation_config = GenerationConfig(**gen_kwargs)
 
-        # 生成逻辑
-        if hasattr(self.model, "encoder") and self.model.encoder.main_input_name != self.model.main_input_name:
-            # [T5]
-            generation_inputs = inputs[self.model.encoder.main_input_name]
+
+        is_enc_dec = self.model.config.is_encoder_decoder
+
+        if is_enc_dec:
+            # [T5 / Encoder-Decoder]
+            # T5 需要 input_ids 作为 encoder 的输入
+            input_name = self.model.main_input_name if hasattr(self.model, "main_input_name") else "input_ids"
+            generation_inputs = inputs[input_name]
+
             generated_tokens = self.model.generate(
                 input_ids=generation_inputs,
                 generation_config=generation_config,
             )
         else:
-            # [Llama] 使用 input_ids_wo_label 进行生成
+            # [Llama / Decoder-only] 使用 input_ids_wo_label 进行生成
             input_ids_wo_label = inputs.get("input_ids_wo_label", inputs[self.model.main_input_name])
 
             generated_tokens = self.model.generate(
@@ -1140,10 +1210,12 @@ class UIETrainer(Seq2SeqTrainer):
                 generation_config=generation_config,
             )
 
-            # [截断] 别人代码里可能在 collator 处理了，或者这里处理
-            # 标准 AutoModel 生成会包含 input，必须截断
+            # [截断] 标准 Decoder-only 生成包含 input，必须截断
             input_len = input_ids_wo_label.shape[1]
             generated_tokens = generated_tokens[:, input_len:]
+
+
+
 
         # 计算 Loss (如果需要)
         # 在计算 Loss 前必须把 input_ids_wo_label 移除，否则标准模型会报错

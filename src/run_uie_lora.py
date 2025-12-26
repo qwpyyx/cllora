@@ -256,7 +256,16 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
         metadata={
             "help": "If True, select uploaded layers randomly within budget instead of using knapsack optimization."}
     )
+    ewc_lambda: float = field(
+        default=5000.0,  # 默认值根据经验设定，通常 LoRA 需要较大的正则化系数
+        metadata={"help": "EWC regularization coefficient."}
+    )
 
+    # [NEW] Replay 参数
+    replay_buffer_size: int = field(
+        default=20,
+        metadata={"help": "Number of samples to keep from previous tasks for experience replay."}
+    )
 
 @dataclass
 class FederatedArguments:

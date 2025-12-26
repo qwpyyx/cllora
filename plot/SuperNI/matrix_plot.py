@@ -5,11 +5,11 @@ import sys
 
 # --- 用户配置 ---
 # 请根据您的设置修改这些变量
-METHOD = "adaptive"
-LR = "1e-04"
+METHOD = "clora-baseolora"
+LR = "1e-05"
 seq = 'order_4_llama'
-BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/Longseq/{seq}/{METHOD}/outputs/{LR}/"
-# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/Longseq/{seq}/{METHOD}/outputs/{LR}/"
+# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/Longseq/{seq}/{METHOD}/outputs/{LR}/"
+BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/Longseq/{seq}/clora/outputs/{LR}/"
 METRIC_PREFIX = "predict_exact_match_for_"
 OUTPUT_EXCEL_FILE = f"cl_metrics_{seq}_{METHOD}_{LR}.xlsx"
 
