@@ -9,7 +9,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 port=$(shuf -i25000-30000 -n1)
-method=replay
+method=ewc
 lora_rank=8
 lamda_2=0
 lamda_1=0

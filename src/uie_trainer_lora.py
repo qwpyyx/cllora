@@ -46,15 +46,7 @@ except ImportError:
         # 兜底：如果没有安装 DeepSpeed 或版本太老
         def is_deepspeed_zero3_enabled():
             return False
-
-
-
-
-
-
-
-
-
+from lorm_utils import LoRMTracker
 # logger = logging.getLogger(__name__)
 from torch.optim.optimizer import Optimizer
 
@@ -247,6 +239,7 @@ class AdaptiveAdamW(Optimizer):
                  # Fisher 修正超参
                  fisher_floor_quantile=0.02, fisher_floor_min=1e-12,
                  fisher_floor_mix=0.7, precond_power=0.5,
+                 ablation_no_adaptive_lr=False,
                  # 内部状态 EMA 超参 (可选)
                  eta_scale_rho=0.1, eta_smin=0.1, eta_smax=10.0
                  ):
@@ -282,6 +275,8 @@ class AdaptiveAdamW(Optimizer):
         self.fisher_floor_mix = fisher_floor_mix
         self.precond_power = precond_power
 
+        # [新增] 存储消融标志
+        self.ablation_no_adaptive_lr = ablation_no_adaptive_lr
         # --------- 3. 用于缩放的内部状态 (可选) ---------
         self._eta_scale = {} # 这个仍然是 {p: float} 映射，开销很小
         self._eta_scale_rho = eta_scale_rho
@@ -302,8 +297,7 @@ class AdaptiveAdamW(Optimizer):
         debug_eta_sum = 0.0
         debug_eta_cnt = 0
 
-
-        # 遍历所有参数组 (例如，一组有 wd，一组没有 wd)
+        # 遍历所有参数组
         for group in self.param_groups:
             # AdamW 超参
             beta1, beta2 = group['betas']
@@ -324,17 +318,13 @@ class AdaptiveAdamW(Optimizer):
                 # 1. 初始化状态 (只在第一步执行)
                 if len(state) == 0:
                     state['step'] = 0
-                    # F_curr (EMA of g^2)
                     state['F_curr'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    # Adam 状态
                     state['adam_m'] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state['adam_v'] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
-                    # 历史状态 (从 __init__ 获取)
                     f_past_gpu = self.bar_F_tensors.get(p, torch.zeros_like(p))
                     theta_past_gpu = self.bar_theta_tensors.get(p, torch.zeros_like(p))
 
-                    # Adaptive 状态
                     hist_mean = torch.clamp(f_past_gpu.mean(), min=1e-12)
                     f_past_eff = f_past_gpu / hist_mean
 
@@ -360,17 +350,18 @@ class AdaptiveAdamW(Optimizer):
                 g2 = g_float * g_float
                 F_curr.mul_(self.alpha_ema).add_(g2, alpha=1.0 - self.alpha_ema)
 
+                # gongcheng
                 F_hat = F_curr / (1.0 - (self.alpha_ema ** t) + eps)
                 scale = 1.0
                 curr_mean = F_hat.mean()
-                if curr_mean > 0: # f_past_eff.mean() 约等于 1
+                if curr_mean > 0:
                     prev_scale = self._eta_scale.get(p, 1.0)
-                    ratio = torch.clamp(curr_mean, min=1e-5) # 假设 hist_mean=1
-                    scale = (1 - self._eta_scale_rho) * prev_scale + self._eta_scale_rho * ratio.item() # .item() 开销小
+                    ratio = torch.clamp(curr_mean, min=1e-5)
+                    scale = (1 - self._eta_scale_rho) * prev_scale + self._eta_scale_rho * ratio.item()
                     scale = max(self._eta_smin, min(self._eta_smax, scale))
                     self._eta_scale[p] = scale
 
-                # [Fisher 修正 (softfloor)]
+                # [Fisher 修正]
                 floor_min = torch.as_tensor(self.fisher_floor_min, device=F_hat.device, dtype=F_hat.dtype)
                 pos = F_hat[F_hat > 0]
                 if pos.numel() > 0:
@@ -384,17 +375,17 @@ class AdaptiveAdamW(Optimizer):
                 preconditioner = (F_soft.pow(self.precond_power)) / scale
                 v = g_float / (preconditioner + eps)
 
-                # [v 缩放] (保留你的逻辑)
+                # [v 缩放]
                 mean_g_abs = torch.mean(torch.abs(g_float))
                 median_v_abs = torch.median(torch.abs(v))
                 scale_v = mean_g_abs / (median_v_abs + eps)
                 v_scaled = v * scale_v
-                v_alg = v_scaled  # 你的代码中 v_alg 和 v_scaled 相同
+                v_alg = v_scaled
 
-                # --- eta (自适应步长) ---
+                # --- eta (自适应步长) 计算 ---
                 delta_theta = p.detach() - theta_past_gpu
 
-                v2 = (v_alg * v_alg)  # (v_alg 已经是 float)
+                v2 = (v_alg * v_alg)
                 cap = torch.quantile(v2, 0.99)
                 v2_clip = torch.clamp(v2, max=cap)
 
@@ -403,7 +394,8 @@ class AdaptiveAdamW(Optimizer):
 
                 Delta_local = self.radius_sq - r2
 
-                eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)  # 默认为 0
+                # 默认 eta 为 0
+                eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
 
                 if Delta_local > self.tau:
                     a_safe = torch.clamp(a_local, min=v2_clip.mean() * v2_clip.numel() * 1e-4)
@@ -424,18 +416,28 @@ class AdaptiveAdamW(Optimizer):
                     if torch.isnan(eta):
                         eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
 
-                eta_scalar = float(eta.detach())
+                # ==================== [消融实验逻辑: 确定 Step Size] ====================
+                if self.ablation_no_adaptive_lr:
+                    # 如果开启消融：强制使用 AdamW 的固定学习率
+                    step_size = torch.tensor(lr_cap, device=p.device, dtype=p.dtype)
+                else:
+                    # 正常模式：使用自适应计算出的 eta
+                    step_size = eta
+                # ======================================================================
+
+                # 记录实际使用的步长用于日志
+                eta_scalar = float(step_size.detach())
+                state['eta_last'] = eta_scalar
+
+                # 统计
                 debug_eta_sum += eta_scalar
                 debug_eta_cnt += 1
                 if debug_eta_min is None or eta_scalar < debug_eta_min:
                     debug_eta_min = eta_scalar
                 if debug_eta_max is None or eta_scalar > debug_eta_max:
                     debug_eta_max = eta_scalar
-                # 把最后一次 eta 存进 state，方便 Trainer 里离线分析
-                state['eta_last'] = eta_scalar
 
-
-                    # --- AdamW 状态更新 (在 v_scaled 上) ---
+                # --- AdamW 状态更新 (在 v_scaled 上) ---
                 adam_m.mul_(beta1).add_(v_scaled, alpha=1.0 - beta1)
                 adam_v.mul_(beta2).addcmul_(v_scaled, v_scaled, value=1.0 - beta2)
 
@@ -444,18 +446,23 @@ class AdaptiveAdamW(Optimizer):
                 adam_dir = m_hat / (torch.sqrt(v_hat) + eps)
 
                 # --- 状态更新 (B_round, r2) ---
+                # [关键] 所有的计算全部基于 step_size
                 Q_alg = (g_float * v_alg).sum()
-                gain_local = torch.clamp((eta - 0.5 * eta.pow(2)) * Q_alg, min=0.0)
+
+                # 计算收益：如果用 step_size 走这一步，收益是多少
+                gain_local = torch.clamp((step_size - 0.5 * step_size.pow(2)) * Q_alg, min=0.0)
                 state['B_round'] = state['B_round'] + gain_local
-                state['r2'] = r2 - 2.0 * eta * b_local + (eta.pow(2)) * a_local
+
+                # 更新半径
+                state['r2'] = r2 - 2.0 * step_size * b_local + (step_size.pow(2)) * a_local
 
                 # --------- 5. [执行参数更新] ---------
                 # Decoupled Weight Decay
                 if wd > 0.0:
-                    p.add_(p, alpha=-eta * wd)  # p = p - eta * wd * p
+                    p.add_(p, alpha=-step_size * wd)  # 使用 step_size
 
                 # AdamW 步长 (使用 adam_dir)
-                p.add_(adam_dir, alpha=-eta)  # p = p - eta * adam_dir
+                p.add_(adam_dir, alpha=-step_size)  # 使用 step_size
 
         if debug_eta_cnt > 0:
             try:
@@ -463,7 +470,6 @@ class AdaptiveAdamW(Optimizer):
             except Exception:
                 is_main = True
 
-            # 只打印前若干个 step，避免日志爆炸，你可以按需改这个阈值
             if is_main and self._step_idx <= 20:
                 eta_mean = debug_eta_sum / debug_eta_cnt
                 logger.info(
@@ -471,7 +477,6 @@ class AdaptiveAdamW(Optimizer):
                     f"eta_min={debug_eta_min:.3e}, eta_max={debug_eta_max:.3e}, eta_mean={eta_mean:.3e}, "
                     f"count={debug_eta_cnt}"
                 )
-
 
         return loss
 
@@ -493,6 +498,7 @@ class UIETrainer(Seq2SeqTrainer):
         accelerator: Accelerator = None,
         ewc_fisher: Dict[str, torch.Tensor] = None,
         ewc_params: Dict[str, torch.Tensor] = None,
+        gem_dataset=None,
         **kwargs,
     ):
         self.continual_state = kwargs.pop("state", None)  # 这里直接赋值给 continual_state
@@ -587,6 +593,43 @@ class UIETrainer(Seq2SeqTrainer):
         self.ewc_params = ewc_params
         self.ewc_lambda = getattr(self.args, "ewc_lambda", 0.0)
 
+        # [Safety Check] 仅在 GEM 模式下初始化相关组件
+        self.gem_dataset = gem_dataset
+        self.gem_loader = None
+        self.gem_iterator = None
+
+        # 严格隔离：只有明确指定 method 为 gem 时才激活
+        if self.args.method == "gem" and self.gem_dataset is not None:
+            self.init_gem_loader()
+
+    def init_gem_loader(self):
+        """A-GEM 专用：初始化记忆数据加载器"""
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"🛠️ [Trainer Internal] Initializing GEM DataLoader with batch size {self.args.per_device_train_batch_size}...")
+
+        sampler = RandomSampler(self.gem_dataset, replacement=True)
+        # 使用更小的 batch size 以减少显存开销，或者与训练 batch size 一致
+        bs = self.args.per_device_train_batch_size
+
+        self.gem_loader = DataLoader(
+            self.gem_dataset,
+            batch_size=bs,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            drop_last=False
+        )
+        self.gem_iterator = iter(self.gem_loader)
+
+    def get_gem_batch(self):
+        try:
+            batch = next(self.gem_iterator)
+        except StopIteration:
+            self.gem_iterator = iter(self.gem_loader)
+            batch = next(self.gem_iterator)
+        return self._prepare_inputs(batch)
+
+
 
     def compute_loss(self, model, inputs, return_outputs=False):
         # 还原为只调用父类，不要在这里算 EWC
@@ -623,6 +666,70 @@ class UIETrainer(Seq2SeqTrainer):
                 device=self.accelerator.device if hasattr(self, "accelerator") else None,
                 requires_grad=False,
             )
+
+        if self.args.method == "gem" and self.gem_loader is not None:
+            # (A) 筛选可训练参数 (LoRA)
+            trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
+            if len(trainable_params) > 0:
+                # (B) 备份当前任务梯度 (g_curr)
+                # 必须 clone，因为后续计算参考梯度会清空 grad
+                grad_curr = []
+                for p in trainable_params:
+                    if p.grad is not None:
+                        grad_curr.append(p.grad.detach().clone())
+                    else:
+                        grad_curr.append(torch.zeros_like(p))
+
+                # (C) 清空梯度，计算记忆数据的梯度 (g_ref)
+                model.zero_grad()
+                gem_batch = self.get_gem_batch()
+
+                if "input_ids_wo_label" in gem_batch:
+                    gem_batch.pop("input_ids_wo_label")
+
+                # 使用上下文管理器确保混合精度(AMP)等配置正确
+                with self.compute_loss_context_manager():
+                    loss_gem = self.compute_loss(model, gem_batch)
+
+                if self.args.n_gpu > 1:
+                    loss_gem = loss_gem.mean()
+
+                # 反向传播 (A-GEM 参考梯度)
+                if hasattr(self, "accelerator"):
+                    self.accelerator.backward(loss_gem)
+                else:
+                    loss_gem.backward()
+
+                # (D) 提取参考梯度 g_ref
+                grad_ref = []
+                for p in trainable_params:
+                    if p.grad is not None:
+                        grad_ref.append(p.grad.detach().clone())
+                    else:
+                        grad_ref.append(torch.zeros_like(p))
+
+                # (E) 恢复 g_curr 到 p.grad (准备原地修改)
+                model.zero_grad()
+                for p, g_c in zip(trainable_params, grad_curr):
+                    if p.grad is None:
+                        p.grad = g_c
+                    else:
+                        p.grad.copy_(g_c)
+
+                # (F) 投影计算 (Projection)
+                # dot = g_curr · g_ref
+                dot_prod = sum(torch.sum(gc * gr) for gc, gr in zip(grad_curr, grad_ref))
+
+                # 只有当方向冲突 (点积 < 0) 时才修正
+                if dot_prod < 0:
+                    ref_mag = sum(torch.sum(gr * gr) for gr in grad_ref)
+                    # g_new = g_curr - (dot / mag) * g_ref
+                    scale = dot_prod / (ref_mag + 1e-12)
+
+                    with torch.no_grad():
+                        for p, gr in zip(trainable_params, grad_ref):
+                            p.grad.add_(gr, alpha=-scale)
+
 
         if self.args.method == "ewc" and getattr(self, "ewc_fisher", None) is not None:
             ewc_lambda = getattr(self.args, "ewc_lambda", 0.0)
@@ -730,9 +837,49 @@ class UIETrainer(Seq2SeqTrainer):
         **kwargs,
     ):  # type: ignore[override]
 
+        if self.method == "lorm":
+            # 1. 正常训练 (Standard SGD/AdamW)
+            # 这里的 train 只是更新本轮“未冻结”的参数 (A 或 B)
+            if self.accelerator.is_main_process:
+                logger.info(f"[Client {cid}] LoRM: Running standard training...")
+
+            train_output = super().train(**kwargs)
+
+            # 2. Post-Hoc Gram Matrix Computation
+            # 训练结束后，跑一遍数据计算 Gram 矩阵
+            if self.accelerator.is_main_process:
+                logger.info(f"[Client {cid}] LoRM: Computing Gram matrices...")
+
+            tracker = LoRMTracker(self.model, self.accelerator.device)
+            tracker.register_hooks()  # 只 Hook lora_A 的输入
+
+            train_dataloader = self.get_train_dataloader()
+            self.model.eval()
+
+            with torch.no_grad():
+                for step, inputs in enumerate(train_dataloader):
+                    inputs = self._prepare_inputs(inputs)
+                    # 移除不兼容字段
+                    if "input_ids_wo_label" in inputs:
+                        inputs.pop("input_ids_wo_label", None)
+
+                    # 前向传播触发 Hook
+                    try:
+                        self.model(**inputs)
+                    except Exception:
+                        pass  # 只要 Hook 触发即可，忽略 Loss 计算错误
+
+            # 保存 Grams 到 Trainer 实例，供联邦聚合使用
+            self.lorm_grams = tracker.get_grams()
+            tracker.remove_hooks()
+
+            if self.accelerator.is_main_process:
+                logger.info(f"[Client {cid}] LoRM: Grams computed. Count: {len(self.lorm_grams)}")
+
+            return train_output
 
 
-        if self.method in ["lora_origin", "ewc", "replay"] or (self.method == "adaptive" and task_id == 1):
+        if self.method in ["lora_origin", "ewc", "replay", "gem"] or (self.method == "adaptive" and task_id == 1):
             logger.info(f"[Task {task_id}] Method '{self.method}': 调用标准 super().train()")
             return super().train(**kwargs)
 
@@ -805,7 +952,8 @@ class UIETrainer(Seq2SeqTrainer):
                 fisher_floor_quantile=float(getattr(self.args, "fisher_floor_quantile", 0.02)),
                 fisher_floor_min=float(getattr(self.args, "fisher_floor_min", 1e-12)),
                 fisher_floor_mix=float(getattr(self.args, "fisher_floor_mix", 0.7)),
-                precond_power=float(getattr(self.args, "precond_power", 0.5))
+                precond_power=float(getattr(self.args, "precond_power", 0.5)),
+                ablation_no_adaptive_lr=getattr(self.args, "ablation_no_adaptive_lr", False)
             )
 
             self.optimizer = self.accelerator.prepare(self.optimizer)
@@ -1189,20 +1337,18 @@ class UIETrainer(Seq2SeqTrainer):
         generation_config = GenerationConfig(**gen_kwargs)
 
 
-        is_enc_dec = self.model.config.is_encoder_decoder
+        is_enc_dec = bool(getattr(model.config, "is_encoder_decoder", False))
 
+        # 生成逻辑
         if is_enc_dec:
-            # [T5 / Encoder-Decoder]
-            # T5 需要 input_ids 作为 encoder 的输入
-            input_name = self.model.main_input_name if hasattr(self.model, "main_input_name") else "input_ids"
-            generation_inputs = inputs[input_name]
-
+            # [T5]
+            generation_inputs = inputs[self.model.encoder.main_input_name]
             generated_tokens = self.model.generate(
                 input_ids=generation_inputs,
                 generation_config=generation_config,
             )
         else:
-            # [Llama / Decoder-only] 使用 input_ids_wo_label 进行生成
+            # [Llama] 使用 input_ids_wo_label 进行生成
             input_ids_wo_label = inputs.get("input_ids_wo_label", inputs[self.model.main_input_name])
 
             generated_tokens = self.model.generate(
@@ -1210,7 +1356,8 @@ class UIETrainer(Seq2SeqTrainer):
                 generation_config=generation_config,
             )
 
-            # [截断] 标准 Decoder-only 生成包含 input，必须截断
+            # [截断] 别人代码里可能在 collator 处理了，或者这里处理
+            # 标准 AutoModel 生成会包含 input，必须截断
             input_len = input_ids_wo_label.shape[1]
             generated_tokens = generated_tokens[:, input_len:]
 

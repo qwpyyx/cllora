@@ -256,6 +256,14 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
         metadata={
             "help": "If True, select uploaded layers randomly within budget instead of using knapsack optimization."}
     )
+
+    # [新增] 消融实验开关：禁用自适应学习率 (Step 2)，但在 Adaptive 方法下仍计算收益供 Step 3 使用
+    ablation_no_adaptive_lr: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, use fixed learning rate (AdamW behavior) but keep calculating B_round for Knapsack."}
+    )
+
     ewc_lambda: float = field(
         default=5000.0,  # 默认值根据经验设定，通常 LoRA 需要较大的正则化系数
         metadata={"help": "EWC regularization coefficient."}
@@ -263,8 +271,14 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
 
     # [NEW] Replay 参数
     replay_buffer_size: int = field(
-        default=20,
+        default=10,
         metadata={"help": "Number of samples to keep from previous tasks for experience replay."}
+    )
+
+    # # [NEW] A-GEM 参数
+    gem_gamma: float = field(
+        default=0.5,
+        metadata={"help": "Margin for GEM projection (usually 0.5). Only used when method='gem'."}
     )
 
 @dataclass

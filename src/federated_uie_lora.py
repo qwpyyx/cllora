@@ -36,6 +36,10 @@ from transformers import (
     GenerationConfig
 )
 from datasets import concatenate_datasets
+from lorm_utils import lorm_aggregate, LormGlobalState
+
+
+
 os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger("federated_training")
 CURRENT_DIR = os.path.dirname(__file__)
@@ -524,6 +528,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     # compare(client_datasets,fed_args.dirichlet_alpha)
     model, tokenizer = build_model_and_tokenizer(model_args)
 
+
     # [修改] 集中管理 Gradient Checkpointing 逻辑
     if training_args.gradient_checkpointing:
         logger.info("Gradient Checkpointing enabled.")
@@ -694,6 +699,24 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     client_replay_buffers = None
     baseline_save_dir = os.path.join(current_output_dir, "baseline_states")
 
+    lorm_global_state = None
+    if method == "lorm":
+        lorm_global_state = LormGlobalState()
+        if prev_task_dir:
+            prev_lorm_path = os.path.join(prev_task_dir, "baseline_states", "lorm_global.pt")
+            lorm_global_state.load(prev_lorm_path)
+
+    if method == "lorm" and prev_task_dir:
+        prev_lorm_path = os.path.join(prev_task_dir, "baseline_states", "lorm_global.pt")
+        if os.path.exists(prev_lorm_path):
+            logger.info(f"[LoRM] Recovering Backbone from {prev_lorm_path}...")
+            state = LormGlobalState()
+            state.load(prev_lorm_path)
+            # 这会将历史累积的 DeltaW 加载到当前新初始化的 Backbone 中
+            state.merge_and_apply(model, device=device)
+
+
+
     if method == "ewc":
         client_ewc_states = defaultdict(lambda: {"fisher": None, "params": None})
         # 如果找到了上个任务目录，尝试加载 EWC 状态
@@ -708,7 +731,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             else:
                 if _is_main(): logger.warning(f"Previous task found but no baseline_states dir at {prev_baseline_dir}")
 
-    elif method == "replay":
+
+    elif method in ["replay", "gem"]:
         client_replay_buffers = defaultdict(list)
         # 如果找到了上个任务目录，尝试加载 Replay Buffer
         if prev_task_dir:
@@ -797,7 +821,23 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         fed_args.federated_seed,
         )
 
+        if method == "lorm":
+            # 偶数轮 (0, 2...) 训练 B，奇数轮 (1, 3...) 训练 A
+            target_matrix = "B" if (rnd % 2 == 0) else "A"
+            freeze_target = "A" if target_matrix == "B" else "B"
 
+            if _is_main():
+                logger.info(f"Global Round {rnd + 1} [LoRM]: Training '{target_matrix}', Freezing '{freeze_target}'")
+
+            # 设置 Global Model 的参数冻结状态 (作为 Client 的初始状态)
+            for n, p in global_model.named_parameters():
+                if "lora_" + freeze_target in n:
+                    p.requires_grad = False
+                elif "lora_" + target_matrix in n:
+                    p.requires_grad = True
+
+            # 初始化收集列表
+            lorm_client_updates = []
 
         if _is_main():
             logger.info(f"Selected client {selected}")
@@ -836,7 +876,117 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             if hasattr(trainer, "adam_states"):
                 trainer.adam_states = {}
 
-            if method in ["lora_origin", "ewc", "replay"]:
+            if method == "lorm":
+                # 1. 训练前准备
+                if _is_main():
+                    logger.info(f"Client {cid}: Starting training (Method: {method})...")
+
+                # 设置冻结状态
+                for n, p in trainer.model.named_parameters():
+                    if "lora_" + freeze_target in n:
+                        p.requires_grad = False
+                    elif "lora_" + target_matrix in n:
+                        p.requires_grad = True
+
+                trainer.optimizer = None
+                trainer.lr_scheduler = None
+
+                # 2. 标准训练 (自动触发 Gram 计算)
+                trainer.train(task_id=data_args.task, cid=cid)
+
+                # 3. [后处理] 提取全量参数 & Grams
+                model_to_save = _trainer_unwrap_model(trainer)
+
+                # 只取本轮训练的目标矩阵 (A 或 B)
+                # 类似于你 EWC 取 params
+                client_params = {
+                    k: v.detach().cpu().clone()
+                    for k, v in model_to_save.state_dict().items()
+                    if "lora" in k and target_matrix in k
+                }
+                client_grams = getattr(trainer, "lorm_grams", {})
+
+                # 4. [通信控制] 稀疏化筛选
+                if fed_args.comm_budget is not None and fed_args.comm_budget > 0:
+
+                    # 准备 Cost 字典 (Parameter + Gram)
+                    # 我们需要手动构建这个 layer_costs，因为 select_layers_* 函数只认 params
+                    # 但 LoRM 的 Cost 是 Param + Gram
+
+                    lorm_layer_costs = {}
+                    candidate_keys = list(client_params.keys())
+
+                    for k in candidate_keys:
+                        # 基础 Cost: 参数本身
+                        cost = calculate_layer_packet_cost(client_params[k])
+
+                        # 额外 Cost: 对应的 Gram
+                        layer_prefix = k.split("lora_")[0]
+                        for g_key, g_val in client_grams.items():
+                            if layer_prefix in g_key:
+                                cost += calculate_layer_packet_cost(g_val)
+                                break
+                        lorm_layer_costs[k] = cost
+
+                    # 调用你的通用筛选函数
+                    selected_layers = set()
+                    selection_cost = 0
+
+                    if training_args.random_layer_selection:
+                        # Random Selection (完全复用你的逻辑)
+                        seed = fed_args.federated_seed + rnd + cid
+                        # 注意：select_layers_random 的第一个参数通常是 key 列表
+                        selected_layers, selection_cost = select_layers_random(
+                            candidate_keys, lorm_layer_costs, fed_args.comm_budget, seed
+                        )
+                        if _is_main():
+                            logger.info(
+                                f"Client {cid} [LoRM Random]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+
+                    else:
+                        # Top-K (Norm-based)
+                        # 注意：select_layers_topk 通常接受 (delta, costs)
+                        # 这里我们传 (client_params, costs)，因为它会算 value 的 norm
+                        selected_layers, selection_cost = select_layers_topk(
+                            client_params, lorm_layer_costs, fed_args.comm_budget
+                        )
+                        if _is_main():
+                            logger.info(
+                                f"Client {cid} [LoRM Top-K]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+
+                    # 5. [执行稀疏化] 剔除未选中的层
+                    # 区别于 FedAvg 的 Mask(置0)，这里直接删除 Key
+                    keys_to_drop = [k for k in client_params.keys() if k not in selected_layers]
+                    for k in keys_to_drop:
+                        del client_params[k]
+
+                    # Gram 矩阵也要对应筛选
+                    grams_to_keep = {}
+                    for k in selected_layers:
+                        layer_prefix = k.split("lora_")[0]
+                        for g_key, g_val in client_grams.items():
+                            if layer_prefix in g_key:
+                                grams_to_keep[g_key] = g_val
+                                break
+                    client_grams = grams_to_keep
+
+                # 5. 存入队列 (等待聚合)
+                lorm_client_updates.append({
+                    "state_dict": client_params,
+                    "grams": client_grams
+                })
+
+                # 显式清理
+                try:
+                    del model_to_save
+                except:
+                    pass
+
+                continue
+
+
+
+            if method in ["lora_origin", "ewc", "replay", "gem"]:
                 if _is_main():
                     logger.info(f"Client {cid}: Starting training (lora_origin)...")
 
@@ -855,6 +1005,25 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     else:
                         if _is_main(): logger.info(
                             f"Client {cid} [Replay]: Buffer empty, training on current task only.")
+
+                elif method == "gem" and client_replay_buffers is not None:
+                    if len(client_replay_buffers[cid]) > 0:
+                        gem_memory_ds = concatenate_datasets(client_replay_buffers[cid])
+                        # GEM 核心：独立设置 gem_dataset
+                        trainer.gem_dataset = gem_memory_ds
+                        trainer.init_gem_loader()  # <--- 手动触发 Loader 初始化
+                        if _is_main():
+                            logger.info(f"✅ Client {cid} [GEM]: Loaded memory constraint. Size: {len(gem_memory_ds)}")
+                    else:
+                        # 确保清理状态
+                        trainer.gem_dataset = None
+                        trainer.gem_loader = None
+                        if _is_main():
+                            logger.info(f"⚠️ Client {cid} [GEM]: Memory empty (Normal for Task 1). Running standard training.")
+                else:
+                    # 确保 GEM 状态被清理，防止污染其他算法
+                    trainer.gem_dataset = None
+                    trainer.gem_loader = None
 
                 # --- [EWC] 注入状态: 设置 Fisher 和 Theta_star ---
                 if method == "ewc" and client_ewc_states is not None:
@@ -962,7 +1131,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     trainer.accelerator.wait_for_everyone()
 
                 # --- [Replay] 后处理: 采样并存入 Buffer ---
-                if method == "replay" and client_replay_buffers is not None:
+                if method in ["replay", "gem"] and client_replay_buffers is not None:
                     current_ds = client_datasets[cid]
                     buffer_size = training_args.replay_buffer_size
 
@@ -982,7 +1151,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     current_task_replay_cache[cid] = sampled_ds
 
                     if _is_main():
-                        logger.info(f"Client {cid} [Replay]: Cached {len(sampled_ds)} examples for current task.")
+                        logger.info(f"Client {cid} [{method.upper()}]: Cached {len(sampled_ds)} examples for next task.")
 
 
                 name_to_param = dict(trained_model.named_parameters())
@@ -1191,11 +1360,77 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             client_selection_tracker[cid]['last_round'] = rnd
             current_task_selected_clients.add(cid)
 
-        for k in lora_keys:
-            mu = aggregated[k] / max(total, 1)
-            global_state_cpu[k] = global_state_cpu[k] - mu
+        if method == "lorm" and len(lorm_client_updates) > 0:
+            if _is_main():
+                logger.info(f"[LoRM] Aggregating {target_matrix} Matrix (Spatial)...")
 
-        global_model.load_state_dict(global_state_cpu, strict=False)
+                # 1. 空间聚合 (Spatial Aggregation): 合并 Client 参数到 Global Model
+                # 这一步让 Global Model 在当前任务上性能最优
+                new_state = lorm_aggregate(
+                    lorm_client_updates,
+                    global_model,
+                    target_matrix=target_matrix,
+                    device=device
+                )
+                global_model.load_state_dict(new_state, strict=False)
+
+                # 同步 CPU 状态供下轮分发
+                global_state_cpu = {
+                    k: v.cpu() for k, v in global_model.state_dict().items()
+                    if "lora" in k
+                }
+
+                # 2. 时间聚合 (Temporal Aggregation): 更新全局历史记忆
+                # [关键] 必须在最后一轮 (Last Round) 执行，否则数据就被 del 了
+                if rnd == fed_args.global_rounds - 1:
+                    logger.info("[LoRM] End of Task: Updating Global History (Temporal)...")
+
+                    # (A) 收集本任务的 Gram 矩阵统计量
+                    # 我们使用最后一轮所有参与 Client 的 Gram 矩阵之和作为本任务数据的近似
+                    task_grams = {}
+                    for client in lorm_client_updates:
+                        for k, g in client['grams'].items():
+                            # 累加到 CPU 避免显存溢出
+                            if k not in task_grams:
+                                task_grams[k] = g.cpu()
+                            else:
+                                task_grams[k] += g.cpu()
+
+                    # (B) 更新全局状态 (LormGlobalState)
+                    # 这会计算 DeltaW = B*A，并累积 Sum(DeltaW * G) 和 Sum(G)
+                    lorm_global_state.update(global_model, task_grams, device=device)
+
+
+
+                    # (D) 保存状态到磁盘 (供下一个 Task 加载)
+                    # 路径: .../outputs/task_id/baseline_states/lorm_global.pt
+                    os.makedirs(baseline_save_dir, exist_ok=True)
+                    save_path = os.path.join(baseline_save_dir, "lorm_global.pt")
+                    lorm_global_state.save(save_path)
+                    logger.info(f"[LoRM] Global state saved to {save_path}")
+
+            # 等待所有进程完成
+            wait_for_everyone()
+
+            # 清理内存 (这也是为什么不能在循环外做的原因)
+            del lorm_client_updates
+            torch.cuda.empty_cache()
+
+        if method != "lorm":
+            for k in lora_keys:
+                mu = aggregated[k] / max(total, 1)
+                global_state_cpu[k] = global_state_cpu[k] - mu
+
+            global_model.load_state_dict(global_state_cpu, strict=False)
+
+
+
+
+        # for k in lora_keys:
+        #     mu = aggregated[k] / max(total, 1)
+        #     global_state_cpu[k] = global_state_cpu[k] - mu
+        #
+        # global_model.load_state_dict(global_state_cpu, strict=False)
 
         wait_for_everyone()
 
@@ -1229,7 +1464,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         wait_for_everyone()
 
 
-    if _is_main() and (method == "ewc" or method == "replay"):
+    if _is_main() and (method == "ewc" or method == "replay" or method == "gem"):
         # baseline_save_dir 在循环外已定义 (current_output_dir/baseline_states)
         os.makedirs(baseline_save_dir, exist_ok=True)
 
@@ -1290,9 +1525,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             logger.info("EWC states saved successfully.")
 
 
-        elif method == "replay" and client_replay_buffers is not None:
 
-            logger.info(f"Saving Replay buffers to {baseline_save_dir}...")
+        elif method in ["replay", "gem"] and client_replay_buffers is not None:
+
+            logger.info(f"Saving {method.upper()} buffers to {baseline_save_dir}...")
             # 遍历所有客户端
             for cid in range(fed_args.num_clients):
                 # 1. 获取该 Client 在当前任务中的采样数据
@@ -1309,10 +1545,13 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         full_replay_ds = concatenate_datasets(buffers)
                         full_replay_ds.save_to_disk(os.path.join(baseline_save_dir, f"replay_{cid}"))
                     except Exception as e:
-                        logger.error(f"Error saving replay buffer for client {cid}: {e}")
-            logger.info("Replay buffers saved successfully.")
+                        logger.error(f"Error saving buffer for client {cid}: {e}")
+            logger.info(f"{method.upper()} buffers saved successfully.")
 
     wait_for_everyone()
+
+
+
 
     # ========== 保存 Adapter ==========
     peft_model_id = os.path.join(training_args.output_dir, "adapter")
