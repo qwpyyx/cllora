@@ -231,13 +231,12 @@ def build_model_and_tokenizer(model_args):
             print("[Build Model] Using float16 for Llama.")
 
         # 2. Flash Attention 2 加速 (如果安装了)
-        if model_args.ues_flash_attention:
-            try:
-                import flash_attn
-                config._attn_implementation = "flash_attention_2"
-                print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
-            except ImportError:
-                print("[Build Model] Flash Attention 2 not found, using default attention.")
+        try:
+            import flash_attn
+            config._attn_implementation = "flash_attention_2"
+            print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
+        except ImportError:
+            print("[Build Model] Flash Attention 2 not found, using default attention.")
 
     # --------- 4) 加载模型 ----------
     if is_llama:

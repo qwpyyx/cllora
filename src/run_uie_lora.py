@@ -124,6 +124,12 @@ class ModelArguments:
         metadata={"help": "Whether to use a single LoRA configuration for all tasks (baseline LoRA)."}
     )
 
+    ues_flash_attention: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, ues flash attention for llama model."}
+    )
+
 
 @dataclass
 class DataTrainingArguments:
@@ -280,6 +286,8 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
         default=0.5,
         metadata={"help": "Margin for GEM projection (usually 0.5). Only used when method='gem'."}
     )
+
+
 
 @dataclass
 class FederatedArguments:
