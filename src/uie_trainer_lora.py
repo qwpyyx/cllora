@@ -583,6 +583,7 @@ class UIETrainer(Seq2SeqTrainer):
         self.deepspeed_engine = None
         self.lambda_conf = 1.0  # 可选：背包里的 λ
         self.method = self.args.method
+        self.lorm_target_matrix = None
         self._force_sgd = False
         self.fisher_floor = getattr(self.args, "fisher_floor", 1e-5)
         self.eta_shrink = float(getattr(self.args, "eta_shrink", 1.0))
@@ -659,7 +660,20 @@ class UIETrainer(Seq2SeqTrainer):
         # 2) 交给父类做真正的前向 + 反向（包括 Deepspeed / Accelerate 逻辑）
         try:
             loss = super().training_step(model, inputs)
-        except Exception as exc:  # 防御性兜底，避免训练直接崩溃
+        except Exception as exc:
+            msg = str(exc)
+
+            # 仅 LoRM：遇到 DDP reducer 级别错误不要吞（吞了会导致各 rank 状态不一致，后续“随机炸”）
+            if self.args.method == "lorm" and any(
+                    k in msg for k in [
+                        "Expected to mark a variable ready only once",
+                        "INTERNAL ASSERT FAILED",
+                        "unmarked_param_indices",
+                    ]
+            ):
+                logger.exception("[LoRM][DDP] Fatal error in training_step, re-raising.")
+                raise
+
             logger.error(f"training_step 错误: {exc}")
             return torch.tensor(
                 0.0,
@@ -829,6 +843,66 @@ class UIETrainer(Seq2SeqTrainer):
     def _pad_across_processes(self, tensor, pad_index=-100):
         return self.accelerator.pad_across_processes(tensor, dim=1, pad_index=pad_index)
 
+    def create_optimizer(self):
+        """
+        仅对 LoRM 生效：通过 optimizer 过滤参数，实现“只更新 lora_A 或只更新 lora_B”。
+        其它方法完全走 Transformers 的默认逻辑（super().create_optimizer）。
+        """
+        # 非 LoRM：保持完全原样
+        if getattr(self, "method", None) != "lorm":
+            return super().create_optimizer()
+
+        # 已创建过就直接复用
+        if self.optimizer is not None:
+            return self.optimizer
+
+        target = getattr(self, "lorm_target_matrix", None)
+        if target not in ("A", "B"):
+            logger.warning("[LoRM] lorm_target_matrix 未设置，回退到 super().create_optimizer()")
+            return super().create_optimizer()
+
+        decay_params = []
+        nodecay_params = []
+
+        for name, param in self.model.named_parameters():
+            # 只优化本轮目标矩阵
+            if f"lora_{target}" not in name:
+                continue
+            if not param.requires_grad:
+                continue
+
+            # 兼容常见 no_decay 规则（LoRA 通常只有 weight，但这里写全更稳）
+            if name.endswith(".bias") or "LayerNorm.weight" in name or "layer_norm.weight" in name:
+                nodecay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        if len(decay_params) == 0 and len(nodecay_params) == 0:
+            logger.warning(f"[LoRM] 未找到可优化的 lora_{target} 参数，回退到 super().create_optimizer()")
+            return super().create_optimizer()
+
+        grouped = []
+        if len(decay_params) > 0:
+            grouped.append({"params": decay_params, "weight_decay": self.args.weight_decay})
+        if len(nodecay_params) > 0:
+            grouped.append({"params": nodecay_params, "weight_decay": 0.0})
+
+        # 与默认 Trainer 的 AdamW 参数保持一致（不影响你其它算法）
+        self.optimizer = torch.optim.AdamW(
+            grouped,
+            lr=self.args.learning_rate,
+            betas=(self.args.adam_beta1, self.args.adam_beta2),
+            eps=self.args.adam_epsilon,
+        )
+        return self.optimizer
+
+
+
+
+
+
+
+
     def train(
         self,
         task_id: int = 1,
@@ -852,32 +926,29 @@ class UIETrainer(Seq2SeqTrainer):
                 logger.info(f"[Client {cid}] LoRM: Computing Gram matrices...")
 
             tracker = LoRMTracker(self.model, self.accelerator.device)
-            tracker.register_hooks()  # 只 Hook lora_A 的输入
+            tracker.register_hooks()
 
-            train_dataloader = self.get_train_dataloader()
-            self.model.eval()
+            try:
+                train_dataloader = self.get_train_dataloader()
+                self.model.eval()
 
-            with torch.no_grad():
-                for step, inputs in enumerate(train_dataloader):
-                    inputs = self._prepare_inputs(inputs)
-                    # 移除不兼容字段
-                    if "input_ids_wo_label" in inputs:
-                        inputs.pop("input_ids_wo_label", None)
+                with torch.no_grad():
+                    for step, inputs in enumerate(train_dataloader):
+                        inputs = self._prepare_inputs(inputs)
+                        if "input_ids_wo_label" in inputs:
+                            inputs.pop("input_ids_wo_label", None)
 
-                    # 前向传播触发 Hook
-                    try:
                         _ = self.model(**inputs)
-                    except Exception as e:
-                        logger.exception(
-                            f"[Client {cid}] LoRM Gram forward failed at step={step}. "
-                            f"Keys={list(inputs.keys())}. This must be fixed (do NOT ignore), "
-                            f"otherwise grams may be empty and LoRM aggregation will become no-op."
-                        )
-                        raise
 
-            # 保存 Grams 到 Trainer 实例，供联邦聚合使用
-            grams = tracker.get_grams()
-            tracker.remove_hooks()
+                grams = tracker.get_grams()
+
+            finally:
+                # 无论成功/失败都清理 hook，避免跨 client 累积
+                try:
+                    tracker.remove_hooks()
+                except Exception:
+                    pass
+                self.model.train()
 
             if len(grams) == 0:
                 raise RuntimeError(

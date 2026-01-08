@@ -831,11 +831,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 logger.info(f"Global Round {rnd + 1} [LoRM]: Training '{target_matrix}', Freezing '{freeze_target}'")
 
             # 设置 Global Model 的参数冻结状态 (作为 Client 的初始状态)
-            for n, p in global_model.named_parameters():
-                if "lora_" + freeze_target in n:
-                    p.requires_grad = False
-                elif "lora_" + target_matrix in n:
-                    p.requires_grad = True
+            # for n, p in global_model.named_parameters():
+            #     if "lora_" + freeze_target in n:
+            #         p.requires_grad = False
+            #     elif "lora_" + target_matrix in n:
+            #         p.requires_grad = True
 
             # 初始化收集列表
             lorm_client_updates = []
@@ -890,6 +890,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             trainer.model.load_state_dict(global_state_gpu, strict=False)
             trainer.train_dataset = client_datasets[cid]
 
+            if method == "lorm":
+                trainer.lorm_target_matrix = target_matrix
+                trainer.lorm_grams = {}
+
             trainer.optimizer = None
             trainer.lr_scheduler = None
             train_dataloader = trainer.get_train_dataloader()
@@ -903,17 +907,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             if method == "lorm":
                 # 1. 训练前准备
                 if _is_main():
-                    logger.info(f"Client {cid}: Starting training (Method: {method})...")
-
-                # 设置冻结状态
-                for n, p in trainer.model.named_parameters():
-                    if "lora_" + freeze_target in n:
-                        p.requires_grad = False
-                    elif "lora_" + target_matrix in n:
-                        p.requires_grad = True
-
-                trainer.optimizer = None
-                trainer.lr_scheduler = None
+                    logger.info(f"Client {cid}: Starting training (Method: {method}, Target: {target_matrix})...")
 
                 # 2. 标准训练 (自动触发 Gram 计算)
                 trainer.train(task_id=data_args.task, cid=cid)
