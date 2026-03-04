@@ -37,6 +37,11 @@ from transformers import (
 )
 from datasets import concatenate_datasets
 from lorm_utils import lorm_aggregate, LormGlobalState
+from pilora_utils import (
+    load_pilora_ref,
+    save_pilora_ref,
+    extract_pilora_ref_from_model,
+)
 
 
 
@@ -679,6 +684,26 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     current_output_dir = training_args.output_dir
     # 解析当前任务序号（假设task_id已通过参数传入）
     current_task_id = data_args.task  # 例如：2
+
+    # ================= PiLoRA: build fixed reference for this task =================
+    pilora_ref_cpu = None
+    if method == "pilora" and current_task_id > 1:
+        # 1) Prefer explicit file from previous adapter dir: <adapter>/pilora_ref.pt
+        pilora_ref_cpu = load_pilora_ref(model_args.model_name_or_path)
+
+        # 2) Fallback: snapshot from the already-loaded adapter weights
+        # (your sh runs task2 with --model_name_or_path = task1/adapter)
+        if pilora_ref_cpu is None:
+            pilora_ref_cpu = extract_pilora_ref_from_model(global_model)
+            if _is_main():
+                logger.info(
+                    "[PILoRA] pilora_ref.pt not found; using snapshot from loaded adapter weights as reference.")
+
+        if _is_main():
+            logger.info(f"[PILoRA] reference ready. #tensors={len(pilora_ref_cpu)}")
+    # =====================================================================
+
+
     prev_task_dir = None
 
     # 构造上一个任务的输出目录路径
@@ -1004,9 +1029,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
 
-            if method in ["lora_origin", "ewc", "replay", "gem"]:
+            if method in ["lora_origin", "ewc", "replay", "gem", "pilora"]:
                 if _is_main():
-                    logger.info(f"Client {cid}: Starting training (lora_origin)...")
+                    logger.info(f"Client {cid}: Starting training {method}...")
 
                 # --- [Replay] 数据增强: 拼接旧数据 ---
                 if method == "replay" and client_replay_buffers is not None:
@@ -1073,7 +1098,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     if state["fisher"] is not None and _is_main():
                         logger.info(f"Client {cid} [EWC]: Loaded regularization constraints.")
 
-                trainer.train(task_id=data_args.task)
+                if method == "pilora":
+                    trainer.train(task_id=data_args.task, pilora_ref=pilora_ref_cpu)
+                else:
+                    trainer.train(task_id=data_args.task)
+
                 _trainer_wait_for_everyone(trainer)
                 trained_model = _trainer_unwrap_model(trainer)
 
@@ -1560,6 +1589,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         global_model.save_pretrained(peft_model_id)
         tokenizer.save_pretrained(peft_model_id)
         logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
+
+        if method == "pilora":
+            save_pilora_ref(peft_model_id, global_model)
+            logger.info(f"[PILoRA] Saved pilora_ref.pt to {peft_model_id}")
+
     all_metrics.update({"adapter_saved": peft_model_id})
     wait_for_everyone()
     # logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")

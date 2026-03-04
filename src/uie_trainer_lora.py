@@ -49,6 +49,7 @@ except ImportError:
 from lorm_utils import LoRMTracker
 # logger = logging.getLogger(__name__)
 from torch.optim.optimizer import Optimizer
+from pilora_utils import move_ref_to_device, add_pilora_ortho_grads_
 
 
 def monitor_gradient_health(step, model, F_curr, bar_F_raw, r2, B_round):
@@ -583,7 +584,11 @@ class UIETrainer(Seq2SeqTrainer):
         self.deepspeed_engine = None
         self.lambda_conf = 1.0  # 可选：背包里的 λ
         self.method = self.args.method
+        # lorm
         self.lorm_target_matrix = None
+        # pilora
+        self._pilora_ref = None
+        self._pilora_task_id = 1
         self._force_sgd = False
         self.fisher_floor = getattr(self.args, "fisher_floor", 1e-5)
         self.eta_shrink = float(getattr(self.args, "eta_shrink", 1.0))
@@ -796,6 +801,31 @@ class UIETrainer(Seq2SeqTrainer):
         # 4) 原有的 Logging 逻辑 (保持不变)
         # ============================================================
 
+        # ===================== PiLoRA: orthogonal gradient injection =====================
+        if (
+                self.args.method == "pilora"
+                and getattr(self, "_pilora_ref", None) is not None
+                and getattr(self, "_pilora_task_id", 1) > 1
+        ):
+            lam = float(getattr(self.args, "pilora_lambda_ortho", 0.1))
+            targets = str(getattr(self.args, "pilora_reg_targets", "A,B")).upper()
+            reg_on_A = ("A" in targets)
+            reg_on_B = ("B" in targets)
+            normalize = bool(getattr(self.args, "pilora_normalize", False))
+
+            add_pilora_ortho_grads_(
+                model,
+                self._pilora_ref,
+                lam,
+                use_delta=True,
+                reg_on_A=reg_on_A,
+                reg_on_B=reg_on_B,
+                normalize=normalize,
+                grad_scale=1.0 / max(int(self.args.gradient_accumulation_steps), 1),
+            )
+        # =====================================================================
+
+
 
 
         # 3) 只在主进程上做 logging
@@ -911,6 +941,15 @@ class UIETrainer(Seq2SeqTrainer):
         **kwargs,
     ):  # type: ignore[override]
 
+        if self.method == "pilora":
+            self._pilora_task_id = task_id
+            pilora_ref_cpu = kwargs.pop("pilora_ref", None)
+            if task_id > 1 and pilora_ref_cpu is not None:
+                self._pilora_ref = move_ref_to_device(pilora_ref_cpu, self.accelerator.device)
+            else:
+                self._pilora_ref = None
+
+
         if self.method == "lorm":
             # 1. 正常训练 (Standard SGD/AdamW)
             # 这里的 train 只是更新本轮“未冻结”的参数 (A 或 B)
@@ -979,7 +1018,7 @@ class UIETrainer(Seq2SeqTrainer):
             return train_output
 
 
-        if self.method in ["lora_origin", "ewc", "replay", "gem"] or (self.method == "adaptive" and task_id == 1):
+        if self.method in ["lora_origin", "ewc", "replay", "gem", "pilora"] or (self.method == "adaptive" and task_id == 1):
             logger.info(f"[Task {task_id}] Method '{self.method}': 调用标准 super().train()")
             return super().train(**kwargs)
 

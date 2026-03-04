@@ -9,7 +9,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 port=$(shuf -i25000-30000 -n1)
-method=lorm
+method=pilora
 lora_rank=8
 lamda_2=0
 lamda_1=0
@@ -27,7 +27,7 @@ fi
 
 # bash scripts/order_1_adaptive.sh> logs_and_outputs/order_1/logs/train_and_infer.log 2>&1 | tee run_order3_llama_adaptive_5e-04.log
 
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -39,8 +39,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task748_glucose_reverse_cause_event_detection \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/1-task748_glucose_reverse_cause_event_detection \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -70,14 +70,14 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 1 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -89,8 +89,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task073_commonsenseqa_answer_generation \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/2-task073_commonsenseqa_answer_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -120,15 +120,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 2 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 3: task1590
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -140,8 +140,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1590_diplomacy_text_generation \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/3-task1590_diplomacy_text_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -171,15 +171,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 3 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 4: task639
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -191,8 +191,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task639_multi_woz_user_utterance_generation \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/4-task639_multi_woz_user_utterance_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -222,15 +222,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 4 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 5: task1572
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -242,8 +242,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1572_samsum_summary \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/5-task1572_samsum_summary \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -273,15 +273,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 5 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 6: task1687
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -293,8 +293,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1687_sentiment140_classification \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/6-task1687_sentiment140_classification \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -324,14 +324,14 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 6 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -343,8 +343,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task591_sciq_answer_generation \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/7-task591_sciq_answer_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -374,15 +374,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 7 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 8: task363
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -394,8 +394,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task363_sst2_polarity_classification \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/8-task363_sst2_polarity_classification \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -425,15 +425,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 8 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 9: task1510
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -445,8 +445,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1510_evalution_relation_extraction \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/9-task1510_evalution_relation_extraction \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -476,14 +476,14 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 9 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -495,8 +495,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1729_personachat_generate_next \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/10-task1729_personachat_generate_next \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -526,15 +526,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 10 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 11: task181
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -546,8 +546,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task181_outcome_extraction \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/11-task181_outcome_extraction \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -577,15 +577,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 11 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 12: task511
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -597,8 +597,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task511_reddit_tifu_long_text_summarization \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/12-task511_reddit_tifu_long_text_summarization \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -628,15 +628,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 12 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 13: task002
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -648,8 +648,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task002_quoref_answer_generation \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/13-task002_quoref_answer_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -679,15 +679,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 13 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 14: task1290
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -699,8 +699,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1290_xsum_summarization \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/14-task1290_xsum_summarization \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -730,15 +730,15 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 14 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param
 
 sleep 5
 
 # Task 15: task875
-CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -750,8 +750,8 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task875_emotion_classification \
    --output_dir results/SuperNI/order_2_t5/$method/t5/outputs/$lr/15-task875_emotion_classification \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 1 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -781,7 +781,7 @@ CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --config_file script_accelerate/acc
    --method $method \
    --task 15 \
    --radius $radius \
-   --gradient_checkpointing False \
+   --gradient_checkpointing True \
    --bf16 True \
-   --ddp_find_unused_parameters True \
+   --ddp_find_unused_parameters False \
    $random_layer_param

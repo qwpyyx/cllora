@@ -9,12 +9,12 @@ import re
 BENCHMARK = "SuperNI"
 ORDER = "order_2_llama"
 METHOD = "lorm"
-LR = "1e-05"
+LR = "1e-05-5%-topk"
 
 # 基础路径，指向包含 '1-task748...', '2-task073...' 等的目录
-# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/clora-baseolora/results/{BENCHMARK}/{ORDER}/{METHOD}/outputs/{LR}/"
-BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}/"
-# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/ablation/no_step2_have_step3/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}"
+BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/{BENCHMARK}/sparsity/{ORDER}/{METHOD}/llama/outputs/topk/{LR}/"
+# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}/"
+# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/ablation/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}"
 # /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_1_llama/lora_origin/llama/outputs/5e-05
 # *** 新增：SuperNI 任务 ID 到指标的映射 ***
 # (根据 image_3843e3.png)

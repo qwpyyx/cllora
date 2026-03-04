@@ -5,7 +5,7 @@ import sys
 
 # --- 用户配置 ---
 # 请根据您的设置修改这些变量
-METHOD = "lorm"
+METHOD = "gem"
 LR = "1e-05"
 seq = 'order_4_llama'
 BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/Longseq/{seq}/{METHOD}/outputs/{LR}/"

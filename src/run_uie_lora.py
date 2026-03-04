@@ -287,7 +287,9 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
         metadata={"help": "Margin for GEM projection (usually 0.5). Only used when method='gem'."}
     )
 
-
+    pilora_lambda_ortho: float = field(default=0.1)
+    pilora_reg_targets: str = field(default="A,B")   # "A" or "B" or "A,B"
+    pilora_normalize: bool = field(default=False)
 
 @dataclass
 class FederatedArguments:
