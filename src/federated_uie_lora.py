@@ -424,146 +424,12 @@ def select_layers_topk(delta_dict, layer_costs, budget):
     return selected_layers, current_cost
 
 def run_federated_training(model_args: ModelArguments, data_args: DataTrainingArguments, training_args: UIETrainingArguments, fed_args: FederatedArguments):
-    world = max(getattr(training_args, "world_size", 1), 1)
 
     from accelerate.utils import set_seed
     set_seed(fed_args.federated_seed, device_specific=False)  # 仅供 Trainer/Sampler 等内部用
 
-
     def _is_main():
         return getattr(training_args, "process_index", 0) == 0
-
-    # loading logging
-    logging.basicConfig(format="%(message)s", handlers=[logging.StreamHandler()])
-    logger.info("Running federated learning mode")
-    # 强制将日志级别设置为 INFO，忽略 training_args 的默认值
-    log_level = logging.INFO  # 直接使用 20（INFO 的级别值）
-    logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu},"
-        f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
-    # logger.info(f"Training/evaluation parameters {training_args}")
-
-    # accelerator.seed_everything(fed_args.federated_seed)
-
-    data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
-    # === 修改开始: 使用上下文管理器确保只有主进程先执行数据生成 ===
-    with training_args.main_process_first(desc="loading dataset"):
-        raw_datasets = load_dataset(
-            os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
-            data_dir=data_args.data_dir,
-            task_config_dir=data_args.task_config_dir,
-            instruction_file=data_args.instruction_file,
-            instruction_strategy=data_args.instruction_strategy,
-            cache_dir=data_cache_dir,
-            max_num_instances_per_task=data_args.max_num_instances_per_task,
-            max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-            num_examples=data_args.num_examples
-        )
-    # === 修改结束 ===
-
-    raw_datasets.cleanup_cache_files()
-
-    # Detecting last checkpoint (复用集中式逻辑)
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, "
-                "change the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
-
-
-    # ========== 数据集拆分 ==========
-    # train dataset
-    if training_args.do_train:
-        if "train" not in raw_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets["train"]
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
-    # eval dataset
-    if training_args.do_eval:
-        if "validation" not in raw_datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = raw_datasets["validation"]
-        if data_args.max_eval_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
-    # predict dataset
-    if training_args.do_predict:
-        if "test" not in raw_datasets:
-            raise ValueError("--do_predict requires a test dataset")
-        predict_dataset = raw_datasets["test"]
-        if data_args.max_predict_samples is not None:
-            # 按任务均匀采样的逻辑
-            unique_tasks = set(predict_dataset["Dataset"])
-            samples_per_task = data_args.max_predict_samples // len(unique_tasks)
-            task_datasets = []
-            for task in unique_tasks:
-                task_data = predict_dataset.filter(lambda ex: ex["Dataset"] == task)
-                task_data = task_data.shuffle(seed=training_args.seed).select(range(min(samples_per_task, len(task_data))))
-                task_datasets.append(task_data)
-
-            predict_dataset = concatenate_datasets(task_datasets)
-
-    all_metrics = {"run_name": training_args.run_name}
-
-    # test_dataset = raw_datasets["test"] if training_args.do_predict else None
-
-    client_datasets = partition_dataset(
-                train_dataset,
-                fed_args.num_clients,
-                fed_args.dirichlet_alpha,
-                base_seed = fed_args.federated_seed,  # 固定联邦种子
-        )
-
-
-    # compare(client_datasets,fed_args.dirichlet_alpha)
-    model, tokenizer = build_model_and_tokenizer(model_args)
-
-
-    # [修改] 集中管理 Gradient Checkpointing 逻辑
-    if training_args.gradient_checkpointing:
-        logger.info("Gradient Checkpointing enabled.")
-
-        # 1. 开启 GC
-        if hasattr(model, "gradient_checkpointing_enable"):
-            # [修改] 旧版 API 不接受参数，直接调用
-            model.gradient_checkpointing_enable()
-            logger.info("Gradient Checkpointing enabled (Legacy Mode).")
-
-        # 2. [关键补充] 只有开 GC 时，才强制开启输入层梯度
-        # 这解决了 "does not have a grad_fn" 报错，同时不影响不开 GC 的情况
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        else:
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
-
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-    else:
-        logger.info("Gradient Checkpointing DISABLED (per arguments).")
-
-
-    # model = accelerator.prepare(model)
-
-    label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-
-    client_rng = random.Random(fed_args.federated_seed)
 
     def compute_rouge_metrics(dataset, preds, save_prefix=None):
         # 对生成式模型的输出进行后处理
@@ -600,7 +466,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         if hasattr(base_model, "module"):
             base_model = base_model.module
 
-        # 跑LLAMA不需要
         return DataCollatorForUIE(
             tokenizer,
             model=base_model,
@@ -615,30 +480,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             input_record_file=data_args.input_record_file,
         )
 
-        #如果要跑T5，需要model=base_model
-
-        # return DataCollatorForUIE(
-        #     tokenizer,
-        #     model=base_model,
-        #     padding="longest",
-        #     max_source_length=data_args.max_source_length,
-        #     max_target_length=data_args.max_target_length,
-        #     label_pad_token_id=label_pad_token_id,
-        #     pad_to_multiple_of=8 if training_args.fp16 else None,
-        #     add_task_name=data_args.add_task_name,
-        #     add_dataset_name=data_args.add_dataset_name,
-        #     num_examples=data_args.num_examples,
-        #     input_record_file=data_args.input_record_file,
-        # )
-
     def get_lora_trainable_keys(model):
-        """
-        提取模型中所有 LoRA 可训练参数的键名。
-        """
         return [name for name, param in model.named_parameters() if param.requires_grad and 'lora' in name]
 
     def get_param_bit_width(param):
-        """根据参数数据类型自动获取比特宽度"""
         dtype = param.dtype
         if dtype == torch.float32 or dtype == torch.int32:
             return 32
@@ -658,16 +503,134 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         return (total_bytes + packet_size - 1) // packet_size  # 向上取整
 
 
+    # --------- loading logging ---------
+    logging.basicConfig(format="%(message)s", handlers=[logging.StreamHandler()])
+    logger.info("Running federated learning mode")
+    log_level = logging.INFO
+    logger.setLevel(log_level)
+    datasets.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
 
-    # 新增：跟踪客户端被选中的次数和最后选中轮次
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu},"
+        f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+
+
+    data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
+    with training_args.main_process_first(desc="loading dataset"):
+        raw_datasets = load_dataset(
+            os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
+            data_dir=data_args.data_dir,
+            task_config_dir=data_args.task_config_dir,
+            instruction_file=data_args.instruction_file,
+            instruction_strategy=data_args.instruction_strategy,
+            cache_dir=data_cache_dir,
+            max_num_instances_per_task=data_args.max_num_instances_per_task,
+            max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
+            num_examples=data_args.num_examples
+        )
+    raw_datasets.cleanup_cache_files()
+
+
+    # --------- Detecting last checkpoint ---------
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+            raise ValueError(
+                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+                "Use --overwrite_output_dir to overcome."
+            )
+        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            logger.info(
+                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, "
+                "change the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+            )
+
+
+    # --------- Dataset ---------
+    if training_args.do_train:
+        if "train" not in raw_datasets:
+            raise ValueError("--do_train requires a train dataset")
+        train_dataset = raw_datasets["train"]
+        if data_args.max_train_samples is not None:
+            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+
+    if training_args.do_eval:
+        if "validation" not in raw_datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_dataset = raw_datasets["validation"]
+        if data_args.max_eval_samples is not None:
+            eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
+
+    if training_args.do_predict:
+        if "test" not in raw_datasets:
+            raise ValueError("--do_predict requires a test dataset")
+        predict_dataset = raw_datasets["test"]
+        if data_args.max_predict_samples is not None:
+            # unique sample
+            unique_tasks = set(predict_dataset["Dataset"])
+            samples_per_task = data_args.max_predict_samples // len(unique_tasks)
+            task_datasets = []
+            for task in unique_tasks:
+                task_data = predict_dataset.filter(lambda ex: ex["Dataset"] == task)
+                task_data = task_data.shuffle(seed=training_args.seed).select(range(min(samples_per_task, len(task_data))))
+                task_datasets.append(task_data)
+
+            predict_dataset = concatenate_datasets(task_datasets)
+
+    all_metrics = {"run_name": training_args.run_name}
+
+    # test_dataset = raw_datasets["test"] if training_args.do_predict else None
+
+
+    # ------------ load client dataset --------------
+    client_datasets = partition_dataset(
+                train_dataset,
+                fed_args.num_clients,
+                fed_args.dirichlet_alpha,
+                base_seed = fed_args.federated_seed,
+        )
+
+
+    # ------------ build model --------------
+    model, tokenizer = build_model_and_tokenizer(model_args)
+
+    # ------------ load checkpoint --------------
+    if training_args.gradient_checkpointing:
+        logger.info("Gradient Checkpointing enabled.")
+
+        # Open GC
+        if hasattr(model, "gradient_checkpointing_enable"):
+            # [修改] 旧版 API 不接受参数，直接调用
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient Checkpointing enabled (Legacy Mode).")
+
+        # Solve "does not have a grad_fn" error
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    else:
+        logger.info("Gradient Checkpointing DISABLED (per arguments).")
+
+
+    label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
     client_selection_tracker = {
         cid: {'count': 0, 'last_round': -1}
         for cid in range(fed_args.num_clients)
     }
 
 
-
-    # -----Begin Training------
+    # -------- Begin Training ---------
     training_args.remove_unused_columns = False
     base_args = copy.deepcopy(training_args)
     base_args.do_train = True
@@ -677,7 +640,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     if _is_main():
         logger.info("Use method: {}".format(method))
     global_model = model
-    global_model.to("cpu")  # <--- 新增：将全局模型移至CPU
+    global_model.to("cpu")
     device = next(global_model.parameters()).device
 
     # 加载过去任务的fisher信息
@@ -692,7 +655,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         pilora_ref_cpu = load_pilora_ref(model_args.model_name_or_path)
 
         # 2) Fallback: snapshot from the already-loaded adapter weights
-        # (your sh runs task2 with --model_name_or_path = task1/adapter)
         if pilora_ref_cpu is None:
             pilora_ref_cpu = extract_pilora_ref_from_model(global_model)
             if _is_main():
@@ -705,7 +667,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
     prev_task_dir = None
-
     # 构造上一个任务的输出目录路径
     if current_task_id > 1:
         # 假设任务文件夹命名格式为 "{task_id}-{dataset_name}"
@@ -725,6 +686,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     client_replay_buffers = None
     baseline_save_dir = os.path.join(current_output_dir, "baseline_states")
 
+    # ------------------ Lorm ---------------
     lorm_global_state = None
     if method == "lorm":
         lorm_global_state = LormGlobalState()
@@ -741,8 +703,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             # 这会将历史累积的 DeltaW 加载到当前新初始化的 Backbone 中
             state.merge_and_apply(model, device=device)
 
-
-
+    # ------------------ ewc ---------------
     if method == "ewc":
         client_ewc_states = defaultdict(lambda: {"fisher": None, "params": None})
         # 如果找到了上个任务目录，尝试加载 EWC 状态
@@ -757,7 +718,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             else:
                 if _is_main(): logger.warning(f"Previous task found but no baseline_states dir at {prev_baseline_dir}")
 
-
+    # ------------------ replay-base method ---------------
     elif method in ["replay", "gem"]:
         client_replay_buffers = defaultdict(list)
         # 如果找到了上个任务目录，尝试加载 Replay Buffer
@@ -824,16 +785,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         logger.info("DeepSpeed Trainer initialized.")
 
 
-
-
+    # ------------------ Training ------------------
     for rnd in range(fed_args.global_rounds):
         if _is_main():
             logger.info(f"Global round {rnd + 1}/{fed_args.global_rounds}")
-
-        # selected = client_rng.sample(
-        #     range(fed_args.num_clients),
-        #     min(fed_args.clients_per_round, fed_args.num_clients),
-        # )
 
         def pick_clients(num_clients, clients_per_round, round_id, base_seed):
             rng = np.random.RandomState(base_seed + 10007 * round_id)
@@ -848,21 +803,10 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         )
 
         if method == "lorm":
-            # 偶数轮 (0, 2...) 训练 B，奇数轮 (1, 3...) 训练 A
             target_matrix = "B" if (rnd % 2 == 0) else "A"
             freeze_target = "A" if target_matrix == "B" else "B"
-
             if _is_main():
                 logger.info(f"Global Round {rnd + 1} [LoRM]: Training '{target_matrix}', Freezing '{freeze_target}'")
-
-            # 设置 Global Model 的参数冻结状态 (作为 Client 的初始状态)
-            # for n, p in global_model.named_parameters():
-            #     if "lora_" + freeze_target in n:
-            #         p.requires_grad = False
-            #     elif "lora_" + target_matrix in n:
-            #         p.requires_grad = True
-
-            # 初始化收集列表
             lorm_client_updates = []
 
         if _is_main():
@@ -1026,8 +970,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     pass
 
                 continue
-
-
 
             if method in ["lora_origin", "ewc", "replay", "gem", "pilora"]:
                 if _is_main():
@@ -1239,9 +1181,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         if k not in selected_layers:
                             delta[k] = torch.zeros_like(delta[k])
 
-
-
-
+                # ------------ Aggregate --------------
                 w = len(client_datasets[cid])
                 for k in lora_keys:
                     aggregated[k] += delta[k] * w
@@ -1290,22 +1230,16 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         aggregated[k] += delta[k] * w
                     total += w
 
-                    # =========================================================================
-                    # [修改点] Adaptive Task 1: 分布式 Fisher 计算 (替换原有的 _is_main 块)
-                    # =========================================================================
                     if _is_main():
                         logger.info(f"Client {cid} [Adaptive Task 1]: Computing Fisher (Distributed)...")
 
                     ADAPTIVE_SAMPLE_LIMIT = 500
                     fisher_ds = client_datasets[cid]
                     if len(fisher_ds) > ADAPTIVE_SAMPLE_LIMIT:
-                        # 确保所有 rank 随机种子一致，这样大家看到的“全集”是一样的
                         rng = np.random.RandomState(fed_args.federated_seed + cid + 1)
                         indices = rng.choice(len(fisher_ds), ADAPTIVE_SAMPLE_LIMIT, replace=False)
                         fisher_ds = fisher_ds.select(indices)
 
-                    # 2. 分布式 DataLoader (所有进程都执行 !!!)
-                    # DistributedSampler 会根据当前 rank 自动分发属于它的数据切片
                     fisher_sampler = torch.utils.data.distributed.DistributedSampler(
                         fisher_ds, shuffle=False, drop_last=False
                     )
@@ -1317,26 +1251,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         collate_fn=fisher_collator
                     )
 
-                    # 3. 并行计算局部 Fisher (所有进程都执行 !!!)
-                    local_fisher_sum, local_count = compute_fisher_diag(trained_model, fisher_loader)
 
-                    # 4. 使用 Accelerate 聚合结果 (所有进程都执行 !!!)
-                    # A. 聚合样本总数
+                    local_fisher_sum, local_count = compute_fisher_diag(trained_model, fisher_loader)
                     local_count_tensor = torch.tensor(local_count, device=trainer.accelerator.device)
-                    # reduce 是集合通信操作，所有进程必须同时到达这里
                     total_count_tensor = trainer.accelerator.reduce(local_count_tensor, reduction="sum")
                     total_samples = total_count_tensor.item()
 
-                    # B. 聚合 Fisher 矩阵 (所有进程都执行 !!!)
                     sorted_keys = sorted(local_fisher_sum.keys())
                     final_fisher = {}
-
                     for name in sorted_keys:
                         local_tensor = local_fisher_sum[name].to(trainer.accelerator.device)
-                        # reduce 是集合通信操作
+
                         global_sum_tensor = trainer.accelerator.reduce(local_tensor, reduction="sum")
 
-                        # 计算平均值 (每个进程都算一份，虽然最后只有 Rank 0 用，但为了逻辑对称没问题)
+
                         if total_samples > 0:
                             avg_fisher = (global_sum_tensor / total_samples).cpu()
                         else:
@@ -1347,7 +1275,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     # 5. [仅主进程] 归一化 -> 更新状态 -> 存入 Cache
                     # 这里才需要缩进
                     if _is_main():
-                        # =========== [关键补丁] 手动执行 Min-Max 归一化 ===========
+
                         all_values = torch.cat([f.flatten() for f in final_fisher.values()])
                         x_min, x_max = all_values.min(), all_values.max()
 
@@ -1392,7 +1320,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     total += w
 
                     if _is_main():
-                        # [!!! 修复 2/3: 更新 client_state 并存入 cache !!!]
+
                         client_state.update(F_client, theta_last)  # 此处 client_state 包含 T-1 历史，被更新为 T 的状态
                         per_task_cache[cid] = client_state  # 将包含 T 状态的 *完整对象* 存入 cache
 
@@ -1453,16 +1381,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             global_model.load_state_dict(global_state_cpu, strict=False)
 
 
-
-
-        # for k in lora_keys:
-        #     mu = aggregated[k] / max(total, 1)
-        #     global_state_cpu[k] = global_state_cpu[k] - mu
-        #
-        # global_model.load_state_dict(global_state_cpu, strict=False)
-
         wait_for_everyone()
-
         try:
             del aggregated, global_state_cpu, global_state_gpu
         except Exception:
@@ -1554,7 +1473,6 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             logger.info("EWC states saved successfully.")
 
 
-
         elif method in ["replay", "gem"] and client_replay_buffers is not None:
 
             logger.info(f"Saving {method.upper()} buffers to {baseline_save_dir}...")
@@ -1597,6 +1515,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     all_metrics.update({"adapter_saved": peft_model_id})
     wait_for_everyone()
     # logger.info(f"Saved LoRA adapter/tokenizer to {peft_model_id}")
+
 
     # ========== 最终预测 & 指标记录 ==========
     if training_args.do_predict:

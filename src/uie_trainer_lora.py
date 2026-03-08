@@ -237,6 +237,7 @@ class AdaptiveAdamW(Optimizer):
                  # 你的 Adaptive 超参 (从 Trainer 传入)
                  radius=1.0, sigma=0.0, tau=0.0, beta=10.0, alpha_ema=0.9,
                  eta_shrink=1.0, trust_radius_shrink=1e-3, beta_mul=1.0,
+                 vartheta=0.3, varsigma=0.3, beta_eps=1e-12,
                  # Fisher 修正超参
                  fisher_floor_quantile=0.02, fisher_floor_min=1e-12,
                  fisher_floor_mix=0.7, precond_power=0.5,
@@ -271,6 +272,12 @@ class AdaptiveAdamW(Optimizer):
         self.eta_shrink = eta_shrink
         self.trust_radius_shrink_sq = trust_radius_shrink ** 2
         self.beta_mul = beta_mul
+
+        # new
+        self.vartheta = float(vartheta)
+        self.varsigma = float(varsigma)
+        self.beta_eps = float(beta_eps)
+
         self.fisher_floor_quantile = fisher_floor_quantile
         self.fisher_floor_min = fisher_floor_min
         self.fisher_floor_mix = fisher_floor_mix
@@ -329,6 +336,9 @@ class AdaptiveAdamW(Optimizer):
                     hist_mean = torch.clamp(f_past_gpu.mean(), min=1e-12)
                     f_past_eff = f_past_gpu / hist_mean
 
+                    state['hist_mean'] = hist_mean
+                    state['f_past_raw'] = f_past_gpu
+
                     state['f_past_eff'] = f_past_eff
                     state['theta_past_gpu'] = theta_past_gpu
                     state['r2'] = ((p.detach() - theta_past_gpu).pow(2) * f_past_eff).sum()
@@ -341,6 +351,10 @@ class AdaptiveAdamW(Optimizer):
 
                 # --- 获取状态 ---
                 F_curr = state['F_curr']
+
+                hist_mean = state['hist_mean']
+                f_past_raw = state['f_past_raw']
+
                 f_past_eff = state['f_past_eff']
                 theta_past_gpu = state['theta_past_gpu']
                 r2 = state['r2']
@@ -383,39 +397,79 @@ class AdaptiveAdamW(Optimizer):
                 v_scaled = v * scale_v
                 v_alg = v_scaled
 
-                # --- eta (自适应步长) 计算 ---
+                # --- Eq. (8)-(10): RieSelect 步长控制 ---
                 delta_theta = p.detach() - theta_past_gpu
+                S_local = (v_alg * f_past_eff * delta_theta).sum()
+                Q_local = ((v_alg * v_alg) * f_past_eff).sum()
 
-                v2 = (v_alg * v_alg)
-                cap = torch.quantile(v2, 0.99)
-                v2_clip = torch.clamp(v2, max=cap)
+                # Eq. (9): beta_hat = max_i max{F_bar_i, F_curr_i} / F_bar_i
+                # 注意这里使用与 r^2 相同归一化尺度下的 Fisher，保证量纲一致。
+                f_curr_eff = torch.clamp(F_hat / hist_mean, min=0.0)
+                denom = torch.clamp(f_past_eff, min=self.beta_eps)
+                beta_hat = torch.max(torch.maximum(f_past_eff, f_curr_eff) / denom)
+                beta_hat = torch.clamp(beta_hat, min=1.0)
 
-                a_local = (v2_clip * f_past_eff).sum()
-                b_local = (v_alg * f_past_eff * delta_theta).sum()
+                eta = torch.tensor(0.0, device=p.device, dtype=g_float.dtype)
 
-                Delta_local = self.radius_sq - r2
-
-                # 默认 eta 为 0
-                eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
-
-                if Delta_local > self.tau:
-                    a_safe = torch.clamp(a_local, min=v2_clip.mean() * v2_clip.numel() * 1e-4)
-                    Delta_eff = torch.clamp(Delta_local - self.tau, min=0.0)
-                    Delta_eff = self.trust_radius_shrink_sq * Delta_eff
-                    beta_eff = self.beta * self.beta_mul
-
-                    if b_local < 0.0:
-                        term_u = b_local - self.sigma
-                        discriminant = torch.clamp(term_u.pow(2) + beta_eff * a_safe * Delta_eff, min=0.0)
-                        eta_closed = (term_u + torch.sqrt(discriminant)) / (beta_eff * a_safe + eps)
-                        eta = torch.clamp(eta_closed * self.eta_shrink, max=lr_cap)
+                if Q_local > 0:
+                    if S_local < 0:
+                        # Eq. (8): conflicting layers use certified safe step size
+                        delta_eps = self.radius_sq - beta_hat * (r2 + self.varsigma)
+                        if delta_eps >= 0:
+                            discr = torch.clamp(
+                                (S_local - self.vartheta).pow(2) + Q_local * (delta_eps / beta_hat),
+                                min=0.0
+                            )
+                            eta_safe = ((S_local - self.vartheta) + torch.sqrt(discr)) / (Q_local + eps)
+                            eta = torch.clamp(eta_safe, min=0.0, max=lr_cap)
+                        else:
+                            eta = torch.tensor(0.0, device=p.device, dtype=g_float.dtype)
                         state['conf'] += 1
                     else:
-                        eta_trust = torch.sqrt(Delta_eff / (a_safe + eps))
-                        eta = torch.clamp(eta_trust * self.eta_shrink, max=lr_cap)
+                        # Eq. (10): non-conflicting layers use lightweight basin cap
+                        slack = self.radius_sq / beta_hat - r2
+                        if slack > 0:
+                            eta_cap = torch.sqrt(torch.clamp(slack / (Q_local + eps), min=0.0))
+                            eta = torch.clamp(eta_cap, min=0.0, max=lr_cap)
+                        else:
+                            eta = torch.tensor(0.0, device=p.device, dtype=g_float.dtype)
 
-                    if torch.isnan(eta):
-                        eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+                if torch.isnan(eta) or torch.isinf(eta):
+                    eta = torch.tensor(0.0, device=p.device, dtype=g_float.dtype)
+
+                a_local = Q_local
+                b_local = S_local
+
+                # v2 = (v_alg * v_alg)
+                # cap = torch.quantile(v2, 0.99)
+                # v2_clip = torch.clamp(v2, max=cap)
+                #
+                # a_local = (v2_clip * f_past_eff).sum()
+                # b_local = (v_alg * f_past_eff * delta_theta).sum()
+                #
+                # Delta_local = self.radius_sq - r2
+                #
+                # # 默认 eta 为 0
+                # eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+                #
+                # if Delta_local > self.tau:
+                #     a_safe = torch.clamp(a_local, min=v2_clip.mean() * v2_clip.numel() * 1e-4)
+                #     Delta_eff = torch.clamp(Delta_local - self.tau, min=0.0)
+                #     Delta_eff = self.trust_radius_shrink_sq * Delta_eff
+                #     beta_eff = self.beta * self.beta_mul
+                #
+                #     if b_local < 0.0:
+                #         term_u = b_local - self.sigma
+                #         discriminant = torch.clamp(term_u.pow(2) + beta_eff * a_safe * Delta_eff, min=0.0)
+                #         eta_closed = (term_u + torch.sqrt(discriminant)) / (beta_eff * a_safe + eps)
+                #         eta = torch.clamp(eta_closed * self.eta_shrink, max=lr_cap)
+                #         state['conf'] += 1
+                #     else:
+                #         eta_trust = torch.sqrt(Delta_eff / (a_safe + eps))
+                #         eta = torch.clamp(eta_trust * self.eta_shrink, max=lr_cap)
+                #
+                #     if torch.isnan(eta):
+                #         eta = torch.tensor(0.0, device=p.device, dtype=p.dtype)
 
                 # ==================== [消融实验逻辑: 确定 Step Size] ====================
                 if self.ablation_no_adaptive_lr:
@@ -594,6 +648,11 @@ class UIETrainer(Seq2SeqTrainer):
         self.eta_shrink = float(getattr(self.args, "eta_shrink", 1.0))
         self.trust_radius_shrink = float(getattr(self.args, "trust_radius_shrink", 1e-3))
         self.beta_mul = float(getattr(self.args, "beta_mul", 1.0))
+
+        self.vartheta = float(getattr(self.args, "vartheta", 0.3))
+        self.varsigma = float(getattr(self.args, "varsigma", 0.3))
+        self.beta_eps = float(getattr(self.args, "beta_eps", 1e-12))
+
 
         self.ewc_fisher = ewc_fisher
         self.ewc_params = ewc_params
@@ -1088,6 +1147,7 @@ class UIETrainer(Seq2SeqTrainer):
                 radius=self.radius, sigma=self.sigma, tau=self.tau, beta=self.beta,
                 alpha_ema=self.alpha, eta_shrink=self.eta_shrink,
                 trust_radius_shrink=self.trust_radius_shrink, beta_mul=self.beta_mul,
+                vartheta=self.vartheta, varsigma=self.varsigma, beta_eps=self.beta_eps,
                 fisher_floor_quantile=float(getattr(self.args, "fisher_floor_quantile", 0.02)),
                 fisher_floor_min=float(getattr(self.args, "fisher_floor_min", 1e-12)),
                 fisher_floor_mix=float(getattr(self.args, "fisher_floor_mix", 0.7)),

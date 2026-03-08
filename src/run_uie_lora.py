@@ -110,7 +110,7 @@ class ModelArguments:
                     "the model's position embeddings."
         },
     )
-    # added for AutoCL
+
     lora_dim: Optional[int] = field(
         default=8,
         metadata={
@@ -118,7 +118,6 @@ class ModelArguments:
         },
     )
 
-    # original LoRA setting
     use_baseline_lora: bool = field(
         default=False,
         metadata={"help": "Whether to use a single LoRA configuration for all tasks (baseline LoRA)."}
@@ -168,7 +167,6 @@ class DataTrainingArguments:
                     "than this will be truncated, sequences shorter will be padded."
         },
     )
-    # for decoder model, it means max_new_tokens
     max_target_length: Optional[int] = field(
         default=50,
         metadata={
@@ -257,6 +255,18 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     packet_bytes: int = field(default=1500, metadata={"help": "每个传输包的有效负载字节数"})
     radius: float = field(default=1.0, metadata={"help": "Constraint radius for adaptive optimizer."})
     # optim: str = field(default="sgd", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
+    vartheta: float = field(
+            default = 0.3,
+        metadata = {"help": "RieSelect Eq. (8) estimation-error margin vartheta."}
+                        )
+    varsigma: float = field(
+            default = 0.3,
+        metadata = {"help": "RieSelect Eq. (8) estimation-error margin varsigma."}
+                        )
+    beta_eps: float = field(
+            default = 1e-12,
+        metadata = {"help": "Numerical epsilon used in Eq. (9) beta-hat denominator."}
+                        )
     random_layer_selection: bool = field(
         default=False,
         metadata={
@@ -270,23 +280,25 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
             "help": "If True, use fixed learning rate (AdamW behavior) but keep calculating B_round for Knapsack."}
     )
 
+    # For ewc
     ewc_lambda: float = field(
         default=5000.0,  # 默认值根据经验设定，通常 LoRA 需要较大的正则化系数
         metadata={"help": "EWC regularization coefficient."}
     )
 
-    # [NEW] Replay 参数
+    # For replay
     replay_buffer_size: int = field(
         default=10,
         metadata={"help": "Number of samples to keep from previous tasks for experience replay."}
     )
 
-    # # [NEW] A-GEM 参数
+    # For A-gem
     gem_gamma: float = field(
         default=0.5,
         metadata={"help": "Margin for GEM projection (usually 0.5). Only used when method='gem'."}
     )
 
+    # For pilora
     pilora_lambda_ortho: float = field(default=0.1)
     pilora_reg_targets: str = field(default="A,B")   # "A" or "B" or "A,B"
     pilora_normalize: bool = field(default=False)
@@ -318,11 +330,11 @@ class FederatedArguments:
         default=50,
         metadata={"help": "Dirichlet alpha controlling data heterogeneity."},
     )
-    # 新增：联邦采样专用的随机种子
     federated_seed: Optional[int] = field(
         default=None,
         metadata={"help": "Seed for client sampling in federated rounds (independent of training_args.seed)."}
     )
+
     # ---------- Continual FL hyperparameters ----------
     comm_budget: Optional[int] = field(
         default=1200,
@@ -338,8 +350,7 @@ class FederatedArguments:
 
 
 def main():
-    # sys.modules['mpi4py'] = None
-    # See all possible arguments in src/transformers/training_args.py
+
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, UIETrainingArguments, FederatedArguments))
 
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -356,12 +367,8 @@ def main():
         run_federated_training(model_args, data_args, training_args, federated_args)
         return
 
-    # # LLAMA
-    # if federated_args.mode == "federated":
-    #     from federated_uie_lora_llama import run_federated_training
-    #     run_federated_training(model_args, data_args, training_args, federated_args)
-    #     return
 
+    # --------------------------- O-LoRA ---------------------------
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
