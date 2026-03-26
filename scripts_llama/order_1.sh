@@ -5,6 +5,12 @@ export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export TRANSFORMERS_CACHE=/home/qiuwenqi/.cache/huggingface
 
 port=$(shuf -i25000-30000 -n1)
+
+# 支持通过环境变量切换基础模型，例如：
+# BASE_MODEL_PATH=Qwen/Qwen2.5-14B-Instruct bash scripts_llama/order_1.sh
+# BASE_MODEL_PATH=Qwen/Qwen3.5-9B-Instruct bash scripts_llama/order_1.sh
+# BASE_MODEL_PATH=Qwen/Qwen3.5-27B-Instruct bash scripts_llama/order_1.sh
+BASE_MODEL_PATH=${BASE_MODEL_PATH:-/home/qiuwenqi/LLM/models/LLAMA2-7B-chat-hf}
  
 # bash scripts_llama/order_1_adaptive.sh> logs_and_outputs_llama/order_1/logs/train_and_infer.log 2>&1 &
 
@@ -12,7 +18,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed --master_port $port src/run_uie_lora.py \
    --do_train \
    --do_predict \
    --predict_with_generate \
-   --model_name_or_path /home/qiuwenqi/LLM/models/LLAMA2-7B-chat-hf \
+   --model_name_or_path ${BASE_MODEL_PATH} \
    --data_dir CL_Benchmark \
    --task_config_dir configs/order1_configs/dbpedia \
    --instruction_file configs/instruction_config.json \

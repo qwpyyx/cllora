@@ -146,12 +146,12 @@ def build_model_and_tokenizer(model_args):
     # --------- 1) 判别模型族 ----------
     name_lower = model_args.model_name_or_path.lower()
     is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
-    # is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+    decoder_keywords = ("llama", "vicuna", "qwen")
     if "t5" in name_lower:
         is_llama = False
     else:
-        is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
-    print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
+        is_llama = any(k in name_lower for k in decoder_keywords)
+    print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Decoder: {is_llama} | Is Adapter: {is_adapter}")
 
     # --------- 2) 准备 Config 和 Tokenizer ----------
     if is_adapter:
@@ -159,6 +159,8 @@ def build_model_and_tokenizer(model_args):
         base_model_path = peft_cfg.base_model_name_or_path
     else:
         base_model_path = model_args.model_name_or_path
+
+    qwen_model = "qwen" in base_model_path.lower()
 
     config = AutoConfig.from_pretrained(
         base_model_path,
@@ -171,13 +173,17 @@ def build_model_and_tokenizer(model_args):
     config.use_cache = False
 
     if is_llama:
-        # Llama Tokenizer (新环境/旧环境都兼容)
+        # Decoder-only Tokenizer (Llama/Qwen 等)
+        tokenizer_kwargs = {}
+        if qwen_model:
+            tokenizer_kwargs["trust_remote_code"] = True
         tokenizer = AutoTokenizer.from_pretrained(
             base_model_path,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
+            **tokenizer_kwargs,
         )
 
         # 1. 补全 pad_token (如果缺失)
@@ -191,11 +197,11 @@ def build_model_and_tokenizer(model_args):
                 tokenizer.pad_token_id = 0
                 tokenizer.pad_token = "<unk>"
 
-        # 2. 强制修正 ID (避免 Pad=1 与 BOS=1 冲突)
-        # 这是解决训练不收敛和预测乱码的关键
-        tokenizer.bos_token_id = 1
-        tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 0  # 必须是 0
+        # 2. LLaMA 系列保持历史 token id；Qwen 等模型沿用各自 tokenizer 预设
+        if ("llama" in base_model_path.lower()) or ("vicuna" in base_model_path.lower()):
+            tokenizer.bos_token_id = 1
+            tokenizer.eos_token_id = 2
+            tokenizer.pad_token_id = 0  # LLaMA 系列通常使用 0
 
         # 3. 设置左填充 (Left Padding)
         # Decoder-only 模型做生成任务时必须左填充，否则输出不对齐
@@ -224,16 +230,20 @@ def build_model_and_tokenizer(model_args):
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
     }
+    if qwen_model:
+        # Qwen2.5-14B-Instruct 官方权重为 safetensors，显式声明避免加载器回退
+        model_load_kwargs["use_safetensors"] = True
+        model_load_kwargs["trust_remote_code"] = True
 
-    # [Llama 专属优化]
+    # [Decoder-only 专属优化]
     if is_llama:
         # 1. 精度选择: 优先 BF16
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             model_load_kwargs["torch_dtype"] = torch.bfloat16
-            print("[Build Model] Using bfloat16 for Llama.")
+            print("[Build Model] Using bfloat16 for decoder-only model.")
         else:
             model_load_kwargs["torch_dtype"] = torch.float16
-            print("[Build Model] Using float16 for Llama.")
+            print("[Build Model] Using float16 for decoder-only model.")
 
         # 2. Flash Attention 2 加速 (如果安装了)
         if model_args.ues_flash_attention:
@@ -286,7 +296,7 @@ def build_model_and_tokenizer(model_args):
             r=model_args.lora_dim,
             lora_alpha=32,
             lora_dropout=0.1,
-            # Llama 需要指定 target_modules，T5 通常不需要(默认q,v)
+            # decoder-only 模型需要指定 target_modules，T5 通常不需要(默认q,v)
             target_modules=["q_proj", "v_proj"] if is_llama else None
         )
         model = get_peft_model(model, peft_config)

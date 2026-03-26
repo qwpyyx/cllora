@@ -34,6 +34,7 @@ from filelock import FileLock
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
     # add
     AutoTokenizer,
     HfArgumentParser,
@@ -48,12 +49,23 @@ from uie_collator import DataCollatorForUIE
 from uie_dataset_lora import gen_cache_path
 from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
 from compute_metrics import compute_metrics, compute_grouped_metrics
-from model.llama import LlamaForCausalLM_with_lossmask
 
 # ignore all warning
 # warnings.filterwarnings("ignore")
 os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger(__name__)
+
+
+DECODER_MODEL_KEYWORDS = ("llama", "vicuna", "qwen")
+
+
+def is_decoder_model_name(model_name_or_path: str) -> bool:
+    name = (model_name_or_path or "").lower()
+    return any(k in name for k in DECODER_MODEL_KEYWORDS)
+
+
+def is_qwen_model_name(model_name_or_path: str) -> bool:
+    return "qwen" in (model_name_or_path or "").lower()
 CURRENT_DIR = os.path.dirname(__file__)
 
 try:
@@ -428,38 +440,46 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    if 'adapter' in model_args.model_name_or_path:  # load lora-config
+    is_adapter = 'adapter' in model_args.model_name_or_path
+    decoder_model = is_decoder_model_name(model_args.model_name_or_path)
+    qwen_model = is_qwen_model_name(model_args.model_name_or_path)
+
+    if is_adapter:  # load lora-config
         config = PeftConfig.from_pretrained(model_args.model_name_or_path)
-        if 'llama' in model_args.model_name_or_path.lower():
-            tokenizer = transformers.LlamaTokenizer.from_pretrained(config.base_model_name_or_path)
-            config.bos_token_id = 1
-            config.eos_token_id = 2
-            config.pad_token_id = 1
-            tokenizer.bos_token_id = 1
-            tokenizer.eos_token_id = 2
-            tokenizer.pad_token_id = 1
+        base_model_path = config.base_model_name_or_path
+        decoder_model = is_decoder_model_name(base_model_path)
+        qwen_model = is_qwen_model_name(base_model_path)
+
+        if decoder_model:
+            tokenizer_kwargs = {"trust_remote_code": True} if qwen_model else {}
+            tokenizer = AutoTokenizer.from_pretrained(base_model_path, **tokenizer_kwargs)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+            tokenizer.padding_side = 'left'
         else:
-            tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
-    elif 'llama' in model_args.model_name_or_path.lower():
+            tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+    elif decoder_model:
         config = AutoConfig.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        config.bos_token_id = 1
-        config.eos_token_id = 2
-        config.pad_token_id = 1
-        tokenizer = transformers.LlamaTokenizer.from_pretrained(
+        tokenizer_kwargs = {"trust_remote_code": True} if qwen_model else {}
+        tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
+            **tokenizer_kwargs,
         )
-        tokenizer.bos_token_id = 1
-        tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 1
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+        tokenizer.padding_side = 'left'
+        config.bos_token_id = tokenizer.bos_token_id
+        config.eos_token_id = tokenizer.eos_token_id
+        config.pad_token_id = tokenizer.pad_token_id
     else:  # load original config
         config = AutoConfig.from_pretrained(
             model_args.config_name if model_args.config_name else model_args.model_name_or_path,
@@ -475,44 +495,40 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
+    decoder_model_load_kwargs = {}
+    if qwen_model:
+        # Qwen2.5-14B-Instruct 以 safetensors 发布，显式启用可避免回退到 .bin 路径
+        decoder_model_load_kwargs["use_safetensors"] = True
+        decoder_model_load_kwargs["trust_remote_code"] = True
+
     # 模型类别设置
-    if 'llama' in model_args.model_name_or_path.lower():  # add llama
-        model_class = LlamaForCausalLM_with_lossmask
+    if decoder_model:  # decoder-only models: llama/qwen/vicuna
+        model_class = AutoModelForCausalLM
         tokenizer.padding_side = 'left'
     else:
         model_class = AutoModelForSeq2SeqLM
 
     # 已经有了训练好的 LoRA 适配器参数，此时只需要把这些参数加载进模型中
-    if 'adapter' in model_args.model_name_or_path:  # add lora-adapter to the original model
-        model = model_class.from_pretrained(config.base_model_name_or_path)
+    if is_adapter:  # add lora-adapter to the original model
+        model = model_class.from_pretrained(config.base_model_name_or_path, **decoder_model_load_kwargs)
         # 加载 LoRA 适配器，里面有个函数load_adapter
         model = PeftModel.from_pretrained(model, model_args.model_name_or_path)
     # 在现有的模型上 初始化一个新的 LoRA 适配器
-    elif 'llama' in model_args.model_name_or_path.lower():
+    elif decoder_model:
         model = model_class.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None
+            use_auth_token=True if model_args.use_auth_token else None,
+            **decoder_model_load_kwargs,
         )
 
-        # 这里修改其他PEFT方法
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_dim, lora_alpha=32, lora_dropout=0.1
         )
         model = get_peft_model(model, peft_config)
-
-        # 如 prefix tuning
-        # from peft import PrefixTuningConfig, get_peft_model
-        #
-        # peft_config = PrefixTuningConfig(
-        #     task_type=TaskType.CAUSAL_LM,  # 任务类型，比如语言模型
-        #     num_virtual_tokens=20,  # 添加的虚拟前缀的长度
-        #     prefix_projection=False,  # 是否对前缀进行线性投影
-        # )
-        # model = get_peft_model(model, peft_config)
     else:
         model = model_class.from_pretrained(
             model_args.model_name_or_path,
@@ -532,10 +548,10 @@ def main():
     # 确保模型的词嵌入矩阵与 tokenizer 的词汇表大小一致
     model.resize_token_embeddings(len(tokenizer))
 
-    if 'llama' in model_args.model_name_or_path.lower():
-        model.generation_config.bos_token_id = 1
-        model.generation_config.eos_token_id = 2
-        model.generation_config.pad_token_id = 1
+    if decoder_model:
+        model.generation_config.bos_token_id = tokenizer.bos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
 
     # fix lora_A/B (bases of previous LoRA parameters, loaded in "load_adapter"[peft_momdel.py])
     # fine-tune loranew_A/B (initialized in "update_layer"[lora.py])
