@@ -767,6 +767,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     current_task_ewc_cache = {}
     current_task_replay_cache = {}
+    adaptive_round_stats = defaultdict(list)
 
     trainer = UIETrainer(
         model=global_model,
@@ -1319,6 +1320,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         aggregated[k] += delta[k] * w
                     total += w
 
+                    if _is_main() and getattr(trainer, "adaptive_task_stats", None) is not None:
+                        stat = copy.deepcopy(trainer.adaptive_task_stats)
+                        stat["global_round"] = int(rnd + 1)
+                        adaptive_round_stats[cid].append(stat)
+
                     if _is_main():
 
                         client_state.update(F_client, theta_last)  # 此处 client_state 包含 T-1 历史，被更新为 T 的状态
@@ -1387,6 +1393,69 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         except Exception:
             pass
         gc.collect()
+
+    if method == "adaptive" and data_args.task > 1 and _is_main():
+        adaptive_dir = os.path.join(current_output_dir, "adaptive_stats")
+        os.makedirs(adaptive_dir, exist_ok=True)
+
+        # 1) 先保存最原始的 round-level stats
+        round_stats_path = os.path.join(
+            adaptive_dir,
+            f"task_{data_args.task}_client_round_stats.json"
+        )
+        with open(round_stats_path, "w", encoding="utf-8") as f:
+            json.dump(adaptive_round_stats, f, indent=2, ensure_ascii=False)
+
+        # 2) 再做一个按 client 聚合后的 task-level summary
+        client_task_summary = {}
+
+        for cid, stats_list in adaptive_round_stats.items():
+            if len(stats_list) == 0:
+                continue
+
+            total_updates = sum(x.get("total_update_events", 0) for x in stats_list)
+            total_risky = sum(x.get("risky_event_count", 0) for x in stats_list)
+            total_capped = sum(x.get("capped_event_count", 0) for x in stats_list)
+
+            eta_count = sum(x.get("eta_summary", {}).get("count", 0) or 0 for x in stats_list)
+            eta_safe_count = sum(x.get("eta_safe_summary", {}).get("count", 0) or 0 for x in stats_list)
+
+            eta_sum = sum(
+                (x.get("eta_summary", {}).get("mean", 0.0) or 0.0) *
+                (x.get("eta_summary", {}).get("count", 0) or 0)
+                for x in stats_list
+            )
+            eta_safe_sum = sum(
+                (x.get("eta_safe_summary", {}).get("mean", 0.0) or 0.0) *
+                (x.get("eta_safe_summary", {}).get("count", 0) or 0)
+                for x in stats_list
+            )
+
+            avg_risky_layer_ratio = float(np.mean([x.get("risky_layer_ratio", 0.0) for x in stats_list]))
+            avg_capped_layer_ratio = float(np.mean([x.get("capped_layer_ratio", 0.0) for x in stats_list]))
+            avg_selected_layer_ratio = float(np.mean([x.get("selected_layer_ratio", 0.0) for x in stats_list]))
+
+            client_task_summary[str(cid)] = {
+                "num_round_records": len(stats_list),
+                "total_update_events": int(total_updates),
+                "risky_event_count": int(total_risky),
+                "risky_event_ratio": (total_risky / total_updates) if total_updates > 0 else 0.0,
+                "capped_event_count": int(total_capped),
+                "capped_event_ratio": (total_capped / total_updates) if total_updates > 0 else 0.0,
+                "eta_mean": (eta_sum / eta_count) if eta_count > 0 else None,
+                "eta_safe_mean": (eta_safe_sum / eta_safe_count) if eta_safe_count > 0 else None,
+                "avg_risky_layer_ratio": avg_risky_layer_ratio,
+                "avg_capped_layer_ratio": avg_capped_layer_ratio,
+                "avg_selected_layer_ratio": avg_selected_layer_ratio,
+            }
+
+        task_summary_path = os.path.join(
+            adaptive_dir,
+            f"task_{data_args.task}_client_task_summary.json"
+        )
+        with open(task_summary_path, "w", encoding="utf-8") as f:
+            json.dump(client_task_summary, f, indent=2, ensure_ascii=False)
+
 
 
     # ===== 任务结束：将“本任务”信息并入历史 =====

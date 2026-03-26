@@ -79,6 +79,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="qiuwenqi@172.31.233.249:22 key">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
     </serverData>
     <option name="myAutoUpload" value="ALWAYS" />
   </component>

@@ -17,7 +17,7 @@ lr=1e-05
 radius=1.0
 com_budget=0
 is_random_select=False
-
+di_alpha=1
 # 根据is_random_select生成对应的参数（核心修改）
 if [ "$is_random_select" = "True" ]; then
     random_layer_param="--random_layer_selection True"
@@ -27,7 +27,7 @@ fi
 
 # bash scripts/order_1_adaptive.sh> logs_and_outputs/order_1/logs/train_and_infer.log 2>&1 | tee run_order3_llama_adaptive_5e-04.log
 
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -38,15 +38,15 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --model_name_or_path /home/qiuwenqi/LLM/models/llama-2-7b-hf \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task748_glucose_reverse_cause_event_detection \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/1-task748_glucose_reverse_cause_event_detection \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/1-task748_glucose_reverse_cause_event_detection \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round1 \
@@ -78,7 +78,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 
 sleep 5
 
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -86,18 +86,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/1-task748_glucose_reverse_cause_event_detection/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/1-task748_glucose_reverse_cause_event_detection/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task073_commonsenseqa_answer_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/2-task073_commonsenseqa_answer_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/2-task073_commonsenseqa_answer_generation \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round2 \
@@ -130,7 +130,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 3: task1590
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -138,18 +138,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/2-task073_commonsenseqa_answer_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/2-task073_commonsenseqa_answer_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1590_diplomacy_text_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/3-task1590_diplomacy_text_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/3-task1590_diplomacy_text_generation \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round3 \
@@ -182,7 +182,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 4: task639
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -190,18 +190,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/3-task1590_diplomacy_text_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/3-task1590_diplomacy_text_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task639_multi_woz_user_utterance_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/4-task639_multi_woz_user_utterance_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/4-task639_multi_woz_user_utterance_generation \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round4 \
@@ -234,7 +234,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 5: task1572
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -242,18 +242,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/4-task639_multi_woz_user_utterance_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/4-task639_multi_woz_user_utterance_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1572_samsum_summary \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/5-task1572_samsum_summary \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/5-task1572_samsum_summary \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round5 \
@@ -286,7 +286,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 6: task1687
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -294,18 +294,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/5-task1572_samsum_summary/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/5-task1572_samsum_summary/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1687_sentiment140_classification \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/6-task1687_sentiment140_classification \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/6-task1687_sentiment140_classification \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round6 \
@@ -337,7 +337,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 
 sleep 5
 
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -345,18 +345,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/6-task1687_sentiment140_classification/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/6-task1687_sentiment140_classification/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task591_sciq_answer_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/7-task591_sciq_answer_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/7-task591_sciq_answer_generation \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round7 \
@@ -389,7 +389,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 8: task363
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -397,18 +397,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/7-task591_sciq_answer_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/7-task591_sciq_answer_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task363_sst2_polarity_classification \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/8-task363_sst2_polarity_classification \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/8-task363_sst2_polarity_classification \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round8 \
@@ -441,7 +441,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 9: task1510
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -449,18 +449,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/8-task363_sst2_polarity_classification/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/8-task363_sst2_polarity_classification/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1510_evalution_relation_extraction \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/9-task1510_evalution_relation_extraction \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/9-task1510_evalution_relation_extraction \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round9 \
@@ -492,7 +492,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 
 sleep 5
 
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -500,18 +500,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/9-task1510_evalution_relation_extraction/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/9-task1510_evalution_relation_extraction/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1729_personachat_generate_next \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/10-task1729_personachat_generate_next \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/10-task1729_personachat_generate_next \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round10 \
@@ -544,7 +544,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 11: task181
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -552,18 +552,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/10-task1729_personachat_generate_next/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/10-task1729_personachat_generate_next/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task181_outcome_extraction \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/11-task181_outcome_extraction \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/11-task181_outcome_extraction \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round11 \
@@ -596,7 +596,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 12: task511
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -604,18 +604,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/11-task181_outcome_extraction/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/11-task181_outcome_extraction/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task511_reddit_tifu_long_text_summarization \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/12-task511_reddit_tifu_long_text_summarization \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/12-task511_reddit_tifu_long_text_summarization \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round12 \
@@ -648,7 +648,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 13: task002
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -656,18 +656,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/12-task511_reddit_tifu_long_text_summarization/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/12-task511_reddit_tifu_long_text_summarization/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task002_quoref_answer_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/13-task002_quoref_answer_generation \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/13-task002_quoref_answer_generation \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round13 \
@@ -700,7 +700,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 14: task1290
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -708,18 +708,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/13-task002_quoref_answer_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/13-task002_quoref_answer_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1290_xsum_summarization \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/14-task1290_xsum_summarization \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/14-task1290_xsum_summarization \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round14 \
@@ -752,7 +752,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
 sleep 5
 
 # Task 15: task875
-CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/accelerate_config.yaml\
    --main_process_port $port \
    src/run_uie_lora.py \
    --report_to none \
@@ -760,18 +760,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file script_accelerate/acc
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/outputs/$lr/14-task1290_xsum_summarization/adapter \
+   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/14-task1290_xsum_summarization/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task875_emotion_classification \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/outputs/$lr/15-task875_emotion_classification \
-   --per_device_train_batch_size 8 \
-   --per_device_eval_batch_size 8 \
+   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/15-task875_emotion_classification \
+   --per_device_train_batch_size 32 \
+   --per_device_eval_batch_size 32 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
    --num_clients 50 \
    --clients_per_round 5 \
-   --dirichlet_alpha 10 \
+   --dirichlet_alpha $di_alpha \
    --comm_budget $com_budget \
    --learning_rate $lr \
    --run_name order2_round15 \

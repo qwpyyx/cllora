@@ -346,6 +346,19 @@ class AdaptiveAdamW(Optimizer):
                     state['B_round'] = torch.tensor(0.0, device=p.device)
                     state['conf'] = 0
 
+                    state['capped_count'] = 0
+                    state['update_count'] = 0
+
+                    state['eta_sum'] = 0.0
+                    state['eta_count'] = 0
+                    state['eta_min'] = float('inf')
+                    state['eta_max'] = float('-inf')
+
+                    state['eta_safe_sum'] = 0.0
+                    state['eta_safe_count'] = 0
+                    state['eta_safe_min'] = float('inf')
+                    state['eta_safe_max'] = float('-inf')
+
                 state['step'] += 1
                 t = state['step']
 
@@ -410,7 +423,7 @@ class AdaptiveAdamW(Optimizer):
                 beta_hat = torch.clamp(beta_hat, min=1.0)
 
                 eta = torch.tensor(0.0, device=p.device, dtype=g_float.dtype)
-
+                eta_safe_to_log = None
                 if Q_local > 0:
                     if S_local < 0:
                         # Eq. (8): conflicting layers use certified safe step size
@@ -422,8 +435,10 @@ class AdaptiveAdamW(Optimizer):
                             )
                             eta_safe = ((S_local - self.vartheta) + torch.sqrt(discr)) / (Q_local + eps)
                             eta = torch.clamp(eta_safe, min=0.0, max=lr_cap)
+                            eta_safe_to_log = float(eta_safe.detach())
                         else:
                             eta = torch.tensor(0.0, device=p.device, dtype=g_float.dtype)
+                            eta_safe_to_log = 0.0
                         state['conf'] += 1
                     else:
                         # Eq. (10): non-conflicting layers use lightweight basin cap
@@ -483,6 +498,25 @@ class AdaptiveAdamW(Optimizer):
                 # 记录实际使用的步长用于日志
                 eta_scalar = float(step_size.detach())
                 state['eta_last'] = eta_scalar
+
+                # ===== 统计 adaptive 学习率 / capped / risky 指标 =====
+                state['update_count'] += 1
+
+                state['eta_sum'] += eta_scalar
+                state['eta_count'] += 1
+                state['eta_min'] = min(state['eta_min'], eta_scalar)
+                state['eta_max'] = max(state['eta_max'], eta_scalar)
+
+                if eta_safe_to_log is not None:
+                    state['eta_safe_sum'] += float(eta_safe_to_log)
+                    state['eta_safe_count'] += 1
+                    state['eta_safe_min'] = min(state['eta_safe_min'], float(eta_safe_to_log))
+                    state['eta_safe_max'] = max(state['eta_safe_max'], float(eta_safe_to_log))
+
+                # 只要实际步长小于 lr_cap，就认为发生了 cap
+                if eta_scalar < (lr_cap - 1e-12):
+                    state['capped_count'] += 1
+
 
                 # 统计
                 debug_eta_sum += eta_scalar
@@ -653,7 +687,7 @@ class UIETrainer(Seq2SeqTrainer):
         self.varsigma = float(getattr(self.args, "varsigma", 0.3))
         self.beta_eps = float(getattr(self.args, "beta_eps", 1e-12))
 
-
+        self.adaptive_task_stats = None
         self.ewc_fisher = ewc_fisher
         self.ewc_params = ewc_params
         self.ewc_lambda = getattr(self.args, "ewc_lambda", 0.0)
@@ -1082,6 +1116,7 @@ class UIETrainer(Seq2SeqTrainer):
             return super().train(**kwargs)
 
         elif self.method == "adaptive" and task_id > 1:
+            self.adaptive_task_stats = None
 
             def _canon_name(name: str) -> str:
                 return name[7:] if name.startswith("module.") else name
@@ -1307,8 +1342,160 @@ class UIETrainer(Seq2SeqTrainer):
 
             delta = adaptive_delta
 
+            def _finite_or_none(v):
+                if v is None:
+                    return None
+                if isinstance(v, (float, int)):
+                    if v == float('inf') or v == float('-inf'):
+                        return None
+                    return float(v)
+                return float(v)
 
+            per_layer_stats = {}
+            total_updates = 0
+            total_risky_events = 0
+            total_capped_events = 0
 
+            total_eta_sum = 0.0
+            total_eta_count = 0
+            total_eta_safe_sum = 0.0
+            total_eta_safe_count = 0
+
+            eta_global_min = None
+            eta_global_max = None
+            eta_safe_global_min = None
+            eta_safe_global_max = None
+
+            layers_with_risk = 0
+            layers_with_cap = 0
+            selected_layers_count = 0
+
+            # 这里 name_to_p / selection_map / names / values / self.layer_costs
+            # 都是 adaptive 分支里你原本就有的变量
+            value_map = dict(zip(names, values))
+
+            for name, p in name_to_p.items():
+                selected_for_upload = bool(selection_map.get(name, True))
+                if selected_for_upload:
+                    selected_layers_count += 1
+
+                if p in self.optimizer.state:
+                    state = self.optimizer.state[p]
+
+                    step_count = int(state.get('update_count', 0))
+                    risk_count = int(state.get('conf', 0))
+                    capped_count = int(state.get('capped_count', 0))
+
+                    eta_count = int(state.get('eta_count', 0))
+                    eta_safe_count = int(state.get('eta_safe_count', 0))
+
+                    eta_sum = float(state.get('eta_sum', 0.0))
+                    eta_safe_sum = float(state.get('eta_safe_sum', 0.0))
+
+                    eta_min = _finite_or_none(state.get('eta_min'))
+                    eta_max = _finite_or_none(state.get('eta_max'))
+                    eta_safe_min = _finite_or_none(state.get('eta_safe_min'))
+                    eta_safe_max = _finite_or_none(state.get('eta_safe_max'))
+
+                    eta_last = float(state.get('eta_last', 0.0))
+                else:
+                    step_count = 0
+                    risk_count = 0
+                    capped_count = 0
+                    eta_count = 0
+                    eta_safe_count = 0
+                    eta_sum = 0.0
+                    eta_safe_sum = 0.0
+                    eta_min = None
+                    eta_max = None
+                    eta_safe_min = None
+                    eta_safe_max = None
+                    eta_last = 0.0
+
+                if risk_count > 0:
+                    layers_with_risk += 1
+                if capped_count > 0:
+                    layers_with_cap += 1
+
+                total_updates += step_count
+                total_risky_events += risk_count
+                total_capped_events += capped_count
+
+                total_eta_sum += eta_sum
+                total_eta_count += eta_count
+                total_eta_safe_sum += eta_safe_sum
+                total_eta_safe_count += eta_safe_count
+
+                if eta_min is not None:
+                    eta_global_min = eta_min if eta_global_min is None else min(eta_global_min, eta_min)
+                if eta_max is not None:
+                    eta_global_max = eta_max if eta_global_max is None else max(eta_global_max, eta_max)
+
+                if eta_safe_min is not None:
+                    eta_safe_global_min = eta_safe_min if eta_safe_global_min is None else min(eta_safe_global_min,
+                                                                                               eta_safe_min)
+                if eta_safe_max is not None:
+                    eta_safe_global_max = eta_safe_max if eta_safe_global_max is None else max(eta_safe_global_max,
+                                                                                               eta_safe_max)
+
+                per_layer_stats[name] = {
+                    "step_count": step_count,
+                    "risk_count": risk_count,
+                    "risk_ratio": (risk_count / step_count) if step_count > 0 else 0.0,
+                    "capped_count": capped_count,
+                    "capped_ratio": (capped_count / step_count) if step_count > 0 else 0.0,
+                    "eta_mean": (eta_sum / eta_count) if eta_count > 0 else None,
+                    "eta_min": eta_min,
+                    "eta_max": eta_max,
+                    "eta_last": eta_last,
+                    "eta_safe_mean": (eta_safe_sum / eta_safe_count) if eta_safe_count > 0 else None,
+                    "eta_safe_min": eta_safe_min,
+                    "eta_safe_max": eta_safe_max,
+                    "eta_safe_count": eta_safe_count,
+                    "selected_for_upload": selected_for_upload,
+                    "selection_value": float(value_map.get(name, 0.0)),
+                    "selection_cost": int(self.layer_costs.get(name, 0)),
+                }
+
+            num_layers = len(per_layer_stats)
+
+            self.adaptive_task_stats = {
+                "task_id": int(task_id),
+                "cid": int(cid),
+                "num_layers": int(num_layers),
+                "selected_layers_count": int(selected_layers_count),
+                "selected_layer_ratio": (selected_layers_count / num_layers) if num_layers > 0 else 0.0,
+
+                "total_update_events": int(total_updates),
+
+                "risky_event_count": int(total_risky_events),
+                "risky_event_ratio": (total_risky_events / total_updates) if total_updates > 0 else 0.0,
+
+                "capped_event_count": int(total_capped_events),
+                "capped_event_ratio": (total_capped_events / total_updates) if total_updates > 0 else 0.0,
+
+                "layers_with_risk": int(layers_with_risk),
+                "risky_layer_ratio": (layers_with_risk / num_layers) if num_layers > 0 else 0.0,
+
+                "layers_with_cap": int(layers_with_cap),
+                "capped_layer_ratio": (layers_with_cap / num_layers) if num_layers > 0 else 0.0,
+
+                "eta_summary": {
+                    "count": int(total_eta_count),
+                    "mean": (total_eta_sum / total_eta_count) if total_eta_count > 0 else None,
+                    "min": eta_global_min,
+                    "max": eta_global_max,
+                },
+
+                "eta_safe_summary": {
+                    "count": int(total_eta_safe_count),
+                    "mean": (total_eta_safe_sum / total_eta_safe_count) if total_eta_safe_count > 0 else None,
+                    "min": eta_safe_global_min,
+                    "max": eta_safe_global_max,
+                },
+
+                "per_layer": per_layer_stats,
+            }
 
             return delta, F_client, theta_last
 

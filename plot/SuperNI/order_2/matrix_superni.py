@@ -8,12 +8,12 @@ import re
 # 请根据您的设置修改这些变量
 BENCHMARK = "SuperNI"
 ORDER = "order_2_llama"
-METHOD = "lorm"
-LR = "1e-05-5%-topk"
+METHOD = "pilora"
+LR = "1e-05-alpha1"
 
 # 基础路径，指向包含 '1-task748...', '2-task073...' 等的目录
-BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/{METHOD}/results/{BENCHMARK}/sparsity/{ORDER}/{METHOD}/llama/outputs/topk/{LR}/"
-# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}/"
+BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_2_llama/{METHOD}/llama/alpha/1/outputs/1e-05-alpha1/"
+# BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_2_llama/replay/llama/alpha/1/outputs/1e-05"
 # BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/ablation/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}"
 # /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_1_llama/lora_origin/llama/outputs/5e-05
 # *** 新增：SuperNI 任务 ID 到指标的映射 ***
