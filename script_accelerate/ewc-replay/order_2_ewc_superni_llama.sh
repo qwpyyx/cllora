@@ -9,15 +9,15 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 port=$(shuf -i25000-30000 -n1)
-method=gem
+method=lora_origin
 lora_rank=8
 lamda_2=0
 lamda_1=0
-lr=1e-05
+lr=1e-04
 radius=1.0
 com_budget=0
 is_random_select=False
-di_alpha=1
+di_alpha=0.1
 # 根据is_random_select生成对应的参数（核心修改）
 if [ "$is_random_select" = "True" ]; then
     random_layer_param="--random_layer_selection True"

@@ -8,11 +8,11 @@ import re
 # 请根据您的设置修改这些变量
 BENCHMARK = "SuperNI"
 ORDER = "order_2_llama"
-METHOD = "pilora"
-LR = "1e-05-alpha1"
-
+METHOD = "lora_origin"
+LR = "1e-04"
+alpha="alpha0-1"
 # 基础路径，指向包含 '1-task748...', '2-task073...' 等的目录
-BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_2_llama/{METHOD}/llama/alpha/1/outputs/1e-05-alpha1/"
+BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_2_llama/{METHOD}/llama/alpha/{alpha}/outputs/{LR}/"
 # BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_2_llama/replay/llama/alpha/1/outputs/1e-05"
 # BASE_PATH = f"/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/ablation/{BENCHMARK}/{ORDER}/{METHOD}/llama/outputs/{LR}"
 # /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/results/SuperNI/order_1_llama/lora_origin/llama/outputs/5e-05
@@ -46,7 +46,7 @@ METRIC_TO_JSON_KEY = {
 }
 
 # Excel 文件保存路径
-OUTPUT_EXCEL_FILE = f"cl_metrics_{BENCHMARK}_{ORDER}_{METHOD}_{LR}.xlsx"
+OUTPUT_EXCEL_FILE = f"cl_metrics_{BENCHMARK}_{ORDER}_{METHOD}_{alpha}_{LR}.xlsx"
 
 
 # --- 配置结束 ---
