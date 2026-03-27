@@ -1,0 +1,84 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===== Virtual env / Conda =====
+.venv/
+venv/
+env/
+ENV/
+conda-meta/
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+*.log
+logs/
+log/
+
+# ===== Checkpoints / model outputs =====
+checkpoint*/
+checkpoints/
+outputs/
+results/
+runs/
+wandb/
+tensorboard/
+tb_logs/
+events.out.tfevents.*
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# ===== Hugging Face / cache =====
+.cache/
+.huggingface/
+hf_cache/
+**/.cache/
+**/downloads/
+**/downloads_extracted/
+
+# ===== DeepSpeed / distributed / temp =====
+*.lock
+*.incomplete.lock
+*.json.tmp
+hostfile
+*.ds
+deepspeed_env.txt
+
+# ===== Data / local artifacts =====
+data_cache/
+tmp/
+temp/
+debug/
+profile/
+
+# ===== Experiment folders you do NOT want to upload =====
+new_order_1/
+
+# ===== Optional: ignore other generated experiment folders =====
+new_order_2/
+new_order_3/
+results*/
+outputs*/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Coverage / test =====
+.coverage
+.pytest_cache/
+htmlcov/
