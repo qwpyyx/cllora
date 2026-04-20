@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="qiuwenqi@172.31.233.163:22 key (9)" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="qiuwenqi@172.31.233.249:22 key (3)" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
       <paths name="qiuwenqi@172.31.233.163:22 key">
         <serverdata>
@@ -13,6 +13,27 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.163:22 key (11)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.163:22 key (12)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.163:22 key (13)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
@@ -83,6 +104,20 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.249:22 key (2)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="qiuwenqi@172.31.233.249:22 key (3)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/qiuwenqi/LLM/Third_work" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

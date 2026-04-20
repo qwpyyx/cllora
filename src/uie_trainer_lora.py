@@ -728,11 +728,40 @@ class UIETrainer(Seq2SeqTrainer):
             batch = next(self.gem_iterator)
         return self._prepare_inputs(batch)
 
+    def compute_loss(
+            self,
+            model,
+            inputs,
+            return_outputs=False,
+            num_items_in_batch=None,
+    ):
+        # 兼容 decoder-only 多出来的字段，避免 model(**inputs) 报错
+        if "input_ids_wo_label" in inputs:
+            inputs = dict(inputs)
+            inputs.pop("input_ids_wo_label", None)
 
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        # 还原为只调用父类，不要在这里算 EWC
-        return super().compute_loss(model, inputs, return_outputs)
+        # 兼容不同 transformers 版本
+        try:
+            if num_items_in_batch is None:
+                return super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                )
+            else:
+                return super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+        except TypeError:
+            # 兼容旧版 transformers：没有 num_items_in_batch
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+            )
 
 
     def get_decay_parameter_names(self, model) -> List[str]:
@@ -743,25 +772,34 @@ class UIETrainer(Seq2SeqTrainer):
         decay_parameters = [name for name in decay_parameters if "bias" not in name]
         return decay_parameters
 
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+    def training_step(
+            self,
+            model: nn.Module,
+            inputs: Dict[str, Union[torch.Tensor, Any]],
+            num_items_in_batch: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         1. 执行标准的前向+反向传播 (Super Class Logic)
-        2. [EWC核心修复] 在反向传播结束后，手动计算并叠加 EWC 梯度
+        2. 在反向传播结束后，叠加你自己的 GEM / EWC / PiLoRA 等逻辑
+        兼容新旧 Transformers:
+          - 旧版: super().training_step(model, inputs)
+          - 新版: super().training_step(model, inputs, num_items_in_batch)
         """
 
-        # 1) 兼容 decoder-only（LLaMA）多出来的字段，防止 model(**inputs) 报错
+        # 1) 兼容 decoder-only 多出来的字段，防止 model(**inputs) 报错
         if "input_ids_wo_label" in inputs:
-            # 拷一份，避免修改到 Trainer 外部的原始 dict
             inputs = dict(inputs)
             inputs.pop("input_ids_wo_label", None)
 
         # 2) 交给父类做真正的前向 + 反向（包括 Deepspeed / Accelerate 逻辑）
         try:
-            loss = super().training_step(model, inputs)
+            if num_items_in_batch is None:
+                loss = super().training_step(model, inputs)
+            else:
+                loss = super().training_step(model, inputs, num_items_in_batch)
         except Exception as exc:
             msg = str(exc)
 
-            # 仅 LoRM：遇到 DDP reducer 级别错误不要吞（吞了会导致各 rank 状态不一致，后续“随机炸”）
             if self.args.method == "lorm" and any(
                     k in msg for k in [
                         "Expected to mark a variable ready only once",
@@ -772,12 +810,8 @@ class UIETrainer(Seq2SeqTrainer):
                 logger.exception("[LoRM][DDP] Fatal error in training_step, re-raising.")
                 raise
 
-            logger.error(f"training_step 错误: {exc}")
-            return torch.tensor(
-                0.0,
-                device=self.accelerator.device if hasattr(self, "accelerator") else None,
-                requires_grad=False,
-            )
+            logger.exception(f"training_step 错误: {exc}")
+            raise
 
         if self.args.method == "gem" and self.gem_loader is not None:
             # (A) 筛选可训练参数 (LoRA)
@@ -1549,7 +1583,7 @@ class UIETrainer(Seq2SeqTrainer):
             logger.info(f"  Num examples = {self.num_examples(dataloader)}")
         else:
             logger.info("  Num examples: Unknown")
-        logger.info(f"  Batch size = {batch_size}")
+        logger.info(f"  Batch size = {batch_size if batch_size is not None else 'auto-detect'}")
 
         model.eval()
 
@@ -1705,15 +1739,71 @@ class UIETrainer(Seq2SeqTrainer):
             "do_sample": False,
         }
 
-        # 针对 Llama 的特殊配置
-        if inputs.get("input_ids_wo_label", None) is not None:
-            gen_kwargs.update({
-                "bos_token_id": 1,
-                "eos_token_id": 2,
-                "pad_token_id": 0,
-            })
+        # # 针对 Llama 的特殊配置
+        # if inputs.get("input_ids_wo_label", None) is not None:
+        #     gen_kwargs.update({
+        #         "bos_token_id": 1,
+        #         "eos_token_id": 2,
+        #         "pad_token_id": 0,
+        #     })
+        # else:
+        #     # T5 配置
+        #     gen_kwargs.update({
+        #         "decoder_start_token_id": 0,
+        #         "eos_token_id": 1,
+        #         "pad_token_id": 0,
+        #     })
+
+        # 严格隔离：T5 / LLaMA / Qwen 分开处理
+        model_name = getattr(model.config, "_name_or_path", "")
+        model_name = (model_name or "").lower()
+
+        is_llama = ("llama" in model_name) or ("vicuna" in model_name)
+        is_qwen = ("qwen" in model_name)
+        is_enc_dec = bool(getattr(model.config, "is_encoder_decoder", False))
+
+        if not is_enc_dec:
+            # decoder-only: LLaMA / Qwen
+            if is_llama:
+                # 保持你原来的 LLaMA 行为
+                gen_kwargs.update({
+                    "bos_token_id": 1,
+                    "eos_token_id": 2,
+                    "pad_token_id": 0,
+                })
+            elif is_qwen:
+                # Qwen: 用模型/分词器自身 special token
+                bos_id = getattr(model.config, "bos_token_id", None)
+                eos_id = getattr(model.config, "eos_token_id", None)
+                pad_id = getattr(model.config, "pad_token_id", None)
+
+                if bos_id is None:
+                    bos_id = getattr(self.tokenizer, "bos_token_id", None)
+                if eos_id is None:
+                    eos_id = getattr(self.tokenizer, "eos_token_id", None)
+                if pad_id is None:
+                    pad_id = getattr(self.tokenizer, "pad_token_id", None)
+
+                if bos_id is not None:
+                    gen_kwargs["bos_token_id"] = bos_id
+                if eos_id is not None:
+                    gen_kwargs["eos_token_id"] = eos_id
+                if pad_id is not None:
+                    gen_kwargs["pad_token_id"] = pad_id
+            else:
+                # 兜底 decoder-only：尽量不写死
+                bos_id = getattr(model.config, "bos_token_id", None)
+                eos_id = getattr(model.config, "eos_token_id", None)
+                pad_id = getattr(model.config, "pad_token_id", None)
+
+                if bos_id is not None:
+                    gen_kwargs["bos_token_id"] = bos_id
+                if eos_id is not None:
+                    gen_kwargs["eos_token_id"] = eos_id
+                if pad_id is not None:
+                    gen_kwargs["pad_token_id"] = pad_id
         else:
-            # T5 配置
+            # T5: 保持旧逻辑
             gen_kwargs.update({
                 "decoder_start_token_id": 0,
                 "eos_token_id": 1,

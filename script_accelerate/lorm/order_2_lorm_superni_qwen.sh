@@ -9,7 +9,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 port=$(shuf -i25000-30000 -n1)
-method=lora_origin
+method=lorm
 lora_rank=8
 lamda_2=0
 lamda_1=0
@@ -35,12 +35,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path /home/qiuwenqi/LLM/models/llama-2-7b-hf \
+   --model_name_or_path /home/qiuwenqi/LLM/models/Qwen2.5-14B-Instruct \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task748_glucose_reverse_cause_event_detection \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/1-task748_glucose_reverse_cause_event_detection \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/1-task748_glucose_reverse_cause_event_detection \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -73,6 +73,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -85,12 +86,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/1-task748_glucose_reverse_cause_event_detection/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/1-task748_glucose_reverse_cause_event_detection/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task073_commonsenseqa_answer_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/2-task073_commonsenseqa_answer_generation \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/2-task073_commonsenseqa_answer_generation \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -123,6 +124,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -136,12 +138,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/2-task073_commonsenseqa_answer_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/2-task073_commonsenseqa_answer_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1590_diplomacy_text_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/3-task1590_diplomacy_text_generation \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/3-task1590_diplomacy_text_generation \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -174,6 +176,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -187,12 +190,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/3-task1590_diplomacy_text_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/3-task1590_diplomacy_text_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task639_multi_woz_user_utterance_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/4-task639_multi_woz_user_utterance_generation \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/4-task639_multi_woz_user_utterance_generation \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -225,6 +228,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -238,12 +242,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/4-task639_multi_woz_user_utterance_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/4-task639_multi_woz_user_utterance_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1572_samsum_summary \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/5-task1572_samsum_summary \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/5-task1572_samsum_summary \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -276,6 +280,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -289,12 +294,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/5-task1572_samsum_summary/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/5-task1572_samsum_summary/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1687_sentiment140_classification \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/6-task1687_sentiment140_classification \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/6-task1687_sentiment140_classification \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -327,6 +332,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -339,12 +345,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/6-task1687_sentiment140_classification/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/6-task1687_sentiment140_classification/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task591_sciq_answer_generation \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/7-task591_sciq_answer_generation \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/7-task591_sciq_answer_generation \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -377,6 +383,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -390,12 +397,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --do_predict \
    --predict_with_generate \
    --lora_dim $lora_rank \
-   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/7-task591_sciq_answer_generation/adapter \
+   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/7-task591_sciq_answer_generation/adapter \
    --data_dir CL_Benchmark \
    --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task363_sst2_polarity_classification \
-   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/8-task363_sst2_polarity_classification \
-   --per_device_train_batch_size 32 \
-   --per_device_eval_batch_size 32 \
+   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/8-task363_sst2_polarity_classification \
+   --per_device_train_batch_size 16 \
+   --per_device_eval_batch_size 16 \
    --gradient_accumulation_steps 2 \
    --global_rounds 5 \
    --local_epochs 10 \
@@ -428,6 +435,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file script_accelerate/a
    --gradient_checkpointing True \
    --bf16 True \
    --ddp_find_unused_parameters False \
+   --ues_flash_attention True \
    $random_layer_param
 
 sleep 5
@@ -441,12 +449,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/8-task363_sst2_polarity_classification/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/8-task363_sst2_polarity_classification/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1510_evalution_relation_extraction \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/9-task1510_evalution_relation_extraction \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/9-task1510_evalution_relation_extraction \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -479,6 +487,7 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param
 #
 #sleep 5
@@ -491,12 +500,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/9-task1510_evalution_relation_extraction/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/9-task1510_evalution_relation_extraction/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1729_personachat_generate_next \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/10-task1729_personachat_generate_next \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/10-task1729_personachat_generate_next \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -529,6 +538,7 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param
 #
 #sleep 5
@@ -542,12 +552,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/10-task1729_personachat_generate_next/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/10-task1729_personachat_generate_next/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task181_outcome_extraction \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/11-task181_outcome_extraction \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/11-task181_outcome_extraction \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -580,6 +590,7 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param
 #
 #sleep 5
@@ -593,12 +604,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/11-task181_outcome_extraction/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/11-task181_outcome_extraction/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task511_reddit_tifu_long_text_summarization \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/12-task511_reddit_tifu_long_text_summarization \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/12-task511_reddit_tifu_long_text_summarization \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -631,6 +642,7 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param
 #
 #sleep 5
@@ -644,12 +656,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/12-task511_reddit_tifu_long_text_summarization/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/12-task511_reddit_tifu_long_text_summarization/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task002_quoref_answer_generation \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/13-task002_quoref_answer_generation \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/13-task002_quoref_answer_generation \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -682,6 +694,7 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param
 #
 #sleep 5
@@ -695,12 +708,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/13-task002_quoref_answer_generation/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/13-task002_quoref_answer_generation/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task1290_xsum_summarization \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/14-task1290_xsum_summarization \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/14-task1290_xsum_summarization \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -733,6 +746,7 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param
 #
 #sleep 5
@@ -746,12 +760,12 @@ sleep 5
 #   --do_predict \
 #   --predict_with_generate \
 #   --lora_dim $lora_rank \
-#   --model_name_or_path results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/14-task1290_xsum_summarization/adapter \
+#   --model_name_or_path results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/14-task1290_xsum_summarization/adapter \
 #   --data_dir CL_Benchmark \
 #   --task_config_dir /home/qiuwenqi/LLM/Fedfinetune/FCL/adaLR/configs/SuperniAndLongseq/gen_script_superni_order2_llama_configs/task875_emotion_classification \
-#   --output_dir results/SuperNI/order_2_llama/$method/llama/alpha/$di_alpha/outputs/$lr/15-task875_emotion_classification \
-#   --per_device_train_batch_size 32 \
-#   --per_device_eval_batch_size 32 \
+#   --output_dir results/SuperNI/order_2_qwen/$method/qwen/alpha/$di_alpha/outputs/$lr/15-task875_emotion_classification \
+#   --per_device_train_batch_size 16 \
+#   --per_device_eval_batch_size 16 \
 #   --gradient_accumulation_steps 2 \
 #   --global_rounds 5 \
 #   --local_epochs 10 \
@@ -784,4 +798,5 @@ sleep 5
 #   --gradient_checkpointing True \
 #   --bf16 True \
 #   --ddp_find_unused_parameters False \
+#   --ues_flash_attention True \
 #   $random_layer_param

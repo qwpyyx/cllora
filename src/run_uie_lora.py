@@ -303,6 +303,245 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
     pilora_reg_targets: str = field(default="A,B")   # "A" or "B" or "A,B"
     pilora_normalize: bool = field(default=False)
 
+    upload_atomic_mode: str = field(
+        default="tensor",
+        metadata={
+            "help": (
+                "Upload atomicity mode for lora_origin sparse upload. "
+                "Choices: tensor, ab_pair, qv_block. "
+                "tensor = original tensor-level upload; "
+                "ab_pair = upload LoRA A/B of the same module together; "
+                "qv_block = upload q_proj/v_proj LoRA tensors in the same transformer layer together."
+            )
+        }
+    )
+
+
+    upload_score_mode: str = field(
+        default="factor_norm",
+        metadata={
+            "help": (
+                "Score used for lora_origin sparse upload selection. "
+                "Choices: factor_norm, effective_norm, sn_p1p2. "
+                "factor_norm = current A/B-pair score sqrt(||U_A||^2+||U_B||^2); "
+                "effective_norm = rank A/B pairs by ||B U_A + U_B A + U_B U_A||_F; "
+                "sn_p1p2 = server-side signal-noise P1 allocation plus gap-aware P2 assignment. "
+                "effective_norm is supported for ab_pair; sn_p1p2 is supported for ab_pair and qv_block."
+            )
+        }
+    )
+
+    sn_gap_eta: float = field(
+        default=1.0,
+        metadata={"help": "Gap-aware redundancy coefficient eta for upload_score_mode=sn_p1p2."}
+    )
+
+    sn_force_full_budget: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, P1 keeps allocating units until the total budget is exhausted even when "
+                "marginal gains become non-positive. Default False follows the positive-marginal theory."
+            )
+        }
+    )
+
+    sn_min_signal_eps: float = field(
+        default=1e-12,
+        metadata={"help": "Numerical floor used when clipping estimated signal/noise in sn_p1p2."}
+    )
+
+    sn_save_diagnostics: bool = field(
+        default=True,
+        metadata={"help": "Save per-round signal/noise quota and assignment diagnostics for sn_p1p2."}
+    )
+
+    sn_p1_norm_mode: str = field(
+        default="raw",
+        metadata={
+            "help": (
+                "Normalization mode for P1 signal-noise allocation. "
+                "Choices: raw/none, rank, depth_rank, depth_balanced. "
+                "depth_rank rank-normalizes a_m and b_m inside depth groups; "
+                "depth_balanced additionally reserves P1 quota for lower/middle/upper depth groups."
+            )
+        }
+    )
+
+    sn_depth_group_ratios: str = field(
+        default="1,1,2",
+        metadata={
+            "help": (
+                "Comma-separated lower,middle,upper P1 quota ratios used when "
+                "sn_p1_norm_mode=depth_balanced. Default 1,1,2."
+            )
+        }
+    )
+
+    upload_diversity_mode: str = field(
+        default="none",
+        metadata={
+            "help": (
+                "System-level diversity mode for lora_origin sparse upload. "
+                "Choices: none, group_mask, coverage_penalty. "
+                "none = independent client-side Top-K; "
+                "group_mask = assign different clients to different LoRA unit groups; "
+                "coverage_penalty = penalize units already selected by previous clients in the same round."
+            )
+        }
+    )
+
+    diversity_num_groups: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Number of LoRA unit groups used when upload_diversity_mode=group_mask."
+            )
+        }
+    )
+
+    coverage_penalty_beta: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Penalty strength used when upload_diversity_mode=coverage_penalty. "
+                "The adjusted score is score / (1 + beta * current_round_coverage_count)."
+            )
+        }
+    )
+
+    diagnose_pair_saliency: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, record A/B-pair saliency diagnostics: "
+                "factor-norm vs effective-update ranking mismatch and "
+                "Top-K instability under equivalent LoRA reparameterization. "
+                "This does not affect training, selection, residuals, or aggregation."
+            )
+        }
+    )
+
+    pair_saliency_reparam_scales: str = field(
+        default="0.25,0.5,2,4",
+        metadata={
+            "help": (
+                "Comma-separated positive scaling factors used by pair saliency diagnostics. "
+                "For each A/B pair, A' = cA and B' = B/c leave BA unchanged but change factor norms."
+            )
+        }
+    )
+
+    pair_saliency_save_top_units: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, save top factor-score and effective-score A/B-pair unit names in diagnostics."
+            )
+        }
+    )
+
+    pair_saliency_top_n: int = field(
+        default=20,
+        metadata={"help": "Number of top units to save when pair_saliency_save_top_units=True."}
+    )
+
+    diagnose_residual_errors: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, record FedLoRA residual diagnostic metrics, including "
+                "split error, drift error, and compensation error ratios."
+            )
+        }
+    )
+
+    diagnose_drift_max_age: int = field(
+        default=5,
+        metadata={
+            "help": (
+                "Maximum residual age for multi-round drift diagnostics. "
+                "Only used when diagnose_residual_errors=True."
+            )
+        }
+    )
+
+    lora_residual_accumulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, use naive factor-space residual accumulation/error feedback "
+                "for sparse LoRA upload. Only used for method='lora_origin'."
+            )
+        }
+    )
+
+    lora_residual_max_age: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Maximum age of residual tensors. -1 means no age cap, i.e., naive infinite residual accumulation. "
+                "Only used when lora_residual_accumulation=True."
+            )
+        }
+    )
+
+    diagnose_residual_replay_gain: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, diagnose whether historical LoRA residuals reduce the current loss "
+                "when replayed on the current global LoRA state."
+            )
+        }
+    )
+
+    replay_gain_max_clients_per_round: int = field(
+        default=2,
+        metadata={
+            "help": "Maximum number of selected clients per round used for residual replay-gain diagnosis."
+        }
+    )
+
+    replay_gain_max_batches: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of mini-batches used to estimate replay gain for each residual age bucket."
+            )
+        }
+    )
+
+    replay_gain_min_age: int = field(
+        default=1,
+        metadata={
+            "help": "Minimum residual age considered in replay-gain diagnosis."
+        }
+    )
+
+    replay_gain_max_age: int = field(
+        default=8,
+        metadata={
+            "help": "Maximum residual age considered in replay-gain diagnosis. -1 means no upper bound."
+        }
+    )
+
+    replay_gain_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Scaling factor applied to the residual when computing replay gain. "
+                "Use 1.0 for local residual utility diagnosis; use a smaller value such as 0.05 "
+                "to mimic one-client contribution in aggregation."
+            )
+        }
+    )
+
+
+
+
+
+
 @dataclass
 class FederatedArguments:
     """Arguments for federated learning scenario."""
@@ -329,6 +568,27 @@ class FederatedArguments:
     dirichlet_alpha: float = field(
         default=50,
         metadata={"help": "Dirichlet alpha controlling data heterogeneity."},
+    )
+
+    partition_strategy: str = field(
+        default="quantity",
+        metadata={
+            "help": (
+                "Client data partition strategy. "
+                "quantity = Dirichlet controls only client sample counts; "
+                "label = label/category-skew Dirichlet partition using partition_label_key."
+            )
+        },
+    )
+
+    partition_label_key: str = field(
+        default="Dataset",
+        metadata={
+            "help": (
+                "Dataset field used as label/category for label-skew Dirichlet partition. "
+                "For converted Dolly UIE data, use Dataset, where each Dolly category is written as one Dataset."
+            )
+        },
     )
     federated_seed: Optional[int] = field(
         default=None,

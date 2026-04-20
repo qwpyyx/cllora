@@ -5,17 +5,19 @@ import copy
 import logging
 import os
 import random
-from collections import defaultdict
+import math
 import json
+import re
 import datasets
 import numpy as np
 import torch
 import gc
-from accelerate.utils import wait_for_everyone
-import math
-from datasets import load_dataset
 import transformers
 import torch.distributed as dist
+from itertools import combinations
+from datasets import load_dataset
+from collections import defaultdict, Counter
+from accelerate.utils import wait_for_everyone
 from transformers.trainer_utils import get_last_checkpoint
 from uie_collator import DataCollatorForUIE
 from uie_trainer_lora import UIETrainer, DenserEvalCallback, skip_instructions
@@ -42,7 +44,7 @@ from pilora_utils import (
     save_pilora_ref,
     extract_pilora_ref_from_model,
 )
-
+from gsm8k.gsm8k_metrics import compute_gsm8k_metrics, extract_gsm8k_final_answer
 
 
 os.environ['WANDB_DISABLED'] = "True"
@@ -136,88 +138,185 @@ def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_
     return [dataset.select(idxs) for idxs in client_indices]
 
 
+
+def summarize_client_partitions(client_datasets, *, label_key="Dataset"):
+    """
+    Build lightweight client-partition statistics for checking whether the split is
+    quantity-skew or label/category-skew. The result is JSON-serializable.
+    """
+    summary = []
+    for cid, ds in enumerate(client_datasets):
+        labels = []
+        if hasattr(ds, "column_names") and label_key in ds.column_names:
+            try:
+                labels = [str(x) for x in ds[label_key]]
+            except Exception:
+                labels = []
+        cnt = Counter(labels)
+        total = int(len(ds))
+        if total > 0 and len(cnt) > 0:
+            probs = np.array(list(cnt.values()), dtype=np.float64) / float(total)
+            entropy = float(-(probs * np.log(probs + 1e-12)).sum())
+            dominant_label, dominant_count = cnt.most_common(1)[0]
+            dominant_ratio = float(dominant_count / total)
+        else:
+            entropy = 0.0
+            dominant_label = None
+            dominant_ratio = 0.0
+
+        summary.append({
+            "cid": int(cid),
+            "num_samples": total,
+            "num_labels": int(len(cnt)),
+            "label_counts": dict(sorted(cnt.items(), key=lambda x: (-x[1], x[0]))),
+            "label_entropy": entropy,
+            "dominant_label": dominant_label,
+            "dominant_label_ratio": dominant_ratio,
+        })
+    return summary
+
+
+def make_client_datasets(train_dataset, fed_args):
+    """
+    Construct FL client datasets.
+
+    quantity: old behavior. Dirichlet controls client sample counts only after a
+              global shuffle, so each client is approximately IID in label/category.
+    label:    label/category-skew Dirichlet. For each label/category, split its
+              examples across clients using Dirichlet(alpha). This is the setting
+              needed for semantic non-IID Dolly experiments.
+    """
+    strategy = str(getattr(fed_args, "partition_strategy", "quantity") or "quantity").lower()
+    label_key = str(getattr(fed_args, "partition_label_key", "Dataset") or "Dataset")
+
+    if strategy in ("quantity", "quantity_skew", "size", "size_skew"):
+        client_datasets = partition_dataset(
+            train_dataset,
+            fed_args.num_clients,
+            fed_args.dirichlet_alpha,
+            base_seed=fed_args.federated_seed,
+        )
+    elif strategy in ("label", "label_skew", "semantic", "category", "category_skew"):
+        if not (hasattr(train_dataset, "column_names") and label_key in train_dataset.column_names):
+            raise ValueError(
+                f"partition_strategy={strategy} requires label_key='{label_key}', "
+                f"but train_dataset columns are {getattr(train_dataset, 'column_names', None)}"
+            )
+        client_datasets = partition_dataset_by_label(
+            train_dataset,
+            fed_args.num_clients,
+            fed_args.dirichlet_alpha,
+            base_seed=fed_args.federated_seed,
+            label_key=label_key,
+        )
+    else:
+        raise ValueError(
+            f"Unknown partition_strategy={strategy}. "
+            "Use quantity or label."
+        )
+
+    return client_datasets
+
+
 def build_model_and_tokenizer(model_args):
     """
-    Unified loader for T5 and Llama in Federated Learning.
-    - T5: Uses standard loading.
-    - Llama: Uses Flash Attention 2 + BF16 + Custom Tokenizer Settings.
+    Isolated loader for T5 / LLaMA / Qwen in Federated Learning.
+    - T5 path: keep old behavior.
+    - LLaMA path: keep old behavior.
+    - Qwen path: new decoder-only branch, but do NOT hard-code 1/2/0.
     """
 
-    # --------- 1) 判别模型族 ----------
     name_lower = model_args.model_name_or_path.lower()
     is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
-    # is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
-    if "t5" in name_lower:
-        is_llama = False
-    else:
-        is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
-    print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
 
-    # --------- 2) 准备 Config 和 Tokenizer ----------
+    is_t5 = "t5" in name_lower
+    is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+    is_qwen = "qwen" in name_lower
+
+    if not (is_t5 or is_llama or is_qwen):
+        raise ValueError(
+            f"Unsupported model family for federated mode: {model_args.model_name_or_path}. "
+            "Currently only T5 / LLaMA / Qwen are explicitly supported."
+        )
+
+    print(
+        f"[Build Model] Loading: {model_args.model_name_or_path} | "
+        f"is_t5={is_t5}, is_llama={is_llama}, is_qwen={is_qwen}, is_adapter={is_adapter}"
+    )
+
+    # --------- resolve base model path ----------
     if is_adapter:
         peft_cfg = PeftConfig.from_pretrained(model_args.model_name_or_path)
         base_model_path = peft_cfg.base_model_name_or_path
     else:
         base_model_path = model_args.model_name_or_path
 
+    # --------- config ----------
     config = AutoConfig.from_pretrained(
         base_model_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        # 若你的 transformers 较老、Qwen 报错，再打开这一行
+        # trust_remote_code=True,
     )
-
-    # [通用设置] 训练时关闭 cache 以节省显存
     config.use_cache = False
 
-    if is_llama:
-        # Llama Tokenizer (新环境/旧环境都兼容)
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+    # --------- tokenizer ----------
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+        # 若你的 transformers 较老、Qwen 报错，再打开这一行
+        # trust_remote_code=True,
+    )
 
-        # 1. 补全 pad_token (如果缺失)
-        # Llama 原生通常没有 pad_token，优先使用 unk_token (id=0)
+    # ===== T5: 完全保持旧逻辑 =====
+    if is_t5:
+        pass
+
+    # ===== LLaMA: 保持你原来的旧逻辑 =====
+    elif is_llama:
         if tokenizer.pad_token is None:
             if tokenizer.unk_token_id is not None:
                 tokenizer.pad_token_id = tokenizer.unk_token_id
                 tokenizer.pad_token = tokenizer.unk_token
             else:
-                # 兜底策略
                 tokenizer.pad_token_id = 0
                 tokenizer.pad_token = "<unk>"
 
-        # 2. 强制修正 ID (避免 Pad=1 与 BOS=1 冲突)
-        # 这是解决训练不收敛和预测乱码的关键
         tokenizer.bos_token_id = 1
         tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 0  # 必须是 0
-
-        # 3. 设置左填充 (Left Padding)
-        # Decoder-only 模型做生成任务时必须左填充，否则输出不对齐
+        tokenizer.pad_token_id = 0
         tokenizer.padding_side = "left"
 
-        # 同步更新 Config，防止生成时报 Warning
         config.bos_token_id = tokenizer.bos_token_id
         config.eos_token_id = tokenizer.eos_token_id
         config.pad_token_id = tokenizer.pad_token_id
 
-    else:
-        # [T5 路径] 标准加载，完全兼容旧环境
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        # T5 默认 pad_token_id=0, padding_side='right'，无需修改
+    # ===== Qwen: 新增逻辑，只对 Qwen 生效 =====
+    elif is_qwen:
+        # Qwen 不要硬写 1/2/0，直接使用它自己的 special tokens
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            elif tokenizer.unk_token is not None:
+                tokenizer.pad_token = tokenizer.unk_token
+            else:
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-    # --------- 3) 准备模型加载参数 ----------
+        tokenizer.padding_side = "left"
+
+        if tokenizer.pad_token_id is not None:
+            config.pad_token_id = tokenizer.pad_token_id
+        if tokenizer.bos_token_id is not None:
+            config.bos_token_id = tokenizer.bos_token_id
+        if tokenizer.eos_token_id is not None:
+            config.eos_token_id = tokenizer.eos_token_id
+
+    # --------- model load kwargs ----------
     model_load_kwargs = {
         "config": config,
         "cache_dir": model_args.cache_dir,
@@ -225,52 +324,48 @@ def build_model_and_tokenizer(model_args):
         "use_auth_token": True if model_args.use_auth_token else None,
     }
 
-    # [Llama 专属优化]
-    if is_llama:
-        # 1. 精度选择: 优先 BF16
+    # decoder-only 模型（LLaMA / Qwen）用半精度与 FlashAttention
+    if is_llama or is_qwen:
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             model_load_kwargs["torch_dtype"] = torch.bfloat16
-            print("[Build Model] Using bfloat16 for Llama.")
+            print("[Build Model] Using bfloat16 for decoder-only model.")
         else:
             model_load_kwargs["torch_dtype"] = torch.float16
-            print("[Build Model] Using float16 for Llama.")
+            print("[Build Model] Using float16 for decoder-only model.")
 
-        # 2. Flash Attention 2 加速 (如果安装了)
         if model_args.ues_flash_attention:
             try:
-                import flash_attn
+                import flash_attn  # noqa: F401
                 config._attn_implementation = "flash_attention_2"
                 print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
             except ImportError:
                 print("[Build Model] Flash Attention 2 not found, using default attention.")
 
-    # --------- 4) 加载模型 ----------
-    if is_llama:
-        model_class = AutoModelForCausalLM
-        lora_task_type = TaskType.CAUSAL_LM
-    else:
-        # T5 使用标准 Seq2Seq 类
+    # --------- model class ----------
+    if is_t5:
         model_class = AutoModelForSeq2SeqLM
         lora_task_type = TaskType.SEQ_2_SEQ_LM
+    else:
+        model_class = AutoModelForCausalLM
+        lora_task_type = TaskType.CAUSAL_LM
 
-    # 加载 Base Model
     model = model_class.from_pretrained(
         base_model_path,
         from_tf=bool(".ckpt" in base_model_path),
-        **model_load_kwargs
+        **model_load_kwargs,
+        # 若你的 transformers 较老、Qwen 报错，再打开这一行
+        # trust_remote_code=True,
     )
 
-    # [梯度检查点支持]
-    # 开启 input_require_grads 以支持 gradient_checkpointing
+    # gradient checkpointing support
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     else:
         def make_inputs_require_grad(module, input, output):
             output.requires_grad_(True)
-
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    # --------- 5) 应用 PEFT / LoRA ----------
+    # --------- PEFT / LoRA ----------
     if is_adapter:
         print(f"[Build Model] Loading existing adapter: {model_args.model_name_or_path}")
         model = PeftModel.from_pretrained(
@@ -280,29 +375,269 @@ def build_model_and_tokenizer(model_args):
         )
     else:
         print(f"[Build Model] Initializing new LoRA adapter (r={model_args.lora_dim})")
+
+        # T5 保持旧逻辑；LLaMA/Qwen 都显式打在 q/v projection 上
+        target_modules = ["q_proj", "v_proj"] if (is_llama or is_qwen) else None
+
         peft_config = LoraConfig(
             task_type=lora_task_type,
             inference_mode=False,
             r=model_args.lora_dim,
             lora_alpha=32,
             lora_dropout=0.1,
-            # Llama 需要指定 target_modules，T5 通常不需要(默认q,v)
-            target_modules=["q_proj", "v_proj"] if is_llama else None
+            target_modules=target_modules,
         )
         model = get_peft_model(model, peft_config)
 
-    # --------- 6) 后处理 ----------
-    # 调整 Embedding 大小以匹配 Tokenizer (防止 special tokens 越界)
     model.resize_token_embeddings(len(tokenizer))
 
-    # 确保 LoRA 参数可训练 (双重保险)
     for name, param in model.named_parameters():
-        if 'lora_' in name:
+        if "lora_" in name:
             param.requires_grad = True
 
-    # 打印可训练参数
     model.print_trainable_parameters()
+
+    # print("tokenizer.name_or_path =", tokenizer.name_or_path)
+    # print("tokenizer.bos/eos/pad =", tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id)
+    # print("tokenizer.padding_side =", tokenizer.padding_side)
+    # print("config.is_encoder_decoder =", getattr(config, "is_encoder_decoder", None))
+
     return model, tokenizer
+
+
+# def build_model_and_tokenizer(model_args):
+#     """
+#     Unified loader for T5 and Llama in Federated Learning.
+#     - T5: Uses standard loading.
+#     - Llama: Uses Flash Attention 2 + BF16 + Custom Tokenizer Settings.
+#     """
+#
+#     # --------- 1) 判别模型族 ----------
+#     name_lower = model_args.model_name_or_path.lower()
+#     is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
+#     # is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+#     if "t5" in name_lower:
+#         is_llama = False
+#     else:
+#         is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+#     print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
+#
+#     # --------- 2) 准备 Config 和 Tokenizer ----------
+#     if is_adapter:
+#         peft_cfg = PeftConfig.from_pretrained(model_args.model_name_or_path)
+#         base_model_path = peft_cfg.base_model_name_or_path
+#     else:
+#         base_model_path = model_args.model_name_or_path
+#
+#     config = AutoConfig.from_pretrained(
+#         base_model_path,
+#         cache_dir=model_args.cache_dir,
+#         revision=model_args.model_revision,
+#         use_auth_token=True if model_args.use_auth_token else None,
+#     )
+#
+#     # [通用设置] 训练时关闭 cache 以节省显存
+#     config.use_cache = False
+#
+#     if is_llama:
+#         # Llama Tokenizer (新环境/旧环境都兼容)
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             base_model_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast_tokenizer,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#
+#         # 1. 补全 pad_token (如果缺失)
+#         # Llama 原生通常没有 pad_token，优先使用 unk_token (id=0)
+#         if tokenizer.pad_token is None:
+#             if tokenizer.unk_token_id is not None:
+#                 tokenizer.pad_token_id = tokenizer.unk_token_id
+#                 tokenizer.pad_token = tokenizer.unk_token
+#             else:
+#                 # 兜底策略
+#                 tokenizer.pad_token_id = 0
+#                 tokenizer.pad_token = "<unk>"
+#
+#         # 2. 强制修正 ID (避免 Pad=1 与 BOS=1 冲突)
+#         # 这是解决训练不收敛和预测乱码的关键
+#         tokenizer.bos_token_id = 1
+#         tokenizer.eos_token_id = 2
+#         tokenizer.pad_token_id = 0  # 必须是 0
+#
+#         # 3. 设置左填充 (Left Padding)
+#         # Decoder-only 模型做生成任务时必须左填充，否则输出不对齐
+#         tokenizer.padding_side = "left"
+#
+#         # 同步更新 Config，防止生成时报 Warning
+#         config.bos_token_id = tokenizer.bos_token_id
+#         config.eos_token_id = tokenizer.eos_token_id
+#         config.pad_token_id = tokenizer.pad_token_id
+#
+#     else:
+#         # [T5 路径] 标准加载，完全兼容旧环境
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             base_model_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast_tokenizer,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#         # T5 默认 pad_token_id=0, padding_side='right'，无需修改
+#
+#     # --------- 3) 准备模型加载参数 ----------
+#     model_load_kwargs = {
+#         "config": config,
+#         "cache_dir": model_args.cache_dir,
+#         "revision": model_args.model_revision,
+#         "use_auth_token": True if model_args.use_auth_token else None,
+#     }
+#
+#     # [Llama 专属优化]
+#     if is_llama:
+#         # 1. 精度选择: 优先 BF16
+#         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+#             model_load_kwargs["torch_dtype"] = torch.bfloat16
+#             print("[Build Model] Using bfloat16 for Llama.")
+#         else:
+#             model_load_kwargs["torch_dtype"] = torch.float16
+#             print("[Build Model] Using float16 for Llama.")
+#
+#         # 2. Flash Attention 2 加速 (如果安装了)
+#         if model_args.ues_flash_attention:
+#             try:
+#                 import flash_attn
+#                 config._attn_implementation = "flash_attention_2"
+#                 print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
+#             except ImportError:
+#                 print("[Build Model] Flash Attention 2 not found, using default attention.")
+#
+#     # --------- 4) 加载模型 ----------
+#     if is_llama:
+#         model_class = AutoModelForCausalLM
+#         lora_task_type = TaskType.CAUSAL_LM
+#     else:
+#         # T5 使用标准 Seq2Seq 类
+#         model_class = AutoModelForSeq2SeqLM
+#         lora_task_type = TaskType.SEQ_2_SEQ_LM
+#
+#     # 加载 Base Model
+#     model = model_class.from_pretrained(
+#         base_model_path,
+#         from_tf=bool(".ckpt" in base_model_path),
+#         **model_load_kwargs
+#     )
+#
+#     # [梯度检查点支持]
+#     # 开启 input_require_grads 以支持 gradient_checkpointing
+#     if hasattr(model, "enable_input_require_grads"):
+#         model.enable_input_require_grads()
+#     else:
+#         def make_inputs_require_grad(module, input, output):
+#             output.requires_grad_(True)
+#
+#         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+#
+#     # --------- 5) 应用 PEFT / LoRA ----------
+#     if is_adapter:
+#         print(f"[Build Model] Loading existing adapter: {model_args.model_name_or_path}")
+#         model = PeftModel.from_pretrained(
+#             model,
+#             model_args.model_name_or_path,
+#             torch_dtype=model_load_kwargs.get("torch_dtype", "auto")
+#         )
+#     else:
+#         print(f"[Build Model] Initializing new LoRA adapter (r={model_args.lora_dim})")
+#         peft_config = LoraConfig(
+#             task_type=lora_task_type,
+#             inference_mode=False,
+#             r=model_args.lora_dim,
+#             lora_alpha=32,
+#             lora_dropout=0.1,
+#             # Llama 需要指定 target_modules，T5 通常不需要(默认q,v)
+#             target_modules=["q_proj", "v_proj"] if is_llama else None
+#         )
+#         model = get_peft_model(model, peft_config)
+#
+#     # --------- 6) 后处理 ----------
+#     # 调整 Embedding 大小以匹配 Tokenizer (防止 special tokens 越界)
+#     model.resize_token_embeddings(len(tokenizer))
+#
+#     # 确保 LoRA 参数可训练 (双重保险)
+#     for name, param in model.named_parameters():
+#         if 'lora_' in name:
+#             param.requires_grad = True
+#
+#     # 打印可训练参数
+#     model.print_trainable_parameters()
+#     return model, tokenizer
+
+def compute_selection_overlap_stats(client_to_layers, all_candidate_layers):
+    """Compute overlap statistics for per-client selected layer sets within a round."""
+    client_ids = sorted(client_to_layers.keys())
+    sets = [set(client_to_layers[cid]) for cid in client_ids]
+    num_clients = len(sets)
+    if num_clients == 0:
+        return None
+
+    selected_sizes = [len(s) for s in sets]
+    stats = {
+        "num_clients": num_clients,
+        "candidate_layers": len(all_candidate_layers),
+        "mean_selected_layers": float(np.mean(selected_sizes)),
+        "min_selected_layers": int(min(selected_sizes)),
+        "max_selected_layers": int(max(selected_sizes)),
+    }
+
+    # Pairwise Jaccard / overlap
+    if num_clients >= 2:
+        jaccards = []
+        intersections = []
+        unions = []
+        for a, b in combinations(sets, 2):
+            inter = len(a & b)
+            union = len(a | b)
+            j = inter / union if union > 0 else 1.0
+            jaccards.append(j)
+            intersections.append(inter)
+            unions.append(union)
+        stats.update({
+            "pairwise_jaccard_mean": float(np.mean(jaccards)),
+            "pairwise_jaccard_min": float(np.min(jaccards)),
+            "pairwise_jaccard_max": float(np.max(jaccards)),
+            "pairwise_intersection_mean": float(np.mean(intersections)),
+            "pairwise_union_mean": float(np.mean(unions)),
+        })
+    else:
+        stats.update({
+            "pairwise_jaccard_mean": 1.0,
+            "pairwise_jaccard_min": 1.0,
+            "pairwise_jaccard_max": 1.0,
+            "pairwise_intersection_mean": float(len(sets[0])),
+            "pairwise_union_mean": float(len(sets[0])),
+        })
+
+    # Layer-level coverage
+    layer_counts = defaultdict(int)
+    for s in sets:
+        for name in s:
+            layer_counts[name] += 1
+
+    coverage_ratios = [cnt / num_clients for cnt in layer_counts.values()]
+    stats.update({
+        "union_selected_layers": int(len(layer_counts)),
+        "mean_layer_coverage_ratio": float(np.mean(coverage_ratios)) if coverage_ratios else 0.0,
+        "fully_shared_layers": int(sum(cnt == num_clients for cnt in layer_counts.values())),
+        "singleton_layers": int(sum(cnt == 1 for cnt in layer_counts.values())),
+        "coverage_histogram": {str(k): int(v) for k, v in sorted(
+            ((cnt, sum(1 for x in layer_counts.values() if x == cnt)) for cnt in set(layer_counts.values())),
+            key=lambda x: int(x[0])
+        )},
+        "top_shared_layers": sorted(layer_counts.items(), key=lambda x: (-x[1], x[0]))[:10],
+    })
+    return stats
+
 
 
 def compute_fisher_diag(model, dataloader):
@@ -334,10 +669,12 @@ def compute_fisher_diag(model, dataloader):
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
         # 2. [关键] Logits Shift (针对 Llama/GPT)
-        is_causal = False
-        if "llama" in getattr(model.config, "_name_or_path", "").lower() or getattr(model.config, "is_decoder", False):
-            if not getattr(model.config, "is_encoder_decoder", False):
-                is_causal = True
+        # is_causal = False
+        # if "llama" in getattr(model.config, "_name_or_path", "").lower() or getattr(model.config, "is_decoder", False):
+        #     if not getattr(model.config, "is_encoder_decoder", False):
+        #         is_causal = True
+        is_causal = not getattr(model.config, "is_encoder_decoder", False)
+
 
         if is_causal:
             logits = logits[..., :-1, :].contiguous()
@@ -398,6 +735,1529 @@ def select_layers_random(layer_names, layer_costs, budget, seed):
     return selected_layers, current_cost
 
 
+def get_atomic_unit_id(name: str, atomic_mode: str) -> str:
+    """
+    Map one LoRA tensor name to an upload unit id.
+
+    atomic_mode:
+      - tensor: original behavior, each tensor is one unit
+      - ab_pair: lora_A and lora_B of the same module are one atomic unit
+      - qv_block: q_proj/v_proj LoRA tensors in the same transformer layer are one atomic unit
+    """
+    if atomic_mode == "tensor":
+        return name
+
+    if atomic_mode == "ab_pair":
+        if ".lora_A." in name:
+            return name.replace(".lora_A.", ".lora_PAIR.")
+        if ".lora_B." in name:
+            return name.replace(".lora_B.", ".lora_PAIR.")
+        return name
+
+    if atomic_mode == "qv_block":
+        # Example:
+        # base_model.model.model.layers.32.self_attn.q_proj.lora_A.default.weight
+        # base_model.model.model.layers.32.self_attn.v_proj.lora_B.default.weight
+        # -> base_model.model.model.layers.32.self_attn.QV_BLOCK
+        if ".self_attn." in name and (".q_proj." in name or ".v_proj." in name):
+            layer_prefix = name.split(".self_attn.")[0]
+            return layer_prefix + ".self_attn.QV_BLOCK"
+        # fallback: at least keep A/B atomicity
+        if ".lora_A." in name:
+            return name.replace(".lora_A.", ".lora_PAIR.")
+        if ".lora_B." in name:
+            return name.replace(".lora_B.", ".lora_PAIR.")
+        return name
+
+    raise ValueError(f"Unknown atomic_mode: {atomic_mode}")
+
+
+def build_atomic_units(layer_names, atomic_mode: str):
+    """
+    Return:
+      units: dict unit_id -> list[tensor_name]
+    """
+    units = defaultdict(list)
+    for name in layer_names:
+        uid = get_atomic_unit_id(name, atomic_mode)
+        units[uid].append(name)
+    return units
+
+
+def select_units_random(layer_names, layer_costs, budget, seed, atomic_mode: str):
+    """
+    Randomly select atomic upload units until budget is exhausted.
+    Return selected tensor names, total cost, selected unit ids.
+    """
+    units = build_atomic_units(layer_names, atomic_mode)
+    unit_items = list(units.items())
+
+    rng = random.Random(seed)
+    rng.shuffle(unit_items)
+
+    selected_layers = set()
+    selected_units = set()
+    current_cost = 0
+
+    for uid, members in unit_items:
+        unit_cost = sum(layer_costs.get(k, 0) for k in members)
+        if current_cost + unit_cost <= budget:
+            selected_units.add(uid)
+            selected_layers.update(members)
+            current_cost += unit_cost
+
+    return selected_layers, current_cost, selected_units
+
+
+def select_units_topk(
+        delta_dict,
+        layer_costs,
+        budget,
+        atomic_mode: str,
+        *,
+        allowed_units=None,
+        coverage_counts=None,
+        coverage_penalty_beta: float = 0.0,
+):
+    """
+    Select atomic upload units by update norm.
+
+    Score of one atomic unit = sqrt(sum(||delta_k||_2^2)) over its member tensors.
+    Cost of one atomic unit = sum(packet cost of its member tensors).
+
+    Optional system-level diversity controls:
+      - allowed_units: if not None, only units in this set can be selected.
+      - coverage_counts: per-round number of previous clients that have selected each unit.
+      - coverage_penalty_beta: adjusted_score = raw_score / (1 + beta * coverage_count).
+    """
+    units = build_atomic_units(list(delta_dict.keys()), atomic_mode)
+
+    allowed_units = set(allowed_units) if allowed_units is not None else None
+    coverage_counts = coverage_counts if coverage_counts is not None else {}
+
+    unit_scores = []
+    for uid, members in units.items():
+        if allowed_units is not None and uid not in allowed_units:
+            continue
+
+        sq_sum = 0.0
+        unit_cost = 0
+        for k in members:
+            if k not in delta_dict:
+                continue
+            n = torch.norm(delta_dict[k].float()).item()
+            sq_sum += n * n
+            unit_cost += layer_costs.get(k, 0)
+
+        raw_score = math.sqrt(sq_sum)
+        cover_cnt = int(coverage_counts.get(uid, 0))
+        adjusted_score = raw_score / (1.0 + float(coverage_penalty_beta) * cover_cnt)
+        unit_scores.append((uid, adjusted_score, unit_cost, members, raw_score, cover_cnt))
+
+    unit_scores.sort(key=lambda x: x[1], reverse=True)
+
+    selected_layers = set()
+    selected_units = set()
+    current_cost = 0
+
+    for uid, adjusted_score, unit_cost, members, raw_score, cover_cnt in unit_scores:
+        if current_cost + unit_cost <= budget:
+            selected_units.add(uid)
+            selected_layers.update(members)
+            current_cost += unit_cost
+
+    return selected_layers, current_cost, selected_units
+
+
+def _lowrank_fro_norm_sq(x_parts, y_parts, eps: float = 1e-12) -> float:
+    """
+    Compute || X Y ||_F^2 without materializing the large matrix XY.
+
+    X = concat(x_parts, dim=1), shape [d_out, k]
+    Y = concat(y_parts, dim=0), shape [k, d_in]
+
+    ||XY||_F^2 = tr((X^T X)(Y Y^T)).
+    """
+    xs = [x.detach().float().cpu() for x in x_parts if x is not None]
+    ys = [y.detach().float().cpu() for y in y_parts if y is not None]
+
+    if len(xs) == 0 or len(ys) == 0:
+        return 0.0
+
+    X = torch.cat(xs, dim=1)
+    Y = torch.cat(ys, dim=0)
+
+    gx = X.transpose(0, 1).matmul(X)
+    gy = Y.matmul(Y.transpose(0, 1))
+
+    val = (gx * gy).sum().item()
+    if math.isnan(val) or math.isinf(val):
+        return 0.0
+    return max(float(val), 0.0)
+
+
+def _get_ab_key_pair(members):
+    """Return (A_key, B_key) from one ab_pair unit."""
+    a_key, b_key = None, None
+    for k in members:
+        if ".lora_A." in k:
+            a_key = k
+        elif ".lora_B." in k:
+            b_key = k
+    return a_key, b_key
+
+
+def _get_ab_key_pairs_from_unit_members(members):
+    """
+    Return all valid (A_key, B_key) pairs contained in an upload unit.
+
+    For atomic_mode=ab_pair, the unit contains one pair.
+    For atomic_mode=qv_block, the unit normally contains two pairs from the
+    same attention layer: q_proj and v_proj.  We treat the block effective
+    update as a direct sum of its pair-level effective updates, so its group
+    inner product is the sum of pair-level Frobenius inner products.
+    """
+    by_pair = defaultdict(list)
+    for k in members:
+        by_pair[get_atomic_unit_id(k, "ab_pair")].append(k)
+
+    pairs = []
+    for pair_uid in sorted(by_pair.keys()):
+        a_key, b_key = _get_ab_key_pair(by_pair[pair_uid])
+        if a_key is not None and b_key is not None:
+            pairs.append((a_key, b_key))
+    return pairs
+
+
+def _safe_sqrt_ratio(num_sq: float, den_sq: float, eps: float = 1e-12) -> float:
+    return math.sqrt(max(num_sq, 0.0) / (max(den_sq, 0.0) + eps))
+
+
+
+
+def _parse_float_list(value, default_values):
+    """Parse comma-separated floats used by diagnostics."""
+    if value is None:
+        return list(default_values)
+    if isinstance(value, (list, tuple)):
+        vals = [float(x) for x in value]
+    else:
+        vals = []
+        for x in str(value).split(','):
+            x = x.strip()
+            if x:
+                vals.append(float(x))
+    vals = [x for x in vals if math.isfinite(x) and x > 0]
+    return vals if len(vals) > 0 else list(default_values)
+
+
+def _rank_dict_desc(score_map):
+    """Return 1-based descending ranks. Ties are broken deterministically by uid."""
+    items = sorted(score_map.items(), key=lambda x: (-float(x[1]), x[0]))
+    return {uid: idx + 1 for idx, (uid, _) in enumerate(items)}
+
+
+def _spearman_from_score_maps(score_a, score_b):
+    common = sorted(set(score_a.keys()) & set(score_b.keys()))
+    n = len(common)
+    if n < 2:
+        return None
+    rank_a = _rank_dict_desc({k: score_a[k] for k in common})
+    rank_b = _rank_dict_desc({k: score_b[k] for k in common})
+    xa = np.array([rank_a[k] for k in common], dtype=np.float64)
+    xb = np.array([rank_b[k] for k in common], dtype=np.float64)
+    xa = xa - xa.mean()
+    xb = xb - xb.mean()
+    den = float(np.sqrt((xa * xa).sum()) * np.sqrt((xb * xb).sum()))
+    if den <= 0:
+        return None
+    return float((xa * xb).sum() / den)
+
+
+def _select_unit_ids_by_score(unit_rows, budget, score_key):
+    """Greedy budgeted unit selection by a chosen score key."""
+    selected = set()
+    current_cost = 0
+    sorted_rows = sorted(
+        unit_rows,
+        key=lambda r: (-float(r.get(score_key, 0.0)), str(r.get("uid", "")))
+    )
+    for r in sorted_rows:
+        cost = int(r.get("unit_cost", 0))
+        if budget is None or budget <= 0 or current_cost + cost <= budget:
+            selected.add(r["uid"])
+            current_cost += cost
+    return selected, current_cost
+
+
+def _selection_overlap(a, b):
+    a = set(a)
+    b = set(b)
+    inter = len(a & b)
+    union = len(a | b)
+    return {
+        "intersection": int(inter),
+        "union": int(union),
+        "jaccard": float(inter / union) if union > 0 else 1.0,
+        "overlap_to_a": float(inter / len(a)) if len(a) > 0 else 1.0,
+        "overlap_to_b": float(inter / len(b)) if len(b) > 0 else 1.0,
+    }
+
+
+def _sum_sq_for_units(unit_rows, selected_units, score_key):
+    selected_units = set(selected_units)
+    return float(sum(float(r.get(score_key, 0.0)) ** 2 for r in unit_rows if r["uid"] in selected_units))
+
+
+def _build_ab_pair_saliency_rows(global_state_cpu, upload_candidate_update, lora_keys, layer_costs):
+    """
+    Build per-A/B-pair diagnostic rows.
+
+    factor_score = sqrt(||U_A||^2 + ||U_B||^2), matching current A/B-pair Top-K.
+    effective_score = ||B U_A + U_B A + U_B U_A||_F, computed without materializing the full matrix.
+    """
+    rows = []
+    units = build_atomic_units(lora_keys, "ab_pair")
+
+    for uid, members in units.items():
+        a_key, b_key = _get_ab_key_pair(members)
+        if a_key is None or b_key is None:
+            continue
+        if a_key not in global_state_cpu or b_key not in global_state_cpu:
+            continue
+        if a_key not in upload_candidate_update or b_key not in upload_candidate_update:
+            continue
+
+        A = global_state_cpu[a_key]
+        B = global_state_cpu[b_key]
+        U_A = upload_candidate_update[a_key]
+        U_B = upload_candidate_update[b_key]
+
+        ua_norm = torch.norm(U_A.float()).item()
+        ub_norm = torch.norm(U_B.float()).item()
+        factor_sq = ua_norm * ua_norm + ub_norm * ub_norm
+
+        # Phi_t(U) = B U_A + U_B A + U_B U_A = [B, U_B] [U_A; A + U_A]
+        eff_sq = _lowrank_fro_norm_sq([B, U_B], [U_A, A + U_A])
+
+        rows.append({
+            "uid": uid,
+            "a_key": a_key,
+            "b_key": b_key,
+            "unit_cost": int(sum(layer_costs.get(k, 0) for k in members)),
+            "factor_score": float(math.sqrt(max(factor_sq, 0.0))),
+            "effective_score": float(math.sqrt(max(eff_sq, 0.0))),
+            "ua_norm": float(ua_norm),
+            "ub_norm": float(ub_norm),
+        })
+
+    return rows
+
+
+
+
+def select_ab_pair_effective_topk(
+        global_state_cpu,
+        upload_candidate_update,
+        lora_keys,
+        layer_costs,
+        budget,
+        *,
+        allowed_units=None,
+        coverage_counts=None,
+        coverage_penalty_beta: float = 0.0,
+):
+    """
+    Select A/B-pair upload units by effective-update norm.
+
+    Score of one A/B pair:
+        || B U_A + U_B A + U_B U_A ||_F
+    computed by the same low-rank Frobenius routine used in diagnostics.
+
+    This function is used for the actual training path when
+    --upload_score_mode effective_norm and --upload_atomic_mode ab_pair.
+    """
+    rows = _build_ab_pair_saliency_rows(
+        global_state_cpu=global_state_cpu,
+        upload_candidate_update=upload_candidate_update,
+        lora_keys=lora_keys,
+        layer_costs=layer_costs,
+    )
+
+    allowed_units = set(allowed_units) if allowed_units is not None else None
+    coverage_counts = coverage_counts if coverage_counts is not None else {}
+
+    unit_scores = []
+    for r in rows:
+        uid = r["uid"]
+        if allowed_units is not None and uid not in allowed_units:
+            continue
+        raw_score = float(r.get("effective_score", 0.0))
+        cover_cnt = int(coverage_counts.get(uid, 0))
+        adjusted_score = raw_score / (1.0 + float(coverage_penalty_beta) * cover_cnt)
+        members = [r["a_key"], r["b_key"]]
+        unit_scores.append((uid, adjusted_score, int(r["unit_cost"]), members, raw_score, cover_cnt))
+
+    unit_scores.sort(key=lambda x: (-x[1], x[0]))
+
+    selected_layers = set()
+    selected_units = set()
+    current_cost = 0
+
+    for uid, adjusted_score, unit_cost, members, raw_score, cover_cnt in unit_scores:
+        if budget is None or budget <= 0 or current_cost + unit_cost <= budget:
+            selected_units.add(uid)
+            selected_layers.update(members)
+            current_cost += unit_cost
+
+    return selected_layers, current_cost, selected_units
+
+
+def _lowrank_fro_inner(x1_parts, y1_parts, x2_parts, y2_parts) -> float:
+    """
+    Compute <X1 Y1, X2 Y2>_F without materializing the large matrices.
+
+    X1 = concat(x1_parts, dim=1), Y1 = concat(y1_parts, dim=0)
+    X2 = concat(x2_parts, dim=1), Y2 = concat(y2_parts, dim=0)
+
+    <X1Y1, X2Y2>_F = sum((X1^T X2) * (Y1 Y2^T)).
+    """
+    xs1 = [x.detach().float().cpu() for x in x1_parts if x is not None]
+    ys1 = [y.detach().float().cpu() for y in y1_parts if y is not None]
+    xs2 = [x.detach().float().cpu() for x in x2_parts if x is not None]
+    ys2 = [y.detach().float().cpu() for y in y2_parts if y is not None]
+
+    if len(xs1) == 0 or len(ys1) == 0 or len(xs2) == 0 or len(ys2) == 0:
+        return 0.0
+
+    X1 = torch.cat(xs1, dim=1)
+    Y1 = torch.cat(ys1, dim=0)
+    X2 = torch.cat(xs2, dim=1)
+    Y2 = torch.cat(ys2, dim=0)
+
+    gx = X1.transpose(0, 1).matmul(X2)
+    gy = Y1.matmul(Y2.transpose(0, 1))
+    val = (gx * gy).sum().item()
+    if math.isnan(val) or math.isinf(val):
+        return 0.0
+    return float(val)
+
+
+class _SNMaxCostFlow:
+    """Small max-cost flow solver for the client-module assignment graph."""
+
+    def __init__(self, n):
+        self.n = n
+        self.g = [[] for _ in range(n)]
+
+    def add_edge(self, v, to, cap, cost, meta=None):
+        fwd = [to, cap, float(cost), len(self.g[to]), meta]
+        rev = [v, 0, -float(cost), len(self.g[v]), None]
+        self.g[v].append(fwd)
+        self.g[to].append(rev)
+        return len(self.g[v]) - 1
+
+    def max_cost_flow(self, s, t, maxf):
+        flow = 0
+        cost = 0.0
+        n = self.n
+        while flow < maxf:
+            dist_arr = [-float('inf')] * n
+            inq = [False] * n
+            pv = [-1] * n
+            pe = [-1] * n
+            dist_arr[s] = 0.0
+            q = [s]
+            inq[s] = True
+            head = 0
+            while head < len(q):
+                v = q[head]
+                head += 1
+                inq[v] = False
+                for ei, e in enumerate(self.g[v]):
+                    if e[1] <= 0:
+                        continue
+                    to = e[0]
+                    nd = dist_arr[v] + e[2]
+                    if nd > dist_arr[to] + 1e-12:
+                        dist_arr[to] = nd
+                        pv[to] = v
+                        pe[to] = ei
+                        if not inq[to]:
+                            q.append(to)
+                            inq[to] = True
+            if pv[t] == -1:
+                break
+            add = maxf - flow
+            v = t
+            while v != s:
+                e = self.g[pv[v]][pe[v]]
+                add = min(add, e[1])
+                v = pv[v]
+            v = t
+            while v != s:
+                e = self.g[pv[v]][pe[v]]
+                e[1] -= add
+                self.g[v][e[3]][1] += add
+                cost += add * e[2]
+                v = pv[v]
+            flow += add
+        return flow, cost
+
+
+
+def _sn_parse_layer_index(uid: str):
+    """Extract transformer layer index from a LoRA unit id if available."""
+    m = re.search(r"\.layers\.(\d+)\.", str(uid))
+    if m is None:
+        m = re.search(r"layers\.(\d+)", str(uid))
+    return int(m.group(1)) if m is not None else None
+
+
+def _sn_depth_group_from_layer(layer_idx, max_layer_idx):
+    """Map a layer index to lower/middle/upper depth group."""
+    if layer_idx is None or max_layer_idx is None or max_layer_idx < 0:
+        return "unknown"
+    n_layers = int(max_layer_idx) + 1
+    # Three approximately equal depth groups.
+    if layer_idx < n_layers / 3.0:
+        return "lower"
+    if layer_idx < 2.0 * n_layers / 3.0:
+        return "middle"
+    return "upper"
+
+
+def _sn_rank_normalize(values_by_uid, uids, eps: float = 1e-6):
+    """
+    Rank-normalize positive scalars to (0, 1].  This preserves order inside the
+    comparison set but removes raw scale differences across depth/projection groups.
+    """
+    uids = list(uids)
+    n = len(uids)
+    if n == 0:
+        return {}
+    ordered = sorted(uids, key=lambda u: (float(values_by_uid.get(u, 0.0)), str(u)))
+    out = {}
+    if n == 1:
+        out[ordered[0]] = 1.0
+        return out
+    for rank, uid in enumerate(ordered, start=1):
+        out[uid] = max(float(rank) / float(n), float(eps))
+    return out
+
+
+def _sn_parse_depth_ratios(depth_group_ratios: str):
+    try:
+        vals = [float(x.strip()) for x in str(depth_group_ratios).split(',') if x.strip() != '']
+    except Exception:
+        vals = []
+    if len(vals) != 3 or any(v < 0 for v in vals) or sum(vals) <= 0:
+        vals = [1.0, 1.0, 2.0]
+    return {"lower": vals[0], "middle": vals[1], "upper": vals[2]}
+
+
+def _sn_group_slot_targets(total_slots: int, ratios_by_group, available_groups):
+    """Integer slot targets for depth-balanced P1, with exact total sum."""
+    total_slots = int(total_slots)
+    groups = [g for g in ["lower", "middle", "upper", "unknown"] if g in available_groups]
+    if total_slots <= 0 or len(groups) == 0:
+        return {g: 0 for g in groups}
+    weights = {g: float(ratios_by_group.get(g, 1.0)) for g in groups}
+    if sum(weights.values()) <= 0:
+        weights = {g: 1.0 for g in groups}
+    raw = {g: total_slots * weights[g] / sum(weights.values()) for g in groups}
+    base = {g: int(math.floor(raw[g])) for g in groups}
+    remain = total_slots - sum(base.values())
+    frac_order = sorted(groups, key=lambda g: (-(raw[g] - base[g]), g))
+    for g in frac_order[:remain]:
+        base[g] += 1
+    return base
+
+def _run_signal_noise_p1_p2_schedule(
+        *,
+        client_records,
+        global_state_cpu,
+        lora_keys,
+        layer_costs,
+        budget,
+        atomic_mode: str = "ab_pair",
+        gap_eta: float = 1.0,
+        force_full_budget: bool = False,
+        min_eps: float = 1e-12,
+        p1_norm_mode: str = "raw",
+        depth_group_ratios: str = "1,1,2",
+):
+    """
+    Server-side signal-noise sparse upload scheduler for structured FedLoRA atoms.
+
+    atomic_mode can be:
+      - ab_pair: each LoRA A/B pair is one upload unit;
+      - qv_block: q_proj and v_proj A/B pairs in the same attention layer are
+        grouped as one upload unit.
+
+    Steps:
+      1) compute exact low-rank effective-update inner products for each upload unit;
+      2) solve P1 by selecting positive diminishing-return marginal gains;
+      3) solve gap-aware P2-L by max-cost flow under equal unit costs.
+
+    This implementation uses exact low-rank statistics for the main-result runs.
+    A later sketch ablation can replace the inner-product matrix by Rademacher sketches.
+    """
+    if budget is None or budget <= 0:
+        raise ValueError("sn_p1p2 requires a positive per-client comm_budget.")
+
+    K = len(client_records)
+    if K <= 1:
+        raise ValueError("sn_p1p2 requires at least two participating clients for leave-one-out signal estimation.")
+
+    atomic_mode = str(atomic_mode or "ab_pair").lower()
+    if atomic_mode not in ("ab_pair", "qv_block"):
+        raise ValueError(f"sn_p1p2 supports atomic_mode=ab_pair or qv_block, got {atomic_mode}.")
+
+    units = build_atomic_units(lora_keys, atomic_mode)
+    unit_infos = []
+    for uid in sorted(units.keys()):
+        members = sorted(units[uid])
+        pairs = _get_ab_key_pairs_from_unit_members(members)
+        if len(pairs) == 0:
+            continue
+        valid = True
+        for a_key, b_key in pairs:
+            if a_key not in global_state_cpu or b_key not in global_state_cpu:
+                valid = False
+                break
+            if any(a_key not in rec["upload_candidate_update"] or b_key not in rec["upload_candidate_update"] for rec in client_records):
+                valid = False
+                break
+        if not valid:
+            continue
+        cost = int(sum(layer_costs.get(k, 0) for k in members))
+        if cost <= 0 or cost > int(budget):
+            continue
+        unit_infos.append({"uid": uid, "members": members, "pairs": pairs, "cost": cost})
+
+    if len(unit_infos) == 0:
+        return {rec["cid"]: {"selected_layers": set(), "selected_units": set(), "selection_cost": 0} for rec in client_records}, {
+            "num_units": 0,
+            "reason": "no_valid_ab_pair_units",
+        }
+
+    costs = sorted(set(int(u["cost"]) for u in unit_infos))
+    equal_cost = (len(costs) == 1)
+
+    # For Qwen2.5 with GQA, q_proj and v_proj LoRA A/B pairs can have
+    # different packet costs (e.g., 220 vs. 132).  In that case P1 is solved
+    # by a cost-aware marginal-gain greedy rule under the total packet budget,
+    # and P2 is solved by a feasible generalized-assignment greedy repair.
+    # The equal-cost case still uses the exact max-cost-flow solver.
+    if equal_cost:
+        unit_cost = int(costs[0])
+        client_capacity = int(budget) // unit_cost
+        if client_capacity <= 0:
+            raise ValueError(f"sn_p1p2 budget={budget} is smaller than one A/B-pair unit cost={unit_cost}.")
+        total_slot_budget = client_capacity * K
+        total_cost_budget = total_slot_budget * unit_cost
+        p2_solver = "exact_max_cost_flow_equal_cost"
+    else:
+        unit_cost = None
+        client_capacity = None
+        total_slot_budget = None
+        total_cost_budget = int(budget) * K
+        p2_solver = "greedy_generalized_assignment_heterogeneous_cost"
+
+    # Build exact effective-update Gram matrices for each unit.
+    # For qv_block, the unit effective update is a direct-sum group of the
+    # q_proj and v_proj pair-level effective updates; therefore the group
+    # inner product is the sum of pair-level inner products.  This avoids
+    # invalid cross terms between q/v matrices with different output shapes.
+    unit_stats = {}
+    for u in unit_infos:
+        uid = u["uid"]
+        group_parts = []
+        q_vals = []
+        for rec in client_records:
+            per_pair_parts = []
+            q_total = 0.0
+            for a_key, b_key in u["pairs"]:
+                A = global_state_cpu[a_key]
+                B = global_state_cpu[b_key]
+                U_A = rec["upload_candidate_update"][a_key]
+                U_B = rec["upload_candidate_update"][b_key]
+                # Phi(U) = B U_A + U_B A + U_B U_A = [B, U_B] [U_A; A + U_A]
+                x_parts = [B, U_B]
+                y_parts = [U_A, A + U_A]
+                per_pair_parts.append((x_parts, y_parts))
+                q_total += _lowrank_fro_norm_sq(x_parts, y_parts)
+            group_parts.append(per_pair_parts)
+            q_vals.append(q_total)
+
+        gram = np.zeros((K, K), dtype=np.float64)
+        for i in range(K):
+            gram[i, i] = float(q_vals[i])
+        for i in range(K):
+            for j in range(i + 1, K):
+                val = 0.0
+                for pair_idx in range(len(u["pairs"])):
+                    val += _lowrank_fro_inner(
+                        group_parts[i][pair_idx][0], group_parts[i][pair_idx][1],
+                        group_parts[j][pair_idx][0], group_parts[j][pair_idx][1],
+                    )
+                gram[i, j] = val
+                gram[j, i] = val
+
+        if K > 1:
+            a_hat = float((gram.sum() - np.trace(gram)) / (K * (K - 1)))
+        else:
+            a_hat = 0.0
+        q_hat = float(np.mean(np.diag(gram)))
+        a_hat = max(a_hat, 0.0)
+        b_hat = max(q_hat - a_hat, float(min_eps))
+        unit_stats[uid] = {
+            "gram": gram,
+            "q": np.asarray(q_vals, dtype=np.float64),
+            "a_hat": a_hat,
+            "b_hat": b_hat,
+            "q_hat": q_hat,
+            "unit_info": u,
+            "num_pairs": int(len(u.get("pairs", []))),
+        }
+
+    # P1: diminishing-return module quota allocation.
+    # We support scale/depth normalization for P1 only.  P2 still uses the exact
+    # leave-one-out effective-update alignment.  This addresses a practical issue
+    # observed on Qwen2.5-14B: raw Frobenius signal can be strongly biased toward
+    # upper layers even after q/v are grouped into equal-cost qv-blocks.
+    p1_norm_mode = str(p1_norm_mode or "raw").lower()
+    if p1_norm_mode == "none":
+        p1_norm_mode = "raw"
+
+    # Depth metadata for diagnostics and depth-aware modes.
+    layer_indices = {uid: _sn_parse_layer_index(uid) for uid in unit_stats.keys()}
+    valid_layers = [x for x in layer_indices.values() if x is not None]
+    max_layer_idx = max(valid_layers) if valid_layers else None
+    depth_groups = {uid: _sn_depth_group_from_layer(layer_indices.get(uid), max_layer_idx) for uid in unit_stats.keys()}
+
+    raw_a = {uid: float(unit_stats[uid]["a_hat"]) for uid in unit_stats.keys()}
+    raw_b = {uid: float(unit_stats[uid]["b_hat"]) for uid in unit_stats.keys()}
+    p1_a = dict(raw_a)
+    p1_b = dict(raw_b)
+
+    if p1_norm_mode in ("rank", "global_rank"):
+        p1_a = _sn_rank_normalize(raw_a, unit_stats.keys(), eps=float(min_eps))
+        p1_b = _sn_rank_normalize(raw_b, unit_stats.keys(), eps=float(min_eps))
+    elif p1_norm_mode in ("depth_rank", "layer_rank", "depth_balanced"):
+        p1_a, p1_b = {}, {}
+        for g in sorted(set(depth_groups.values())):
+            group_uids = [uid for uid in unit_stats.keys() if depth_groups.get(uid) == g]
+            p1_a.update(_sn_rank_normalize(raw_a, group_uids, eps=float(min_eps)))
+            p1_b.update(_sn_rank_normalize(raw_b, group_uids, eps=float(min_eps)))
+    elif p1_norm_mode in ("mean", "global_mean"):
+        mean_a = float(np.mean(list(raw_a.values()))) if raw_a else 1.0
+        mean_b = float(np.mean(list(raw_b.values()))) if raw_b else 1.0
+        p1_a = {uid: raw_a[uid] / max(mean_a, float(min_eps)) for uid in raw_a}
+        p1_b = {uid: raw_b[uid] / max(mean_b, float(min_eps)) for uid in raw_b}
+    elif p1_norm_mode != "raw":
+        raise ValueError(f"Unknown sn_p1_norm_mode={p1_norm_mode}. Use raw, rank, depth_rank, or depth_balanced.")
+
+    for uid in unit_stats.keys():
+        unit_stats[uid]["p1_a_hat"] = float(max(p1_a.get(uid, raw_a[uid]), 0.0))
+        unit_stats[uid]["p1_b_hat"] = float(max(p1_b.get(uid, raw_b[uid]), float(min_eps)))
+        unit_stats[uid]["layer_idx"] = layer_indices.get(uid)
+        unit_stats[uid]["depth_group"] = depth_groups.get(uid, "unknown")
+
+    def _build_marginals(uid_subset=None):
+        uid_subset = sorted(unit_stats.keys()) if uid_subset is None else sorted(uid_subset)
+        out = []
+        for uid in uid_subset:
+            a_hat = unit_stats[uid]["p1_a_hat"]
+            b_hat = unit_stats[uid]["p1_b_hat"]
+            unit_c = int(unit_stats[uid]["unit_info"]["cost"])
+            for k in range(K):
+                gain = ((2 * (K - k) - 1) * a_hat - b_hat) / (K * K)
+                if force_full_budget or gain > 0.0:
+                    density = float(gain) / max(float(unit_c), 1.0)
+                    out.append((float(gain), density, uid, k, unit_c))
+        return out
+
+    quotas = {uid: 0 for uid in unit_stats.keys()}
+    used_total_cost = 0
+
+    if p1_norm_mode == "depth_balanced" and equal_cost:
+        ratios_by_group = _sn_parse_depth_ratios(depth_group_ratios)
+        group_targets = _sn_group_slot_targets(int(total_slot_budget), ratios_by_group, set(depth_groups.values()))
+        all_chosen_keys = set()
+        for g, group_slots in group_targets.items():
+            if group_slots <= 0:
+                continue
+            group_uids = [uid for uid in unit_stats.keys() if depth_groups.get(uid) == g]
+            group_marginals = _build_marginals(group_uids)
+            group_marginals.sort(key=lambda x: (-x[0], x[2], x[3]))
+            chosen = group_marginals[:int(group_slots)]
+            for gain, density, uid, k, unit_c in chosen:
+                quotas[uid] += 1
+                used_total_cost += int(unit_c)
+                all_chosen_keys.add((uid, k))
+        # If some group lacks positive candidates and we still have remaining slots,
+        # backfill globally.  With force_full_budget=True this exactly exhausts the
+        # same total slot budget; otherwise it only backfills positive marginal gains.
+        remaining_slots = int(total_slot_budget) - int(sum(quotas.values()))
+        if remaining_slots > 0:
+            global_marginals = [m for m in _build_marginals(None) if (m[2], m[3]) not in all_chosen_keys]
+            global_marginals.sort(key=lambda x: (-x[0], x[2], x[3]))
+            for gain, density, uid, k, unit_c in global_marginals[:remaining_slots]:
+                quotas[uid] += 1
+                used_total_cost += int(unit_c)
+    else:
+        marginals = _build_marginals(None)
+        if equal_cost:
+            marginals.sort(key=lambda x: (-x[0], x[2], x[3]))
+            chosen = marginals[:int(total_slot_budget)]
+            for gain, density, uid, k, unit_c in chosen:
+                quotas[uid] += 1
+                used_total_cost += int(unit_c)
+        else:
+            # Multiple-choice marginal knapsack approximation.  Each marginal copy
+            # has the corresponding module cost.  This keeps P1 cost-aware without
+            # introducing a large DP table into the training loop.
+            marginals.sort(key=lambda x: (-x[1], -x[0], x[2], x[3]))
+            for gain, density, uid, k, unit_c in marginals:
+                if used_total_cost + int(unit_c) <= int(total_cost_budget):
+                    quotas[uid] += 1
+                    used_total_cost += int(unit_c)
+
+    quotas = {uid: int(k) for uid, k in quotas.items() if int(k) > 0}
+    required_flow = int(sum(quotas.values()))
+
+    if required_flow == 0:
+        empty = {rec["cid"]: {"selected_layers": set(), "selected_units": set(), "selection_cost": 0} for rec in client_records}
+        diag = {
+            "num_clients": int(K),
+            "atomic_mode": str(atomic_mode),
+            "num_units": int(len(unit_stats)),
+            "equal_cost": bool(equal_cost),
+            "unit_cost": int(unit_cost) if unit_cost is not None else None,
+            "unit_costs": [int(x) for x in costs],
+            "client_capacity_units": int(client_capacity) if client_capacity is not None else None,
+            "total_slot_budget": int(total_slot_budget) if total_slot_budget is not None else None,
+            "total_cost_budget": int(total_cost_budget),
+            "scheduled_units_total": 0,
+            "scheduled_cost_total": 0,
+            "p2_solver": p2_solver,
+            "reason": "no_positive_marginal_gain",
+        }
+        return empty, diag
+
+    # P2-L score with leave-one-out shared direction and positive-interaction gap penalty.
+    active_uids = sorted(quotas.keys())
+    score = {}
+    interaction_gap_pos = {}
+    for uid in active_uids:
+        g = unit_stats[uid]["gram"]
+        q = unit_stats[uid]["q"]
+        for i, rec in enumerate(client_records):
+            loo_alignment = float((g[i, :].sum() - g[i, i]) / max(K - 1, 1))
+            d_pos = float(sum(max(float(g[i, j]), 0.0) for j in range(K) if j != i))
+            s_im = (2.0 / K) * loo_alignment - (1.0 / (K * K)) * float(q[i]) - (float(gap_eta) / (K * K)) * d_pos
+            score[(i, uid)] = float(s_im)
+            interaction_gap_pos[(i, uid)] = d_pos
+
+    selected_by_client = {rec["cid"]: {"selected_layers": set(), "selected_units": set(), "selection_cost": 0} for rec in client_records}
+    unit_selected_clients = defaultdict(list)
+    flow_score = 0.0
+    p2_unfilled_quotas = {}
+
+    if equal_cost:
+        # Max-cost flow: source -> clients -> modules -> sink.
+        n_clients = K
+        n_units = len(active_uids)
+        src = 0
+        client_offset = 1
+        unit_offset = client_offset + n_clients
+        sink = unit_offset + n_units
+        mf = _SNMaxCostFlow(sink + 1)
+
+        for i in range(n_clients):
+            mf.add_edge(src, client_offset + i, int(client_capacity), 0.0)
+
+        edge_lookup = {}
+        for i in range(n_clients):
+            for uidx, uid in enumerate(active_uids):
+                eidx = mf.add_edge(client_offset + i, unit_offset + uidx, 1, score[(i, uid)], meta=(i, uid))
+                edge_lookup[(i, uid)] = (client_offset + i, eidx)
+
+        for uidx, uid in enumerate(active_uids):
+            mf.add_edge(unit_offset + uidx, sink, quotas[uid], 0.0)
+
+        flow, flow_score = mf.max_cost_flow(src, sink, required_flow)
+        if flow != required_flow:
+            raise RuntimeError(f"sn_p1p2 assignment infeasible: flow={flow}, required={required_flow}.")
+
+        for (i, uid), (v, eidx) in edge_lookup.items():
+            # forward edge cap becomes 0 if it was used once.
+            if mf.g[v][eidx][1] == 0:
+                rec = client_records[i]
+                cid = rec["cid"]
+                u = unit_stats[uid]["unit_info"]
+                selected_by_client[cid]["selected_units"].add(uid)
+                selected_by_client[cid]["selected_layers"].update(u["members"])
+                selected_by_client[cid]["selection_cost"] += int(unit_cost)
+                unit_selected_clients[uid].append(int(cid))
+    else:
+        # Greedy generalized assignment for heterogeneous A/B-pair costs.
+        # It respects every client's packet budget and every module quota as far
+        # as feasible.  If a quota cannot be filled because of heterogeneous
+        # budgets, we relax it and record the unfilled quota in diagnostics.
+        remaining_budget = [int(budget) for _ in range(K)]
+        remaining_quota = {uid: int(quotas[uid]) for uid in active_uids}
+        candidates = []
+        for uid in active_uids:
+            unit_c = int(unit_stats[uid]["unit_info"]["cost"])
+            for i in range(K):
+                val = float(score[(i, uid)])
+                density = val / max(float(unit_c), 1.0)
+                candidates.append((density, val, i, uid, unit_c))
+        candidates.sort(key=lambda x: (-x[0], -x[1], x[2], x[3]))
+
+        for density, val, i, uid, unit_c in candidates:
+            if remaining_quota.get(uid, 0) <= 0:
+                continue
+            if remaining_budget[i] < unit_c:
+                continue
+            rec = client_records[i]
+            cid = rec["cid"]
+            if uid in selected_by_client[cid]["selected_units"]:
+                continue
+            u = unit_stats[uid]["unit_info"]
+            selected_by_client[cid]["selected_units"].add(uid)
+            selected_by_client[cid]["selected_layers"].update(u["members"])
+            selected_by_client[cid]["selection_cost"] += int(unit_c)
+            unit_selected_clients[uid].append(int(cid))
+            remaining_budget[i] -= int(unit_c)
+            remaining_quota[uid] -= 1
+            flow_score += float(val)
+
+        p2_unfilled_quotas = {uid: int(v) for uid, v in remaining_quota.items() if int(v) > 0}
+        # Use actual scheduled flow after feasible repair.
+        required_flow = int(sum(len(v["selected_units"]) for v in selected_by_client.values()))
+
+    quota_values = list(quotas.values())
+    diag_units = []
+    # Save compact top diagnostics only to avoid huge files.
+    for uid in sorted(unit_stats.keys(), key=lambda x: (-quotas.get(x, 0), -unit_stats[x]["a_hat"], x))[:50]:
+        st = unit_stats[uid]
+        diag_units.append({
+            "uid": uid,
+            "quota": int(quotas.get(uid, 0)),
+            "unit_cost": int(st["unit_info"].get("cost", 0)),
+            "num_pairs": int(st.get("num_pairs", 1)),
+            "layer_idx": None if st.get("layer_idx") is None else int(st.get("layer_idx")),
+            "depth_group": str(st.get("depth_group", "unknown")),
+            "a_hat": float(st["a_hat"]),
+            "b_hat": float(st["b_hat"]),
+            "q_hat": float(st["q_hat"]),
+            "p1_a_hat": float(st.get("p1_a_hat", st["a_hat"])),
+            "p1_b_hat": float(st.get("p1_b_hat", st["b_hat"])),
+            "snr": float(st["a_hat"] / (st["b_hat"] + 1e-12)),
+            "p1_snr": float(st.get("p1_a_hat", st["a_hat"]) / (st.get("p1_b_hat", st["b_hat"]) + 1e-12)),
+            "selected_clients": unit_selected_clients.get(uid, []),
+        })
+
+    scheduled_cost_total = int(sum(int(v["selection_cost"]) for v in selected_by_client.values()))
+    diag = {
+        "num_clients": int(K),
+        "atomic_mode": str(atomic_mode),
+        "num_units": int(len(unit_stats)),
+        "active_units": int(len(active_uids)),
+        "equal_cost": bool(equal_cost),
+        "unit_cost": int(unit_cost) if unit_cost is not None else None,
+        "unit_costs": [int(x) for x in costs],
+        "client_capacity_units": int(client_capacity) if client_capacity is not None else None,
+        "per_client_budget": int(budget),
+        "total_slot_budget": int(total_slot_budget) if total_slot_budget is not None else None,
+        "total_cost_budget": int(total_cost_budget),
+        "used_total_cost_p1": int(used_total_cost),
+        "scheduled_units_total": int(required_flow),
+        "scheduled_cost_total": scheduled_cost_total,
+        "p2_solver": p2_solver,
+        "p2_unfilled_quota_total": int(sum(p2_unfilled_quotas.values())) if p2_unfilled_quotas else 0,
+        "p2_unfilled_quotas": {str(k): int(v) for k, v in p2_unfilled_quotas.items()},
+        "flow_score": float(flow_score),
+        "gap_eta": float(gap_eta),
+        "force_full_budget": bool(force_full_budget),
+        "p1_norm_mode": str(p1_norm_mode),
+        "depth_group_ratios": str(depth_group_ratios),
+        "quota_by_depth_group": {str(g): int(sum(int(quotas.get(uid, 0)) for uid in quotas if depth_groups.get(uid) == g)) for g in sorted(set(depth_groups.values()))},
+        "mean_quota": float(np.mean(quota_values)) if quota_values else 0.0,
+        "max_quota": int(max(quota_values)) if quota_values else 0,
+        "num_quota_units": int(len(quota_values)),
+        "client_selected_units": {str(cid): int(len(v["selected_units"])) for cid, v in selected_by_client.items()},
+        "client_selection_cost": {str(cid): int(v["selection_cost"]) for cid, v in selected_by_client.items()},
+        "top_units": diag_units,
+    }
+    return selected_by_client, diag
+
+
+def _diagnose_ab_pair_saliency(
+        *,
+        cid,
+        rnd,
+        selected_units,
+        selection_cost,
+        budget,
+        global_state_cpu,
+        upload_candidate_update,
+        lora_keys,
+        layer_costs,
+        reparam_scales,
+        seed,
+        save_top_units=False,
+        top_n=20,
+):
+    """
+    Diagnostic only: does not affect selection, residuals, or aggregation.
+
+    Diagnosis 1: equivalent LoRA reparameterization changes factor-norm Top-K.
+    Diagnosis 2: factor-norm ranking mismatches effective-update ranking.
+    """
+    rows = _build_ab_pair_saliency_rows(
+        global_state_cpu=global_state_cpu,
+        upload_candidate_update=upload_candidate_update,
+        lora_keys=lora_keys,
+        layer_costs=layer_costs,
+    )
+
+    if len(rows) == 0:
+        return None
+
+    factor_score_map = {r["uid"]: r["factor_score"] for r in rows}
+    eff_score_map = {r["uid"]: r["effective_score"] for r in rows}
+
+    factor_selected, factor_cost = _select_unit_ids_by_score(rows, budget, "factor_score")
+    eff_selected, eff_cost = _select_unit_ids_by_score(rows, budget, "effective_score")
+
+    # Use the actual selection from the training path as well, because diversity/random modes may differ.
+    actual_selected = set(selected_units)
+
+    eff_mass_factor = _sum_sq_for_units(rows, factor_selected, "effective_score")
+    eff_mass_eff = _sum_sq_for_units(rows, eff_selected, "effective_score")
+    eff_mass_actual = _sum_sq_for_units(rows, actual_selected, "effective_score")
+
+    factor_mass_factor = _sum_sq_for_units(rows, factor_selected, "factor_score")
+    factor_mass_eff = _sum_sq_for_units(rows, eff_selected, "factor_score")
+
+    out = {
+        "global_round": int(rnd + 1),
+        "cid": int(cid),
+        "budget": int(budget) if budget is not None else None,
+        "actual_selection_cost": int(selection_cost),
+        "num_ab_pairs": int(len(rows)),
+        "num_actual_selected_units": int(len(actual_selected)),
+        "num_factor_selected_units": int(len(factor_selected)),
+        "num_effective_selected_units": int(len(eff_selected)),
+        "factor_selection_cost": int(factor_cost),
+        "effective_selection_cost": int(eff_cost),
+
+        # Diagnosis 2: ranking mismatch between current factor score and effective update score.
+        "spearman_factor_vs_effective": _spearman_from_score_maps(factor_score_map, eff_score_map),
+        "factor_vs_effective_selection_overlap": _selection_overlap(factor_selected, eff_selected),
+        "actual_vs_effective_selection_overlap": _selection_overlap(actual_selected, eff_selected),
+        "effective_mass_factor_selected": float(eff_mass_factor),
+        "effective_mass_effective_selected": float(eff_mass_eff),
+        "effective_mass_actual_selected": float(eff_mass_actual),
+        "effective_mass_ratio_factor_to_effective": float(eff_mass_factor / (eff_mass_eff + 1e-12)),
+        "effective_mass_ratio_actual_to_effective": float(eff_mass_actual / (eff_mass_eff + 1e-12)),
+        "factor_mass_factor_selected": float(factor_mass_factor),
+        "factor_mass_effective_selected": float(factor_mass_eff),
+    }
+
+    # Mean absolute rank gap between factor and effective rankings.
+    factor_rank = _rank_dict_desc(factor_score_map)
+    eff_rank = _rank_dict_desc(eff_score_map)
+    common = sorted(set(factor_rank) & set(eff_rank))
+    if len(common) > 0:
+        rank_gaps = [abs(factor_rank[u] - eff_rank[u]) for u in common]
+        out["mean_abs_rank_gap_factor_effective"] = float(np.mean(rank_gaps))
+        out["median_abs_rank_gap_factor_effective"] = float(np.median(rank_gaps))
+
+    # Diagnosis 1a: same scalar gauge transformation for all modules.
+    scale_records = []
+    for c in reparam_scales:
+        c = float(c)
+        reparam_rows = []
+        for r in rows:
+            reparam_score = math.sqrt((c * r["ua_norm"]) ** 2 + (r["ub_norm"] / c) ** 2)
+            rr = dict(r)
+            rr["reparam_factor_score"] = float(reparam_score)
+            reparam_rows.append(rr)
+
+        reparam_score_map = {r["uid"]: r["reparam_factor_score"] for r in reparam_rows}
+        reparam_selected, reparam_cost = _select_unit_ids_by_score(
+            reparam_rows, budget, "reparam_factor_score"
+        )
+        eff_mass_reparam = _sum_sq_for_units(reparam_rows, reparam_selected, "effective_score")
+
+        scale_records.append({
+            "scheme": "global_scale",
+            "scale": float(c),
+            "num_selected_units": int(len(reparam_selected)),
+            "selection_cost": int(reparam_cost),
+            "spearman_factor_vs_reparam_factor": _spearman_from_score_maps(factor_score_map, reparam_score_map),
+            "overlap_with_original_factor_selection": _selection_overlap(factor_selected, reparam_selected),
+            "overlap_with_effective_selection": _selection_overlap(eff_selected, reparam_selected),
+            "effective_mass_reparam_selected": float(eff_mass_reparam),
+            "effective_mass_ratio_reparam_to_effective": float(eff_mass_reparam / (eff_mass_eff + 1e-12)),
+        })
+
+    # Diagnosis 1b: independent per-module gauge transformation.
+    rng = random.Random(int(seed))
+    scale_choices = [float(x) for x in reparam_scales if float(x) > 0]
+    if len(scale_choices) > 0:
+        per_unit_scales = {r["uid"]: scale_choices[rng.randrange(len(scale_choices))] for r in rows}
+        reparam_rows = []
+        max_eff_relerr = 0.0
+
+        row_by_uid = {r["uid"]: r for r in rows}
+        for r in rows:
+            c = float(per_unit_scales[r["uid"]])
+            reparam_score = math.sqrt((c * r["ua_norm"]) ** 2 + (r["ub_norm"] / c) ** 2)
+            rr = dict(r)
+            rr["reparam_factor_score"] = float(reparam_score)
+            reparam_rows.append(rr)
+
+            # Verify effective-update invariance under A' = cA, B' = B/c, U_A' = cU_A, U_B' = U_B/c.
+            A = global_state_cpu[r["a_key"]]
+            B = global_state_cpu[r["b_key"]]
+            U_A = upload_candidate_update[r["a_key"]]
+            U_B = upload_candidate_update[r["b_key"]]
+            eff_reparam_sq = _lowrank_fro_norm_sq([B / c, U_B / c], [c * U_A, c * (A + U_A)])
+            eff_reparam = math.sqrt(max(eff_reparam_sq, 0.0))
+            denom = abs(float(r["effective_score"])) + 1e-12
+            max_eff_relerr = max(max_eff_relerr, abs(eff_reparam - float(r["effective_score"])) / denom)
+
+        reparam_score_map = {r["uid"]: r["reparam_factor_score"] for r in reparam_rows}
+        reparam_selected, reparam_cost = _select_unit_ids_by_score(
+            reparam_rows, budget, "reparam_factor_score"
+        )
+        eff_mass_reparam = _sum_sq_for_units(reparam_rows, reparam_selected, "effective_score")
+        scale_records.append({
+            "scheme": "per_unit_random_scale",
+            "scale_choices": scale_choices,
+            "num_selected_units": int(len(reparam_selected)),
+            "selection_cost": int(reparam_cost),
+            "spearman_factor_vs_reparam_factor": _spearman_from_score_maps(factor_score_map, reparam_score_map),
+            "overlap_with_original_factor_selection": _selection_overlap(factor_selected, reparam_selected),
+            "overlap_with_effective_selection": _selection_overlap(eff_selected, reparam_selected),
+            "effective_mass_reparam_selected": float(eff_mass_reparam),
+            "effective_mass_ratio_reparam_to_effective": float(eff_mass_reparam / (eff_mass_eff + 1e-12)),
+            "max_effective_score_relative_error_after_reparam": float(max_eff_relerr),
+        })
+
+    out["reparameterization_diagnostics"] = scale_records
+
+    if save_top_units:
+        top_n = max(1, int(top_n))
+        top_factor = sorted(rows, key=lambda r: (-r["factor_score"], r["uid"]))[:top_n]
+        top_eff = sorted(rows, key=lambda r: (-r["effective_score"], r["uid"]))[:top_n]
+        out["top_factor_units"] = [
+            {"uid": r["uid"], "factor_score": r["factor_score"], "effective_score": r["effective_score"]}
+            for r in top_factor
+        ]
+        out["top_effective_units"] = [
+            {"uid": r["uid"], "factor_score": r["factor_score"], "effective_score": r["effective_score"]}
+            for r in top_eff
+        ]
+
+    return out
+
+def _compute_residual_pre_diagnostics(
+    *,
+    cid,
+    rnd,
+    atomic_mode,
+    selected_layers,
+    full_update,
+    global_state_cpu,
+    lora_keys,
+):
+    """
+    Compute quantities available before global aggregation:
+      - full effective update norm ||Phi_t(U)||^2
+      - residual effective update norm ||Phi_t(R)||^2
+      - missing effective update norm ||H||^2
+      - split error norm ||S||^2
+
+    Also keep per-module C/R factors for post-aggregation drift diagnostics.
+    """
+    units = build_atomic_units(lora_keys, "ab_pair")
+
+    full_eff_sq = 0.0
+    residual_eff_sq = 0.0
+    missing_eff_sq = 0.0
+    split_sq = 0.0
+
+    modules = []
+
+    for uid, members in units.items():
+        a_key, b_key = _get_ab_key_pair(members)
+        if a_key is None or b_key is None:
+            continue
+        if a_key not in full_update or b_key not in full_update:
+            continue
+        if a_key not in global_state_cpu or b_key not in global_state_cpu:
+            continue
+
+        A = global_state_cpu[a_key]
+        B = global_state_cpu[b_key]
+
+        U_A = full_update[a_key]
+        U_B = full_update[b_key]
+
+        zero_A = torch.zeros_like(U_A)
+        zero_B = torch.zeros_like(U_B)
+
+        # C: uploaded part; R: unuploaded residual part.
+        C_A = U_A if a_key in selected_layers else zero_A
+        C_B = U_B if b_key in selected_layers else zero_B
+        R_A = zero_A if a_key in selected_layers else U_A
+        R_B = zero_B if b_key in selected_layers else U_B
+
+        # Phi_t(U) = [B, U_B] [U_A; A + U_A]
+        full_eff_sq += _lowrank_fro_norm_sq(
+            [B, U_B],
+            [U_A, A + U_A],
+        )
+
+        # Phi_t(R) = [B, R_B] [R_A; A + R_A]
+        residual_eff_sq += _lowrank_fro_norm_sq(
+            [B, R_B],
+            [R_A, A + R_A],
+        )
+
+        # H = Phi_t(U) - Phi_t(C)
+        #   = (B + C_B) R_A + R_B (A + U_A)
+        #   = [B + C_B, R_B] [R_A; A + U_A]
+        missing_eff_sq += _lowrank_fro_norm_sq(
+            [B + C_B, R_B],
+            [R_A, A + U_A],
+        )
+
+        # S = C_B R_A + R_B C_A = [C_B, R_B] [R_A; C_A]
+        split_sq += _lowrank_fro_norm_sq(
+            [C_B, R_B],
+            [R_A, C_A],
+        )
+
+        # Store for post-aggregation drift/error computation.
+        modules.append({
+            "a_key": a_key,
+            "b_key": b_key,
+            "C_A": C_A.detach().cpu(),
+            "C_B": C_B.detach().cpu(),
+            "R_A": R_A.detach().cpu(),
+            "R_B": R_B.detach().cpu(),
+        })
+
+    return {
+        "cid": int(cid),
+        "global_round": int(rnd + 1),
+        "atomic_mode": atomic_mode,
+        "num_modules": int(len(modules)),
+        "full_eff_sq": float(full_eff_sq),
+        "residual_eff_sq": float(residual_eff_sq),
+        "missing_eff_sq": float(missing_eff_sq),
+        "split_sq": float(split_sq),
+        "modules": modules,
+    }
+
+
+def _finish_residual_post_diagnostics(pre_record, global_update_cpu):
+    """
+    Compute drift and total compensation error after global aggregation.
+
+    global_update_cpu[k] = A^{t+1} - A^t or B^{t+1} - B^t.
+    """
+    drift_sq = 0.0
+    comp_sq = 0.0
+
+    for m in pre_record["modules"]:
+        a_key = m["a_key"]
+        b_key = m["b_key"]
+
+        if a_key not in global_update_cpu or b_key not in global_update_cpu:
+            continue
+
+        dA = global_update_cpu[a_key]
+        dB = global_update_cpu[b_key]
+
+        C_A = m["C_A"]
+        C_B = m["C_B"]
+        R_A = m["R_A"]
+        R_B = m["R_B"]
+
+        # D = dB R_A + R_B dA = [dB, R_B] [R_A; dA]
+        drift_sq += _lowrank_fro_norm_sq(
+            [dB, R_B],
+            [R_A, dA],
+        )
+
+        # E = D - S = (dB - C_B) R_A + R_B (dA - C_A)
+        #     = [dB - C_B, R_B] [R_A; dA - C_A]
+        comp_sq += _lowrank_fro_norm_sq(
+            [dB - C_B, R_B],
+            [R_A, dA - C_A],
+        )
+
+    eps = 1e-12
+    split_ratio_full = _safe_sqrt_ratio(pre_record["split_sq"], pre_record["full_eff_sq"], eps)
+    split_ratio_missing = _safe_sqrt_ratio(pre_record["split_sq"], pre_record["missing_eff_sq"], eps)
+    drift_ratio_residual = _safe_sqrt_ratio(drift_sq, pre_record["residual_eff_sq"], eps)
+    comp_error_ratio_missing = _safe_sqrt_ratio(comp_sq, pre_record["missing_eff_sq"], eps)
+
+    out = {
+        "cid": pre_record["cid"],
+        "global_round": pre_record["global_round"],
+        "atomic_mode": pre_record["atomic_mode"],
+        "num_modules": pre_record["num_modules"],
+
+        "full_eff_norm": math.sqrt(max(pre_record["full_eff_sq"], 0.0)),
+        "residual_eff_norm": math.sqrt(max(pre_record["residual_eff_sq"], 0.0)),
+        "missing_eff_norm": math.sqrt(max(pre_record["missing_eff_sq"], 0.0)),
+        "split_norm": math.sqrt(max(pre_record["split_sq"], 0.0)),
+        "drift_norm": math.sqrt(max(drift_sq, 0.0)),
+        "comp_error_norm": math.sqrt(max(comp_sq, 0.0)),
+
+        "split_ratio_to_full": float(split_ratio_full),
+        "split_ratio_to_missing": float(split_ratio_missing),
+        "drift_ratio_to_residual": float(drift_ratio_residual),
+        "comp_error_ratio_to_missing": float(comp_error_ratio_missing),
+    }
+
+    # Do not serialize tensors.
+    return out
+
+
+def _make_state_delta_cpu(anchor_state_cpu, current_state_cpu, lora_keys):
+    """
+    Return current_state - anchor_state for LoRA tensors.
+    This corresponds to A^s - A^t and B^s - B^t.
+    """
+    out = {}
+    for k in lora_keys:
+        if k in anchor_state_cpu and k in current_state_cpu:
+            out[k] = (current_state_cpu[k] - anchor_state_cpu[k]).detach().cpu()
+    return out
+
+
+def _move_batch_to_device_for_loss(batch, device):
+    out = {}
+    for k, v in batch.items():
+        if k == "input_ids_wo_label":
+            continue
+        if torch.is_tensor(v):
+            out[k] = v.to(device)
+        else:
+            out[k] = v
+    return out
+
+
+@torch.no_grad()
+def _estimate_loss_on_batches(model, dataloader, device, max_batches: int):
+    was_training = model.training
+    model.eval()
+
+    total_loss = 0.0
+    count = 0
+
+    for step, batch in enumerate(dataloader):
+        if step >= max_batches:
+            break
+
+        inputs = _move_batch_to_device_for_loss(batch, device)
+
+        try:
+            outputs = model(**inputs)
+            loss = getattr(outputs, "loss", None)
+            if loss is None:
+                if isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+                    loss = outputs[0]
+                else:
+                    continue
+
+            loss_val = float(loss.detach().float().item())
+            if math.isfinite(loss_val):
+                total_loss += loss_val
+                count += 1
+        except Exception as e:
+            # 诊断逻辑不要影响主训练
+            logger.warning(f"[ReplayGain] loss estimation failed at batch {step}: {e}")
+            continue
+
+    if was_training:
+        model.train()
+
+    if count == 0:
+        return None
+
+    return total_loss / count
+
+
+def _set_lora_state_inplace(model, state_cpu, lora_keys, device):
+    name_to_param = dict(model.named_parameters())
+    for k in lora_keys:
+        if k in name_to_param and k in state_cpu:
+            p = name_to_param[k]
+            p.data.copy_(state_cpu[k].to(device=p.device, dtype=p.dtype))
+
+
+def _apply_lora_residual_inplace(model, residual_cpu, scale: float):
+    name_to_param = dict(model.named_parameters())
+    for k, r in residual_cpu.items():
+        if k in name_to_param:
+            p = name_to_param[k]
+            p.data.add_(r.to(device=p.device, dtype=p.dtype), alpha=scale)
+
+
+def _diagnose_residual_replay_gain(
+        *,
+        model,
+        global_state_cpu,
+        lora_keys,
+        client_dataset,
+        collator,
+        device,
+        cid,
+        rnd,
+        client_residuals,
+        client_residual_ages,
+        batch_size,
+        max_batches,
+        min_age,
+        max_age,
+        scale,
+        seed,
+):
+    """
+    Bucket-level residual replay gain.
+
+    For each residual age bucket:
+      1. Reset LoRA to current global state.
+      2. Compute baseline loss on a small local mini-batch.
+      3. Add residuals of this age bucket to global LoRA.
+      4. Compute replay loss.
+      5. replay_gain = baseline_loss - replay_loss.
+
+    Positive replay_gain means the historical residual still reduces current loss.
+    """
+
+    if client_residuals is None or len(client_residuals) == 0:
+        return []
+
+    # group residual tensors by age
+    age_to_residual = defaultdict(dict)
+    age_to_factor_norm_sq = defaultdict(float)
+
+    for k, r in client_residuals.items():
+        if k not in lora_keys:
+            continue
+
+        age = int(client_residual_ages.get(k, 0))
+        if age < min_age:
+            continue
+        if max_age >= 0 and age > max_age:
+            continue
+
+        if r is None:
+            continue
+
+        r_cpu = r.detach().cpu()
+        r_norm = torch.norm(r_cpu.float()).item()
+        if r_norm <= 0:
+            continue
+
+        age_to_residual[age][k] = r_cpu
+        age_to_factor_norm_sq[age] += r_norm * r_norm
+
+    if len(age_to_residual) == 0:
+        return []
+
+    # build a small dataloader for replay-gain estimation
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+
+    dataloader = torch.utils.data.DataLoader(
+        client_dataset,
+        batch_size=max(1, int(batch_size)),
+        shuffle=True,
+        generator=g,
+        collate_fn=collator,
+    )
+
+    # baseline: current global LoRA
+    _set_lora_state_inplace(model, global_state_cpu, lora_keys, device)
+    baseline_loss = _estimate_loss_on_batches(
+        model, dataloader, device, max_batches=max_batches
+    )
+
+    if baseline_loss is None:
+        _set_lora_state_inplace(model, global_state_cpu, lora_keys, device)
+        return []
+
+    records = []
+
+    for age in sorted(age_to_residual.keys()):
+        residual_bucket = age_to_residual[age]
+
+        # reset to global state before each replay
+        _set_lora_state_inplace(model, global_state_cpu, lora_keys, device)
+
+        # temporarily apply residual bucket
+        _apply_lora_residual_inplace(model, residual_bucket, scale=scale)
+
+        # rebuild dataloader to use the same shuffled order for fair comparison
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        dataloader = torch.utils.data.DataLoader(
+            client_dataset,
+            batch_size=max(1, int(batch_size)),
+            shuffle=True,
+            generator=g,
+            collate_fn=collator,
+        )
+
+        replay_loss = _estimate_loss_on_batches(
+            model, dataloader, device, max_batches=max_batches
+        )
+
+        if replay_loss is None:
+            continue
+
+        gain = baseline_loss - replay_loss
+        factor_norm = math.sqrt(max(age_to_factor_norm_sq[age], 0.0))
+
+        records.append({
+            "global_round": int(rnd + 1),
+            "cid": int(cid),
+            "residual_age": int(age),
+            "num_tensors": int(len(residual_bucket)),
+            "baseline_loss": float(baseline_loss),
+            "replay_loss": float(replay_loss),
+            "replay_gain": float(gain),
+            "positive_gain": bool(gain > 0),
+            "gain_per_factor_norm": float(gain / (factor_norm + 1e-12)),
+            "relative_gain_to_baseline": float(gain / (abs(baseline_loss) + 1e-12)),
+            "residual_factor_norm": float(factor_norm),
+            "replay_scale": float(scale),
+            "max_batches": int(max_batches),
+        })
+
+    # important: restore global LoRA state after diagnosis
+    _set_lora_state_inplace(model, global_state_cpu, lora_keys, device)
+
+    return records
+
+
+
+
 def select_layers_topk(delta_dict, layer_costs, budget):
     """
     Select layers based on L2 norm of the update (Top-K importance) until budget is exhausted.
@@ -431,23 +2291,213 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     def _is_main():
         return getattr(training_args, "process_index", 0) == 0
 
+    # Upload atomicity mode for lora_origin experiments.
+    # tensor: original tensor-level upload
+    # ab_pair: A/B pair atomic upload
+    # qv_block: q/v adapter block atomic upload
+    UPLOAD_ATOMIC_MODE = getattr(training_args, "upload_atomic_mode", "tensor").strip()
+
+    if UPLOAD_ATOMIC_MODE not in ["tensor", "ab_pair", "qv_block"]:
+        raise ValueError(
+            f"Invalid upload_atomic_mode={UPLOAD_ATOMIC_MODE}. "
+            "Choose from: tensor, ab_pair, qv_block."
+        )
+
+    if _is_main():
+        logger.info(f"[UploadAtomicity] upload_atomic_mode={UPLOAD_ATOMIC_MODE}")
+
+    UPLOAD_DIVERSITY_MODE = getattr(training_args, "upload_diversity_mode", "none").strip()
+    if UPLOAD_DIVERSITY_MODE not in ["none", "group_mask", "coverage_penalty"]:
+        raise ValueError(
+            f"Invalid upload_diversity_mode={UPLOAD_DIVERSITY_MODE}. "
+            "Choose from: none, group_mask, coverage_penalty."
+        )
+
+    DIVERSITY_NUM_GROUPS = max(1, int(getattr(training_args, "diversity_num_groups", 4)))
+    COVERAGE_PENALTY_BETA = float(getattr(training_args, "coverage_penalty_beta", 1.0))
+
+    if _is_main():
+        logger.info(
+            f"[UploadDiversity] mode={UPLOAD_DIVERSITY_MODE}, "
+            f"num_groups={DIVERSITY_NUM_GROUPS}, "
+            f"coverage_penalty_beta={COVERAGE_PENALTY_BETA}"
+        )
+
+    DIAGNOSE_RESIDUAL_ERRORS = bool(
+        getattr(training_args, "diagnose_residual_errors", False)
+    )
+
+    if _is_main():
+        logger.info(f"[ResidualDiagnostics] diagnose_residual_errors={DIAGNOSE_RESIDUAL_ERRORS}")
+
+
+    DIAGNOSE_DRIFT_MAX_AGE = int(
+        getattr(training_args, "diagnose_drift_max_age", 5)
+    )
+
+    if _is_main():
+        logger.info(
+            f"[ResidualDiagnostics] diagnose_drift_max_age={DIAGNOSE_DRIFT_MAX_AGE}"
+        )
+
+    LORA_RESIDUAL_ACCUMULATION = bool(
+        getattr(training_args, "lora_residual_accumulation", False)
+    )
+
+    LORA_RESIDUAL_MAX_AGE = int(
+        getattr(training_args, "lora_residual_max_age", -1)
+    )
+
+    if _is_main():
+        logger.info(
+            f"[LoRAResidual] accumulation={LORA_RESIDUAL_ACCUMULATION}, "
+            f"max_age={LORA_RESIDUAL_MAX_AGE}"
+        )
+
+    DIAGNOSE_RESIDUAL_REPLAY_GAIN = bool(
+        getattr(training_args, "diagnose_residual_replay_gain", False)
+    )
+
+    REPLAY_GAIN_MAX_CLIENTS_PER_ROUND = int(
+        getattr(training_args, "replay_gain_max_clients_per_round", 2)
+    )
+
+    REPLAY_GAIN_MAX_BATCHES = int(
+        getattr(training_args, "replay_gain_max_batches", 1)
+    )
+
+    REPLAY_GAIN_MIN_AGE = int(
+        getattr(training_args, "replay_gain_min_age", 1)
+    )
+
+    REPLAY_GAIN_MAX_AGE = int(
+        getattr(training_args, "replay_gain_max_age", 8)
+    )
+
+    REPLAY_GAIN_SCALE = float(
+        getattr(training_args, "replay_gain_scale", 1.0)
+    )
+
+    if _is_main():
+        logger.info(
+            f"[ResidualReplayGain] enabled={DIAGNOSE_RESIDUAL_REPLAY_GAIN}, "
+            f"max_clients_per_round={REPLAY_GAIN_MAX_CLIENTS_PER_ROUND}, "
+            f"max_batches={REPLAY_GAIN_MAX_BATCHES}, "
+            f"age_range=[{REPLAY_GAIN_MIN_AGE}, {REPLAY_GAIN_MAX_AGE}], "
+            f"scale={REPLAY_GAIN_SCALE}"
+        )
+
+    UPLOAD_SCORE_MODE = str(
+        getattr(training_args, "upload_score_mode", "factor_norm") or "factor_norm"
+    ).lower()
+    if UPLOAD_SCORE_MODE not in ("factor_norm", "effective_norm", "sn_p1p2"):
+        raise ValueError(
+            f"Unknown upload_score_mode={UPLOAD_SCORE_MODE}. "
+            "Use factor_norm, effective_norm, or sn_p1p2."
+        )
+
+    if _is_main():
+        logger.info(f"[UploadScore] mode={UPLOAD_SCORE_MODE}")
+
+    SERVER_SN_UPLOAD = (UPLOAD_SCORE_MODE == "sn_p1p2")
+    SN_GAP_ETA = float(getattr(training_args, "sn_gap_eta", 1.0))
+    SN_FORCE_FULL_BUDGET = bool(getattr(training_args, "sn_force_full_budget", False))
+    SN_MIN_SIGNAL_EPS = float(getattr(training_args, "sn_min_signal_eps", 1e-12))
+    SN_SAVE_DIAGNOSTICS = bool(getattr(training_args, "sn_save_diagnostics", True))
+    SN_P1_NORM_MODE = str(getattr(training_args, "sn_p1_norm_mode", "raw") or "raw")
+    SN_DEPTH_GROUP_RATIOS = str(getattr(training_args, "sn_depth_group_ratios", "1,1,2") or "1,1,2")
+
+    if SERVER_SN_UPLOAD:
+        if UPLOAD_ATOMIC_MODE not in ("ab_pair", "qv_block"):
+            raise ValueError("upload_score_mode=sn_p1p2 requires upload_atomic_mode=ab_pair or qv_block.")
+        if LORA_RESIDUAL_ACCUMULATION:
+            raise ValueError("upload_score_mode=sn_p1p2 currently does not support lora_residual_accumulation.")
+        if UPLOAD_DIVERSITY_MODE != "none":
+            raise ValueError("upload_score_mode=sn_p1p2 is a server-side scheduler; set upload_diversity_mode=none.")
+
+    if _is_main():
+        logger.info(
+            f"[SignalNoiseUpload] enabled={SERVER_SN_UPLOAD}, "
+            f"gap_eta={SN_GAP_ETA}, force_full_budget={SN_FORCE_FULL_BUDGET}, "
+            f"min_eps={SN_MIN_SIGNAL_EPS}, save_diag={SN_SAVE_DIAGNOSTICS}"
+        )
+
+    # Pair-saliency diagnostics for A/B pair Top-K. This does not affect training.
+    DIAGNOSE_PAIR_SALIENCY = bool(
+        getattr(training_args, "diagnose_pair_saliency", False)
+    )
+    PAIR_SALIENCY_REPARAM_SCALES = _parse_float_list(
+        getattr(training_args, "pair_saliency_reparam_scales", "0.25,0.5,2,4"),
+        [0.25, 0.5, 2.0, 4.0],
+    )
+    PAIR_SALIENCY_SAVE_TOP_UNITS = bool(
+        getattr(training_args, "pair_saliency_save_top_units", False)
+    )
+    PAIR_SALIENCY_TOP_N = int(
+        getattr(training_args, "pair_saliency_top_n", 20)
+    )
+
+    if _is_main():
+        logger.info(
+            f"[PairSaliencyDiagnostics] enabled={DIAGNOSE_PAIR_SALIENCY}, "
+            f"reparam_scales={PAIR_SALIENCY_REPARAM_SCALES}, "
+            f"save_top_units={PAIR_SALIENCY_SAVE_TOP_UNITS}, "
+            f"top_n={PAIR_SALIENCY_TOP_N}"
+        )
+
+
+
     def compute_rouge_metrics(dataset, preds, save_prefix=None):
-        # 对生成式模型的输出进行后处理
-        print(type(preds), np.asarray(preds).dtype, np.asarray(preds).shape)
         decoded_preds = skip_instructions(model, preds, tokenizer)
         references = [e["Instance"]["label"] for e in dataset]
+
+        dataset_names = [str(x).lower() for x in dataset["Dataset"]]
+        is_gsm8k = len(dataset_names) > 0 and all("gsm8k" in x for x in dataset_names)
+
+        # ===== GSM8K 专用评测 =====
+        if is_gsm8k:
+            result = compute_gsm8k_metrics(decoded_preds, references)
+
+            prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+            result["gen_len"] = np.mean(prediction_lens)
+            result = {k: round(v, 4) for k, v in result.items()}
+
+            if save_prefix is not None:
+                with open(os.path.join(training_args.output_dir, f"{save_prefix}_eval_predictions.jsonl"), "w") as fout:
+                    for example, pred, ref in zip(dataset, decoded_preds, references):
+                        fout.write(json.dumps({
+                            "Task": example["Task"],
+                            "Dataset": example["Dataset"],
+                            "Instance": example["Instance"],
+                            "Prediction": pred,
+                            "Prediction_final": extract_gsm8k_final_answer(pred),
+                            "Reference_final": extract_gsm8k_final_answer(ref),
+                        }, ensure_ascii=False) + "\n")
+
+            return result
+
+        # ===== 其他数据集仍走原逻辑 =====
         result = compute_metrics(predictions=decoded_preds, references=references)
-        # 按类别进行分类，考虑的是所有TC类的准确率
-        result_per_task = compute_grouped_metrics(predictions=decoded_preds, references=references,
-                                                  groups=dataset["Task"])
+
+        result_per_task = compute_grouped_metrics(
+            predictions=decoded_preds,
+            references=references,
+            groups=dataset["Task"]
+        )
         result.update(result_per_task)
+
         categories = dataset["Dataset"]
-        result_per_category = compute_grouped_metrics(predictions=decoded_preds, references=references,
-                                                      groups=categories)
+        result_per_category = compute_grouped_metrics(
+            predictions=decoded_preds,
+            references=references,
+            groups=categories
+        )
         result.update(result_per_category)
+
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
         result = {k: round(v, 4) for k, v in result.items()}
+
         if save_prefix is not None:
             with open(os.path.join(training_args.output_dir, f"{save_prefix}_eval_predictions.jsonl"), "w") as fout:
                 for example, pred in zip(dataset, decoded_preds):
@@ -457,7 +2507,37 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         "Instance": example["Instance"],
                         "Prediction": pred
                     }) + "\n")
+
         return result
+
+
+    # def compute_rouge_metrics(dataset, preds, save_prefix=None):
+    #     # 对生成式模型的输出进行后处理
+    #     print(type(preds), np.asarray(preds).dtype, np.asarray(preds).shape)
+    #     decoded_preds = skip_instructions(model, preds, tokenizer)
+    #     references = [e["Instance"]["label"] for e in dataset]
+    #     result = compute_metrics(predictions=decoded_preds, references=references)
+    #     # 按类别进行分类，考虑的是所有TC类的准确率
+    #     result_per_task = compute_grouped_metrics(predictions=decoded_preds, references=references,
+    #                                               groups=dataset["Task"])
+    #     result.update(result_per_task)
+    #     categories = dataset["Dataset"]
+    #     result_per_category = compute_grouped_metrics(predictions=decoded_preds, references=references,
+    #                                                   groups=categories)
+    #     result.update(result_per_category)
+    #     prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+    #     result["gen_len"] = np.mean(prediction_lens)
+    #     result = {k: round(v, 4) for k, v in result.items()}
+    #     if save_prefix is not None:
+    #         with open(os.path.join(training_args.output_dir, f"{save_prefix}_eval_predictions.jsonl"), "w") as fout:
+    #             for example, pred in zip(dataset, decoded_preds):
+    #                 fout.write(json.dumps({
+    #                     "Task": example["Task"],
+    #                     "Dataset": example["Dataset"],
+    #                     "Instance": example["Instance"],
+    #                     "Prediction": pred
+    #                 }) + "\n")
+    #     return result
 
     def collator_for(model):
         # 确保数据整理器始终拿到未被分布式/Accelerate 包装的原始模型，
@@ -521,6 +2601,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
     data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
+
+    print("data_args.data_dir =", data_args.data_dir)
+    print("data_args.task_config_dir =", data_args.task_config_dir)
+    print("data_args.instruction_file =", data_args.instruction_file)
+
+    assert data_args.data_dir is not None and os.path.exists(data_args.data_dir), data_args.data_dir
+    assert data_args.task_config_dir is not None and os.path.exists(
+        data_args.task_config_dir), data_args.task_config_dir
+
+    # instruction_file 对你这套脚本是可选的，不要强制 assert
+    if data_args.instruction_file is not None:
+        assert os.path.exists(data_args.instruction_file), data_args.instruction_file
+
+
     with training_args.main_process_first(desc="loading dataset"):
         raw_datasets = load_dataset(
             os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
@@ -531,7 +2625,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             cache_dir=data_cache_dir,
             max_num_instances_per_task=data_args.max_num_instances_per_task,
             max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-            num_examples=data_args.num_examples
+            num_examples=data_args.num_examples,
+            trust_remote_code=True,
         )
     raw_datasets.cleanup_cache_files()
 
@@ -589,16 +2684,39 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
     # ------------ load client dataset --------------
-    client_datasets = partition_dataset(
-                train_dataset,
-                fed_args.num_clients,
-                fed_args.dirichlet_alpha,
-                base_seed = fed_args.federated_seed,
+    client_datasets = make_client_datasets(train_dataset, fed_args)
+
+    if _is_main():
+        partition_strategy = str(getattr(fed_args, "partition_strategy", "quantity"))
+        partition_label_key = str(getattr(fed_args, "partition_label_key", "Dataset"))
+        logger.info(
+            f"[Partition] strategy={partition_strategy}, "
+            f"label_key={partition_label_key}, "
+            f"alpha={fed_args.dirichlet_alpha}, "
+            f"num_clients={fed_args.num_clients}"
         )
+
+        partition_summary = summarize_client_partitions(
+            client_datasets,
+            label_key=partition_label_key,
+        )
+        partition_summary_path = os.path.join(
+            training_args.output_dir,
+            "client_partition_summary.json"
+        )
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        with open(partition_summary_path, "w", encoding="utf-8") as fout:
+            json.dump(partition_summary, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved client partition summary to {partition_summary_path}")
 
 
     # ------------ build model --------------
     model, tokenizer = build_model_and_tokenizer(model_args)
+
+    # for n, p in model.named_parameters():
+    #     if p.requires_grad and "lora" in n:
+    #         print(n)
+
 
     # ------------ load checkpoint --------------
     if training_args.gradient_checkpointing:
@@ -757,6 +2875,61 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         for k, p in lora_params.items()
     }
 
+    # ===== Group 3: Dense-Reduced-Participation baseline =====
+    # 默认 False：正常跑 Group 1 / Group 2
+    # 改成 True：自动把 clients_per_round 缩到与 sparse budget 匹配
+    USE_DENSE_REDUCED_PARTICIPATION = False
+
+    if USE_DENSE_REDUCED_PARTICIPATION and method != "lora_origin":
+        raise ValueError("Dense-Reduced-Participation baseline is currently intended only for method='lora_origin'.")
+
+    full_upload_cost = int(sum(layer_costs.values()))
+
+    # 默认沿用原始值
+    effective_clients_per_round = fed_args.clients_per_round
+    effective_comm_budget = fed_args.comm_budget
+
+    if USE_DENSE_REDUCED_PARTICIPATION:
+        if fed_args.comm_budget is None or fed_args.comm_budget <= 0:
+            raise ValueError("Dense-Reduced-Participation baseline needs a positive comm_budget, e.g. 1000.")
+
+        # 匹配 Group 2 的系统级每轮总流量:
+        #   Group 2: clients_per_round * comm_budget
+        #   Group 3: effective_clients_per_round * full_upload_cost
+        dense_clients_real = fed_args.clients_per_round * fed_args.comm_budget / full_upload_cost
+
+        if dense_clients_real < 1:
+            raise ValueError(
+                f"Infeasible Dense-Reduced-Participation baseline: "
+                f"one full-upload client costs {full_upload_cost}, "
+                f"but sparse system budget per round is only "
+                f"{fed_args.clients_per_round * fed_args.comm_budget}. "
+                f"Please increase comm_budget or use a multi-round/window-matched dense baseline."
+            )
+
+        dense_clients = math.floor(dense_clients_real)
+        effective_clients_per_round = min(fed_args.clients_per_round, dense_clients)
+
+        # Group 3 必须 full upload，所以关闭按层裁剪
+        effective_comm_budget = None
+
+        if _is_main():
+            logger.info(
+                f"[Dense-Reduced-Participation] full_upload_cost={full_upload_cost}, "
+                f"sparse_budget_per_client={fed_args.comm_budget}, "
+                f"orig_clients_per_round={fed_args.clients_per_round}, "
+                f"effective_clients_per_round={effective_clients_per_round}"
+            )
+    else:
+        if _is_main():
+            logger.info(
+                f"[Normal FedLoRA] full_upload_cost={full_upload_cost}, "
+                f"clients_per_round={effective_clients_per_round}, "
+                f"comm_budget={effective_comm_budget}"
+            )
+
+
+
     base_args.num_train_epochs = fed_args.local_epochs
     base_args.save_strategy = "no"
     base_args.logging_strategy = "no"
@@ -768,6 +2941,19 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     current_task_ewc_cache = {}
     current_task_replay_cache = {}
     adaptive_round_stats = defaultdict(list)
+    selection_overlap_history = []
+    residual_diag_history = []
+
+    residual_multistep_history = []
+    pending_residual_pre_records = []
+    global_state_snapshots = {}
+
+    client_lora_residuals = defaultdict(dict)
+    client_lora_residual_ages = defaultdict(dict)
+    residual_accumulation_history = []
+    residual_replay_gain_history = []
+    pair_saliency_history = []
+    sn_schedule_history = []
 
     trainer = UIETrainer(
         model=global_model,
@@ -798,10 +2984,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
         selected = pick_clients(
                         fed_args.num_clients,
-                        fed_args.clients_per_round,
+                        effective_clients_per_round,
                         rnd,
                         fed_args.federated_seed,
         )
+
+        if (
+                DIAGNOSE_RESIDUAL_REPLAY_GAIN
+                and LORA_RESIDUAL_ACCUMULATION
+                and method == "lora_origin"
+        ):
+            replay_gain_clients = set(
+                selected[:max(0, REPLAY_GAIN_MAX_CLIENTS_PER_ROUND)]
+            )
+        else:
+            replay_gain_clients = set()
+
 
         if method == "lorm":
             target_matrix = "B" if (rnd % 2 == 0) else "A"
@@ -825,6 +3023,13 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             for k, v in global_model.state_dict().items()
             if k in lora_keys  # 只需要 LoRA 键
         }
+
+        if DIAGNOSE_RESIDUAL_ERRORS and _is_main() and method == "lora_origin":
+            # This is the anchor state (A^t, B^t) before local training and aggregation.
+            global_state_snapshots[rnd + 1] = {
+                k: v.detach().cpu().clone()
+                for k, v in global_state_cpu.items()
+            }
 
         # 2. 将其转换为 GPU 字典，用于快速加载
         global_state_gpu = {
@@ -851,8 +3056,16 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
         aggregated = {k: torch.zeros_like(global_state_cpu[k]) for k in lora_keys}
         total = 0
+        round_selected_layers = {}
+        # Atomic-unit coverage already selected by previous clients in this round.
+        # Used only by upload_diversity_mode=coverage_penalty, but maintained for all modes.
+        round_unit_coverage_counts = defaultdict(int)
+        # Sorted unit list for deterministic group assignment in upload_diversity_mode=group_mask.
+        round_atomic_unit_ids = sorted(build_atomic_units(lora_keys, UPLOAD_ATOMIC_MODE).keys())
+        round_residual_pre_records = []
+        round_server_sn_records = []
 
-        for cid in selected:
+        for client_order, cid in enumerate(selected):
             if _is_main():
                 logger.info(f"Client ID: {cid}")
                 logger.info(f"Client {cid}: Resetting persistent trainer...")
@@ -895,7 +3108,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 client_grams = getattr(trainer, "lorm_grams", {})
 
                 # 4. [通信控制] 稀疏化筛选
-                if fed_args.comm_budget is not None and fed_args.comm_budget > 0:
+                if effective_comm_budget is not None and effective_comm_budget  > 0:
 
                     # 准备 Cost 字典 (Parameter + Gram)
                     # 我们需要手动构建这个 layer_costs，因为 select_layers_* 函数只认 params
@@ -925,22 +3138,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         seed = fed_args.federated_seed + rnd + cid
                         # 注意：select_layers_random 的第一个参数通常是 key 列表
                         selected_layers, selection_cost = select_layers_random(
-                            candidate_keys, lorm_layer_costs, fed_args.comm_budget, seed
+                            candidate_keys, lorm_layer_costs, effective_comm_budget, seed
                         )
                         if _is_main():
                             logger.info(
-                                f"Client {cid} [LoRM Random]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+                                f"Client {cid} [LoRM Random]: Selected {len(selected_layers)} layers, cost {selection_cost}/{effective_comm_budget}")
 
                     else:
                         # Top-K (Norm-based)
                         # 注意：select_layers_topk 通常接受 (delta, costs)
                         # 这里我们传 (client_params, costs)，因为它会算 value 的 norm
                         selected_layers, selection_cost = select_layers_topk(
-                            client_params, lorm_layer_costs, fed_args.comm_budget
+                            client_params, lorm_layer_costs, effective_comm_budget
                         )
                         if _is_main():
                             logger.info(
-                                f"Client {cid} [LoRM Top-K]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+                                f"Client {cid} [LoRM Top-K]: Selected {len(selected_layers)} layers, cost {selection_cost}/{effective_comm_budget}")
 
                     # 5. [执行稀疏化] 剔除未选中的层
                     # 区别于 FedAvg 的 Mask(置0)，这里直接删除 Key
@@ -1154,33 +3367,351 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         continue  # 或者 log warning
                     delta[k] = global_state_cpu[k] - p.detach().cpu()
 
+                local_update = {
+                    k: (-delta[k]).detach().cpu()
+                    for k in delta
+                }
+
+                if (
+                        LORA_RESIDUAL_ACCUMULATION
+                        and method == "lora_origin"
+                ):
+                    upload_candidate_update = {}
+                    for k in lora_keys:
+                        prev_r = client_lora_residuals[cid].get(k, None)
+                        if prev_r is None:
+                            prev_r = torch.zeros_like(local_update[k])
+
+                        prev_age = int(client_lora_residual_ages[cid].get(k, 0))
+
+                        # Optional bounded-age support.
+                        if LORA_RESIDUAL_MAX_AGE >= 0 and prev_age >= LORA_RESIDUAL_MAX_AGE:
+                            prev_r = torch.zeros_like(local_update[k])
+                            prev_age = 0
+
+                        upload_candidate_update[k] = local_update[k] + prev_r
+                else:
+                    upload_candidate_update = local_update
+
+                # The rest of the existing code expects delta = global - local.
+                # For aggregation, selected upload should be -candidate_update.
+                delta = {
+                    k: (-upload_candidate_update[k]).detach().cpu()
+                    for k in upload_candidate_update
+                }
+
+                # ===== Server-side signal-noise scheduling path =====
+                # For upload_score_mode=sn_p1p2, we first collect every selected client's
+                # full A/B-pair candidate update, and only after all local training is done
+                # let the server solve P1+gap-aware P2-L for the whole round.
+                if SERVER_SN_UPLOAD and method == "lora_origin":
+                    round_server_sn_records.append({
+                        "cid": int(cid),
+                        "weight": int(len(client_datasets[cid])),
+                        "delta": {k: delta[k].detach().cpu() for k in delta},
+                        "upload_candidate_update": {
+                            k: upload_candidate_update[k].detach().cpu()
+                            for k in upload_candidate_update
+                        },
+                    })
+                    try:
+                        del name_to_param, trained_model
+                    except Exception:
+                        pass
+                    continue
+
+                # ===== Residual replay-gain diagnosis =====
+                # This is only a diagnostic. It does not affect selection, residual update, or aggregation.
+                if (
+                        DIAGNOSE_RESIDUAL_REPLAY_GAIN
+                        and _is_main()
+                        and method == "lora_origin"
+                        and LORA_RESIDUAL_ACCUMULATION
+                        and cid in replay_gain_clients
+                ):
+                    try:
+                        replay_records = _diagnose_residual_replay_gain(
+                            model=trained_model,
+                            global_state_cpu=global_state_cpu,
+                            lora_keys=lora_keys,
+                            client_dataset=client_datasets[cid],
+                            collator=collator_for(trained_model),
+                            device=device,
+                            cid=cid,
+                            rnd=rnd,
+                            client_residuals=client_lora_residuals[cid],
+                            client_residual_ages=client_lora_residual_ages[cid],
+                            batch_size=training_args.per_device_eval_batch_size,
+                            max_batches=REPLAY_GAIN_MAX_BATCHES,
+                            min_age=REPLAY_GAIN_MIN_AGE,
+                            max_age=REPLAY_GAIN_MAX_AGE,
+                            scale=REPLAY_GAIN_SCALE,
+                            seed=fed_args.federated_seed + 7919 * (rnd + 1) + cid,
+                        )
+
+                        residual_replay_gain_history.extend(replay_records)
+
+                        if len(replay_records) > 0:
+                            logger.info(
+                                f"[ReplayGain] round={rnd + 1}, cid={cid}, "
+                                f"records={len(replay_records)}"
+                            )
+
+                    except Exception as e:
+                        logger.warning(
+                            f"[ReplayGain] failed at round={rnd + 1}, cid={cid}: {e}"
+                        )
+
+
+
                 # 2. Apply Selection Strategy (Compressed Upload)
-                if fed_args.comm_budget is not None and fed_args.comm_budget > 0:
+                if effective_comm_budget is not None and effective_comm_budget > 0:
                     selected_layers = set()
                     selection_cost = 0
 
+                    atomic_mode = UPLOAD_ATOMIC_MODE if method == "lora_origin" else "tensor"
+
                     if training_args.random_layer_selection:
-                        # Random Selection
                         seed = fed_args.federated_seed + rnd + cid
-                        selected_layers, selection_cost = select_layers_random(
-                            lora_keys, layer_costs, fed_args.comm_budget, seed
-                        )
+
+                        if atomic_mode == "tensor":
+                            selected_layers, selection_cost = select_layers_random(
+                                lora_keys, layer_costs, effective_comm_budget, seed
+                            )
+                            selected_units = set(selected_layers)
+                        else:
+                            selected_layers, selection_cost, selected_units = select_units_random(
+                                lora_keys, layer_costs, effective_comm_budget, seed, atomic_mode
+                            )
+
                         if _is_main():
                             logger.info(
-                                f"Client {cid} [Random]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+                                f"Client {cid} [Random/{atomic_mode}]: "
+                                f"Selected {len(selected_units)} units, "
+                                f"{len(selected_layers)} tensors, "
+                                f"cost {selection_cost}/{effective_comm_budget}"
+                            )
+
                     else:
-                        # Top-K (Norm-based) Selection
-                        selected_layers, selection_cost = select_layers_topk(
-                            delta, layer_costs, fed_args.comm_budget
-                        )
+                        diversity_tag = "independent"
+                        if atomic_mode == "tensor":
+                            selected_layers, selection_cost = select_layers_topk(
+                                delta, layer_costs, effective_comm_budget
+                            )
+                            selected_units = set(selected_layers)
+                        else:
+                            allowed_units = None
+                            coverage_counts = None
+                            coverage_beta = 0.0
+                            diversity_tag = "independent"
+
+                            if (
+                                    method == "lora_origin"
+                                    and atomic_mode != "tensor"
+                                    and UPLOAD_DIVERSITY_MODE == "group_mask"
+                            ):
+                                group_id = client_order % DIVERSITY_NUM_GROUPS
+                                allowed_units = {
+                                    uid for idx, uid in enumerate(round_atomic_unit_ids)
+                                    if idx % DIVERSITY_NUM_GROUPS == group_id
+                                }
+                                diversity_tag = f"group_mask:g{group_id}/{DIVERSITY_NUM_GROUPS}"
+
+                            elif (
+                                    method == "lora_origin"
+                                    and atomic_mode != "tensor"
+                                    and UPLOAD_DIVERSITY_MODE == "coverage_penalty"
+                            ):
+                                coverage_counts = round_unit_coverage_counts
+                                coverage_beta = COVERAGE_PENALTY_BETA
+                                diversity_tag = f"coverage_penalty:beta={COVERAGE_PENALTY_BETA}"
+
+                            if UPLOAD_SCORE_MODE == "effective_norm":
+                                if atomic_mode != "ab_pair":
+                                    raise ValueError(
+                                        "upload_score_mode=effective_norm is currently supported only "
+                                        "with upload_atomic_mode=ab_pair."
+                                    )
+                                selected_layers, selection_cost, selected_units = select_ab_pair_effective_topk(
+                                    global_state_cpu=global_state_cpu,
+                                    upload_candidate_update=upload_candidate_update,
+                                    lora_keys=lora_keys,
+                                    layer_costs=layer_costs,
+                                    budget=effective_comm_budget,
+                                    allowed_units=allowed_units,
+                                    coverage_counts=coverage_counts,
+                                    coverage_penalty_beta=coverage_beta,
+                                )
+                            else:
+                                selected_layers, selection_cost, selected_units = select_units_topk(
+                                    delta,
+                                    layer_costs,
+                                    effective_comm_budget,
+                                    atomic_mode,
+                                    allowed_units=allowed_units,
+                                    coverage_counts=coverage_counts,
+                                    coverage_penalty_beta=coverage_beta,
+                                )
+
                         if _is_main():
                             logger.info(
-                                f"Client {cid} [Top-K]: Selected {len(selected_layers)} layers, cost {selection_cost}/{fed_args.comm_budget}")
+                                f"Client {cid} [Top-K/{atomic_mode}/{UPLOAD_SCORE_MODE}/{diversity_tag}]: "
+                                f"Selected {len(selected_units)} units, "
+                                f"{len(selected_layers)} tensors, "
+                                f"cost {selection_cost}/{effective_comm_budget}"
+                            )
+
+                    # ===== A/B-pair saliency diagnostics =====
+                    # Diagnostic only: keep the original selected_layers/selected_units unchanged.
+                    if (
+                            DIAGNOSE_PAIR_SALIENCY
+                            and _is_main()
+                            and method == "lora_origin"
+                            and atomic_mode == "ab_pair"
+                            and effective_comm_budget is not None
+                            and effective_comm_budget > 0
+                    ):
+                        try:
+                            pair_diag = _diagnose_ab_pair_saliency(
+                                cid=cid,
+                                rnd=rnd,
+                                selected_units=set(selected_units),
+                                selection_cost=selection_cost,
+                                budget=effective_comm_budget,
+                                global_state_cpu=global_state_cpu,
+                                upload_candidate_update=upload_candidate_update,
+                                lora_keys=lora_keys,
+                                layer_costs=layer_costs,
+                                reparam_scales=PAIR_SALIENCY_REPARAM_SCALES,
+                                seed=fed_args.federated_seed + 104729 * (rnd + 1) + cid,
+                                save_top_units=PAIR_SALIENCY_SAVE_TOP_UNITS,
+                                top_n=PAIR_SALIENCY_TOP_N,
+                            )
+                            if pair_diag is not None:
+                                pair_saliency_history.append(pair_diag)
+                                logger.info(
+                                    f"[PairSaliency][Round {rnd + 1}][Client {cid}] "
+                                    f"rho={pair_diag.get('spearman_factor_vs_effective')}, "
+                                    f"factor/eff_jaccard="
+                                    f"{pair_diag['factor_vs_effective_selection_overlap']['jaccard']:.4f}, "
+                                    f"mass_ratio="
+                                    f"{pair_diag['effective_mass_ratio_factor_to_effective']:.4f}"
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"[PairSaliency] failed at round={rnd + 1}, cid={cid}: {e}"
+                            )
+
+                    # if training_args.random_layer_selection:
+                    #     # Random Selection
+                    #     seed = fed_args.federated_seed + rnd + cid
+                    #     selected_layers, selection_cost = select_layers_random(
+                    #         lora_keys, layer_costs, effective_comm_budget, seed
+                    #     )
+                    #     if _is_main():
+                    #         logger.info(
+                    #             f"Client {cid} [Random]: Selected {len(selected_layers)} layers, cost {selection_cost}/{effective_comm_budget}")
+                    # else:
+                    #     # Top-K (Norm-based) Selection
+                    #     selected_layers, selection_cost = select_layers_topk(
+                    #         delta, layer_costs, effective_comm_budget
+                    #     )
+                    #     if _is_main():
+                    #         logger.info(
+                    #             f"Client {cid} [Top-K]: Selected {len(selected_layers)} layers, cost {selection_cost}/{effective_comm_budget}")
+
+                    if (
+                            DIAGNOSE_RESIDUAL_ERRORS
+                            and _is_main()
+                            and method == "lora_origin"
+                    ):
+                        # Code delta is global - local, while the actual local update is local - global.
+                        full_update_for_diag = {
+                            k: upload_candidate_update[k].detach().cpu()
+                            for k in upload_candidate_update
+                        }
+
+                        pre_diag = _compute_residual_pre_diagnostics(
+                            cid=cid,
+                            rnd=rnd,
+                            atomic_mode=atomic_mode,
+                            selected_layers=set(selected_layers),
+                            full_update=full_update_for_diag,
+                            global_state_cpu=global_state_cpu,
+                            lora_keys=lora_keys,
+                        )
+
+                        pre_diag["origin_round"] = rnd + 1
+
+                        round_residual_pre_records.append(pre_diag)
+                        pending_residual_pre_records.append(pre_diag)
+
+                    # ===== Naive residual accumulation update =====
+                    if (
+                            LORA_RESIDUAL_ACCUMULATION
+                            and method == "lora_origin"
+                    ):
+                        before_residual_sq = 0.0
+                        after_residual_sq = 0.0
+                        uploaded_sq = 0.0
+
+                        new_residual = {}
+                        new_age = {}
+
+                        for k in lora_keys:
+                            prev_r = client_lora_residuals[cid].get(k, None)
+                            if prev_r is not None:
+                                before_residual_sq += torch.norm(prev_r.float()).item() ** 2
+
+                            if k in selected_layers:
+                                # Candidate update is uploaded, so no residual remains for this tensor.
+                                new_residual[k] = torch.zeros_like(upload_candidate_update[k])
+                                new_age[k] = 0
+                                uploaded_sq += torch.norm(upload_candidate_update[k].float()).item() ** 2
+                            else:
+                                # Candidate update is not uploaded, keep it as residual.
+                                new_residual[k] = upload_candidate_update[k].detach().cpu()
+                                prev_age = int(client_lora_residual_ages[cid].get(k, 0))
+                                new_age[k] = prev_age + 1
+                                after_residual_sq += torch.norm(new_residual[k].float()).item() ** 2
+
+                        client_lora_residuals[cid] = new_residual
+                        client_lora_residual_ages[cid] = new_age
+
+                        if _is_main():
+                            residual_accumulation_history.append({
+                                "global_round": int(rnd + 1),
+                                "cid": int(cid),
+                                "atomic_mode": atomic_mode,
+                                "comm_budget": int(
+                                    effective_comm_budget) if effective_comm_budget is not None else None,
+                                "before_residual_norm": float(math.sqrt(before_residual_sq)),
+                                "after_residual_norm": float(math.sqrt(after_residual_sq)),
+                                "uploaded_candidate_norm": float(math.sqrt(uploaded_sq)),
+                                "max_residual_age": int(max(new_age.values())) if len(new_age) > 0 else 0,
+                                "mean_residual_age": float(np.mean(list(new_age.values()))) if len(
+                                    new_age) > 0 else 0.0,
+                            })
+
 
                     # 3. Mask unselected layers (set delta to 0)
                     for k in delta:
                         if k not in selected_layers:
                             delta[k] = torch.zeros_like(delta[k])
+
+
+
+                    if method == "lora_origin":
+                        round_selected_layers[cid] = sorted(selected_layers)
+                        for uid in selected_units:
+                            round_unit_coverage_counts[uid] += 1
+
+                elif method == "lora_origin":
+                    round_selected_layers[cid] = sorted(lora_keys)
+                    # Dense upload: every atomic unit is selected by this client.
+                    for uid in build_atomic_units(lora_keys, UPLOAD_ATOMIC_MODE).keys():
+                        round_unit_coverage_counts[uid] += 1
+
 
                 # ------------ Aggregate --------------
                 w = len(client_datasets[cid])
@@ -1336,10 +3867,88 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         pass
 
 
+        if SERVER_SN_UPLOAD and len(round_server_sn_records) > 0:
+            selected_by_client, sn_diag = _run_signal_noise_p1_p2_schedule(
+                client_records=round_server_sn_records,
+                global_state_cpu=global_state_cpu,
+                lora_keys=lora_keys,
+                layer_costs=layer_costs,
+                budget=effective_comm_budget,
+                atomic_mode=UPLOAD_ATOMIC_MODE,
+                gap_eta=SN_GAP_ETA,
+                force_full_budget=SN_FORCE_FULL_BUDGET,
+                min_eps=SN_MIN_SIGNAL_EPS,
+                p1_norm_mode=SN_P1_NORM_MODE,
+                depth_group_ratios=SN_DEPTH_GROUP_RATIOS,
+            )
+            sn_diag["global_round"] = int(rnd + 1)
+            if SN_SAVE_DIAGNOSTICS and _is_main():
+                sn_schedule_history.append(sn_diag)
+                logger.info(
+                    f"[SignalNoiseUpload][Round {rnd + 1}] "
+                    f"active_units={sn_diag.get('active_units', 0)}, "
+                    f"scheduled={sn_diag.get('scheduled_units_total', 0)}/"
+                    f"{sn_diag.get('total_slot_budget', 0)}, "
+                    f"unit_cost={sn_diag.get('unit_cost', None)}, "
+                    f"flow_score={sn_diag.get('flow_score', 0.0):.4e}"
+                )
+
+            for rec in round_server_sn_records:
+                cid = rec["cid"]
+                selected_layers = set(selected_by_client[cid]["selected_layers"])
+                selected_units = set(selected_by_client[cid]["selected_units"])
+                selection_cost = int(selected_by_client[cid]["selection_cost"])
+                delta = rec["delta"]
+
+                for k in delta:
+                    if k not in selected_layers:
+                        delta[k] = torch.zeros_like(delta[k])
+
+                round_selected_layers[cid] = sorted(selected_layers)
+                for uid in selected_units:
+                    round_unit_coverage_counts[uid] += 1
+
+                w = int(rec["weight"])
+                for k in lora_keys:
+                    aggregated[k] += delta[k] * w
+                total += w
+
+                if _is_main():
+                    logger.info(
+                        f"Client {cid} [SN-P1P2/ab_pair]: "
+                        f"Selected {len(selected_units)} units, "
+                        f"{len(selected_layers)} tensors, cost {selection_cost}/{effective_comm_budget}"
+                    )
+
         for cid in selected:
             client_selection_tracker[cid]['count'] += 1
             client_selection_tracker[cid]['last_round'] = rnd
             current_task_selected_clients.add(cid)
+
+        if _is_main() and method == "lora_origin" and len(round_selected_layers) > 0:
+            overlap_stats = compute_selection_overlap_stats(round_selected_layers, lora_keys)
+            if overlap_stats is not None:
+                overlap_stats["global_round"] = int(rnd + 1)
+                overlap_stats["upload_diversity_mode"] = UPLOAD_DIVERSITY_MODE
+                overlap_stats["diversity_num_groups"] = int(DIVERSITY_NUM_GROUPS)
+                overlap_stats["coverage_penalty_beta"] = float(COVERAGE_PENALTY_BETA)
+                overlap_stats["selected_client_ids"] = list(sorted(round_selected_layers.keys()))
+                overlap_stats["per_client_num_layers"] = {
+                    str(cid): len(layers) for cid, layers in round_selected_layers.items()
+                }
+                selection_overlap_history.append(overlap_stats)
+                logger.info(
+                    f"[SelectionOverlap][Round {rnd + 1}] "
+                    f"clients={overlap_stats['num_clients']}, "
+                    f"mean_selected={overlap_stats['mean_selected_layers']:.2f}, "
+                    f"jaccard_mean={overlap_stats['pairwise_jaccard_mean']:.4f}, "
+                    f"coverage_mean={overlap_stats['mean_layer_coverage_ratio']:.4f}, "
+                    f"fully_shared={overlap_stats['fully_shared_layers']}, "
+                    f"singleton_layers={overlap_stats['singleton_layers']}"
+                )
+
+
+
 
         if method == "lorm" and len(lorm_client_updates) > 0:
             if _is_main():
@@ -1379,12 +3988,109 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             del lorm_client_updates
             torch.cuda.empty_cache()
 
+        global_update_cpu = {}
         if method != "lorm":
             for k in lora_keys:
                 mu = aggregated[k] / max(total, 1)
-                global_state_cpu[k] = global_state_cpu[k] - mu
+                global_update_cpu[k] = (-mu).detach().cpu()
+                global_state_cpu[k] = global_state_cpu[k] + global_update_cpu[k]
+                # global_state_cpu[k] = global_state_cpu[k] - mu
 
+            # ===== Multi-round drift diagnostics =====
+            if (
+                    DIAGNOSE_RESIDUAL_ERRORS
+                    and _is_main()
+                    and method == "lora_origin"
+                    and len(pending_residual_pre_records) > 0
+            ):
+                current_after_round = rnd + 1
+                multistep_finished = []
+
+                for rec in list(pending_residual_pre_records):
+                    origin_round = int(rec.get("origin_round", rec["global_round"]))
+                    residual_age = current_after_round - origin_round + 1
+
+                    if residual_age <= 0:
+                        continue
+
+                    if residual_age > DIAGNOSE_DRIFT_MAX_AGE:
+                        continue
+
+                    if origin_round not in global_state_snapshots:
+                        continue
+
+                    anchor_state_cpu = global_state_snapshots[origin_round]
+
+                    cumulative_update_cpu = _make_state_delta_cpu(
+                        anchor_state_cpu,
+                        global_state_cpu,
+                        lora_keys,
+                    )
+
+                    out = _finish_residual_post_diagnostics(rec, cumulative_update_cpu)
+                    out["origin_round"] = origin_round
+                    out["eval_round"] = current_after_round
+                    out["residual_age"] = residual_age
+
+                    residual_multistep_history.append(out)
+                    multistep_finished.append(out)
+
+                # Log mean drift by age.
+                if len(multistep_finished) > 0:
+                    age_to_vals = defaultdict(list)
+                    for x in multistep_finished:
+                        age_to_vals[int(x["residual_age"])].append(x["drift_ratio_to_residual"])
+
+                    msg_parts = []
+                    for age in sorted(age_to_vals.keys()):
+                        msg_parts.append(
+                            f"age{age}={np.mean(age_to_vals[age]):.4f}"
+                        )
+
+                    logger.info(
+                        f"[ResidualMultiStepDrift][After Round {rnd + 1}] "
+                        + ", ".join(msg_parts)
+                    )
+
+                # Remove very old records to control memory.
+                pending_residual_pre_records = [
+                    rec for rec in pending_residual_pre_records
+                    if current_after_round - int(rec.get("origin_round", rec["global_round"])) + 1
+                       < DIAGNOSE_DRIFT_MAX_AGE
+                ]
+
+                # Remove old snapshots no longer needed.
+                min_needed_round = current_after_round - DIAGNOSE_DRIFT_MAX_AGE + 2
+                old_rounds = [r for r in global_state_snapshots.keys() if r < min_needed_round]
+                for r in old_rounds:
+                    del global_state_snapshots[r]
+
+
+            # -----
+            if (
+                    DIAGNOSE_RESIDUAL_ERRORS
+                    and _is_main()
+                    and method == "lora_origin"
+                    and len(round_residual_pre_records) > 0
+            ):
+                round_finished = []
+                for rec in round_residual_pre_records:
+                    out = _finish_residual_post_diagnostics(rec, global_update_cpu)
+                    residual_diag_history.append(out)
+                    round_finished.append(out)
+
+                if len(round_finished) > 0:
+                    logger.info(
+                        f"[ResidualDiagnostics][Round {rnd + 1}] "
+                        f"split/full={np.mean([x['split_ratio_to_full'] for x in round_finished]):.4f}, "
+                        f"split/missing={np.mean([x['split_ratio_to_missing'] for x in round_finished]):.4f}, "
+                        f"drift/residual={np.mean([x['drift_ratio_to_residual'] for x in round_finished]):.4f}, "
+                        f"comp/missing={np.mean([x['comp_error_ratio_to_missing'] for x in round_finished]):.4f}"
+                    )
             global_model.load_state_dict(global_state_cpu, strict=False)
+
+
+            # global_model.load_state_dict(global_state_cpu, strict=False)
 
 
         wait_for_everyone()
@@ -1566,7 +4272,148 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     wait_for_everyone()
 
+    if _is_main() and len(sn_schedule_history) > 0:
+        sn_path = os.path.join(training_args.output_dir, "signal_noise_schedule_history.json")
+        with open(sn_path, "w", encoding="utf-8") as fout:
+            json.dump(sn_schedule_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved signal-noise schedule history to {sn_path}")
 
+    if _is_main() and len(selection_overlap_history) > 0:
+        overlap_path = os.path.join(training_args.output_dir, "selection_overlap_history.json")
+        with open(overlap_path, "w", encoding="utf-8") as fout:
+            json.dump(selection_overlap_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved selection-overlap history to {overlap_path}")
+
+    if _is_main() and len(residual_accumulation_history) > 0:
+        residual_acc_path = os.path.join(
+            training_args.output_dir,
+            "residual_accumulation_history.json"
+        )
+        with open(residual_acc_path, "w", encoding="utf-8") as fout:
+            json.dump(residual_accumulation_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved residual accumulation history to {residual_acc_path}")
+
+    if _is_main() and len(residual_replay_gain_history) > 0:
+        replay_gain_path = os.path.join(
+            training_args.output_dir,
+            "residual_replay_gain_history.json"
+        )
+        with open(replay_gain_path, "w", encoding="utf-8") as fout:
+            json.dump(residual_replay_gain_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved residual replay-gain history to {replay_gain_path}")
+
+        # Aggregate by residual age.
+        age_groups = defaultdict(list)
+        for r in residual_replay_gain_history:
+            age_groups[int(r["residual_age"])].append(r)
+
+        replay_gain_by_age = []
+        for age in sorted(age_groups.keys()):
+            rows = age_groups[age]
+            gains = [float(x["replay_gain"]) for x in rows]
+            gains_per_norm = [float(x["gain_per_factor_norm"]) for x in rows]
+            rel_gains = [float(x["relative_gain_to_baseline"]) for x in rows]
+            pos = [1.0 if bool(x["positive_gain"]) else 0.0 for x in rows]
+            norms = [float(x["residual_factor_norm"]) for x in rows]
+
+            replay_gain_by_age.append({
+                "residual_age": int(age),
+                "count": int(len(rows)),
+                "mean_replay_gain": float(np.mean(gains)),
+                "median_replay_gain": float(np.median(gains)),
+                "positive_gain_ratio": float(np.mean(pos)),
+                "mean_gain_per_factor_norm": float(np.mean(gains_per_norm)),
+                "median_gain_per_factor_norm": float(np.median(gains_per_norm)),
+                "mean_relative_gain_to_baseline": float(np.mean(rel_gains)),
+                "mean_residual_factor_norm": float(np.mean(norms)),
+            })
+
+        replay_gain_by_age_path = os.path.join(
+            training_args.output_dir,
+            "residual_replay_gain_by_age.json"
+        )
+        with open(replay_gain_by_age_path, "w", encoding="utf-8") as fout:
+            json.dump(replay_gain_by_age, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved residual replay-gain by age to {replay_gain_by_age_path}")
+
+
+    if _is_main() and len(residual_diag_history) > 0:
+        residual_diag_path = os.path.join(training_args.output_dir, "residual_diagnostics_history.json")
+        with open(residual_diag_path, "w", encoding="utf-8") as fout:
+            json.dump(residual_diag_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved residual diagnostics history to {residual_diag_path}")
+
+    if _is_main() and len(residual_multistep_history) > 0:
+        residual_multistep_path = os.path.join(
+            training_args.output_dir,
+            "residual_multistep_drift_history.json"
+        )
+        with open(residual_multistep_path, "w", encoding="utf-8") as fout:
+            json.dump(residual_multistep_history, fout, ensure_ascii=False, indent=2)
+        logger.info(
+            f"Saved residual multi-step drift history to {residual_multistep_path}"
+        )
+
+    if _is_main() and len(pair_saliency_history) > 0:
+        pair_diag_path = os.path.join(training_args.output_dir, "pair_saliency_diagnostics_history.json")
+        with open(pair_diag_path, "w", encoding="utf-8") as fout:
+            json.dump(pair_saliency_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved pair-saliency diagnostics history to {pair_diag_path}")
+
+        pair_summary = {
+            "count": int(len(pair_saliency_history)),
+            "mean_spearman_factor_vs_effective": float(np.mean([
+                x["spearman_factor_vs_effective"] for x in pair_saliency_history
+                if x.get("spearman_factor_vs_effective") is not None
+            ])) if any(x.get("spearman_factor_vs_effective") is not None for x in pair_saliency_history) else None,
+            "mean_factor_effective_selection_jaccard": float(np.mean([
+                x["factor_vs_effective_selection_overlap"]["jaccard"] for x in pair_saliency_history
+            ])),
+            "mean_effective_mass_ratio_factor_to_effective": float(np.mean([
+                x["effective_mass_ratio_factor_to_effective"] for x in pair_saliency_history
+            ])),
+            "mean_effective_mass_ratio_actual_to_effective": float(np.mean([
+                x["effective_mass_ratio_actual_to_effective"] for x in pair_saliency_history
+            ])),
+        }
+
+        # Aggregate reparameterization diagnostics by scheme/scale.
+        reparam_groups = defaultdict(list)
+        for x in pair_saliency_history:
+            for r in x.get("reparameterization_diagnostics", []):
+                if r.get("scheme") == "global_scale":
+                    key = f"global_scale={r.get('scale')}"
+                else:
+                    key = str(r.get("scheme"))
+                reparam_groups[key].append(r)
+
+        pair_summary["reparameterization_summary"] = {}
+        for key, rows in sorted(reparam_groups.items()):
+            pair_summary["reparameterization_summary"][key] = {
+                "count": int(len(rows)),
+                "mean_selection_jaccard_with_original_factor": float(np.mean([
+                    r["overlap_with_original_factor_selection"]["jaccard"] for r in rows
+                ])),
+                "mean_selection_jaccard_with_effective": float(np.mean([
+                    r["overlap_with_effective_selection"]["jaccard"] for r in rows
+                ])),
+                "mean_effective_mass_ratio_reparam_to_effective": float(np.mean([
+                    r["effective_mass_ratio_reparam_to_effective"] for r in rows
+                ])),
+                "mean_spearman_factor_vs_reparam_factor": float(np.mean([
+                    r["spearman_factor_vs_reparam_factor"] for r in rows
+                    if r.get("spearman_factor_vs_reparam_factor") is not None
+                ])) if any(r.get("spearman_factor_vs_reparam_factor") is not None for r in rows) else None,
+            }
+            if any("max_effective_score_relative_error_after_reparam" in r for r in rows):
+                pair_summary["reparameterization_summary"][key]["max_effective_score_relative_error_after_reparam"] = float(max([
+                    r.get("max_effective_score_relative_error_after_reparam", 0.0) for r in rows
+                ]))
+
+        pair_summary_path = os.path.join(training_args.output_dir, "pair_saliency_diagnostics_summary.json")
+        with open(pair_summary_path, "w", encoding="utf-8") as fout:
+            json.dump(pair_summary, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved pair-saliency diagnostics summary to {pair_summary_path}")
 
 
     # ========== 保存 Adapter ==========
