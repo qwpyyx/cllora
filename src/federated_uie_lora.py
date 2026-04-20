@@ -138,86 +138,103 @@ def partition_dataset_by_label(dataset, num_clients: int, alpha: float, *, base_
 
 def build_model_and_tokenizer(model_args):
     """
-    Unified loader for T5 and Llama in Federated Learning.
-    - T5: Uses standard loading.
-    - Llama: Uses Flash Attention 2 + BF16 + Custom Tokenizer Settings.
+    Isolated loader for T5 / LLaMA / Qwen in Federated Learning.
+    - T5 path: keep old behavior.
+    - LLaMA path: keep old behavior.
+    - Qwen path: new decoder-only branch, but do NOT hard-code 1/2/0.
     """
 
-    # --------- 1) 判别模型族 ----------
     name_lower = model_args.model_name_or_path.lower()
     is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
-    # is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
-    if "t5" in name_lower:
-        is_llama = False
-    else:
-        is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
-    print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
 
-    # --------- 2) 准备 Config 和 Tokenizer ----------
+    is_t5 = "t5" in name_lower
+    is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+    is_qwen = "qwen" in name_lower
+
+    if not (is_t5 or is_llama or is_qwen):
+        raise ValueError(
+            f"Unsupported model family for federated mode: {model_args.model_name_or_path}. "
+            "Currently only T5 / LLaMA / Qwen are explicitly supported."
+        )
+
+    print(
+        f"[Build Model] Loading: {model_args.model_name_or_path} | "
+        f"is_t5={is_t5}, is_llama={is_llama}, is_qwen={is_qwen}, is_adapter={is_adapter}"
+    )
+
+    # --------- resolve base model path ----------
     if is_adapter:
         peft_cfg = PeftConfig.from_pretrained(model_args.model_name_or_path)
         base_model_path = peft_cfg.base_model_name_or_path
     else:
         base_model_path = model_args.model_name_or_path
 
+    # --------- config ----------
     config = AutoConfig.from_pretrained(
         base_model_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        # 若你的 transformers 较老、Qwen 报错，再打开这一行
+        # trust_remote_code=True,
     )
-
-    # [通用设置] 训练时关闭 cache 以节省显存
     config.use_cache = False
 
-    if is_llama:
-        # Llama Tokenizer (新环境/旧环境都兼容)
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+    # --------- tokenizer ----------
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+        # 若你的 transformers 较老、Qwen 报错，再打开这一行
+        # trust_remote_code=True,
+    )
 
-        # 1. 补全 pad_token (如果缺失)
-        # Llama 原生通常没有 pad_token，优先使用 unk_token (id=0)
+    # ===== T5: 完全保持旧逻辑 =====
+    if is_t5:
+        pass
+
+    # ===== LLaMA: 保持你原来的旧逻辑 =====
+    elif is_llama:
         if tokenizer.pad_token is None:
             if tokenizer.unk_token_id is not None:
                 tokenizer.pad_token_id = tokenizer.unk_token_id
                 tokenizer.pad_token = tokenizer.unk_token
             else:
-                # 兜底策略
                 tokenizer.pad_token_id = 0
                 tokenizer.pad_token = "<unk>"
 
-        # 2. 强制修正 ID (避免 Pad=1 与 BOS=1 冲突)
-        # 这是解决训练不收敛和预测乱码的关键
         tokenizer.bos_token_id = 1
         tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 0  # 必须是 0
-
-        # 3. 设置左填充 (Left Padding)
-        # Decoder-only 模型做生成任务时必须左填充，否则输出不对齐
+        tokenizer.pad_token_id = 0
         tokenizer.padding_side = "left"
 
-        # 同步更新 Config，防止生成时报 Warning
         config.bos_token_id = tokenizer.bos_token_id
         config.eos_token_id = tokenizer.eos_token_id
         config.pad_token_id = tokenizer.pad_token_id
 
-    else:
-        # [T5 路径] 标准加载，完全兼容旧环境
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        # T5 默认 pad_token_id=0, padding_side='right'，无需修改
+    # ===== Qwen: 新增逻辑，只对 Qwen 生效 =====
+    elif is_qwen:
+        # Qwen 不要硬写 1/2/0，直接使用它自己的 special tokens
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            elif tokenizer.unk_token is not None:
+                tokenizer.pad_token = tokenizer.unk_token
+            else:
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-    # --------- 3) 准备模型加载参数 ----------
+        tokenizer.padding_side = "left"
+
+        if tokenizer.pad_token_id is not None:
+            config.pad_token_id = tokenizer.pad_token_id
+        if tokenizer.bos_token_id is not None:
+            config.bos_token_id = tokenizer.bos_token_id
+        if tokenizer.eos_token_id is not None:
+            config.eos_token_id = tokenizer.eos_token_id
+
+    # --------- model load kwargs ----------
     model_load_kwargs = {
         "config": config,
         "cache_dir": model_args.cache_dir,
@@ -225,52 +242,48 @@ def build_model_and_tokenizer(model_args):
         "use_auth_token": True if model_args.use_auth_token else None,
     }
 
-    # [Llama 专属优化]
-    if is_llama:
-        # 1. 精度选择: 优先 BF16
+    # decoder-only 模型（LLaMA / Qwen）用半精度与 FlashAttention
+    if is_llama or is_qwen:
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             model_load_kwargs["torch_dtype"] = torch.bfloat16
-            print("[Build Model] Using bfloat16 for Llama.")
+            print("[Build Model] Using bfloat16 for decoder-only model.")
         else:
             model_load_kwargs["torch_dtype"] = torch.float16
-            print("[Build Model] Using float16 for Llama.")
+            print("[Build Model] Using float16 for decoder-only model.")
 
-        # 2. Flash Attention 2 加速 (如果安装了)
         if model_args.ues_flash_attention:
             try:
-                import flash_attn
+                import flash_attn  # noqa: F401
                 config._attn_implementation = "flash_attention_2"
                 print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
             except ImportError:
                 print("[Build Model] Flash Attention 2 not found, using default attention.")
 
-    # --------- 4) 加载模型 ----------
-    if is_llama:
-        model_class = AutoModelForCausalLM
-        lora_task_type = TaskType.CAUSAL_LM
-    else:
-        # T5 使用标准 Seq2Seq 类
+    # --------- model class ----------
+    if is_t5:
         model_class = AutoModelForSeq2SeqLM
         lora_task_type = TaskType.SEQ_2_SEQ_LM
+    else:
+        model_class = AutoModelForCausalLM
+        lora_task_type = TaskType.CAUSAL_LM
 
-    # 加载 Base Model
     model = model_class.from_pretrained(
         base_model_path,
         from_tf=bool(".ckpt" in base_model_path),
-        **model_load_kwargs
+        **model_load_kwargs,
+        # 若你的 transformers 较老、Qwen 报错，再打开这一行
+        # trust_remote_code=True,
     )
 
-    # [梯度检查点支持]
-    # 开启 input_require_grads 以支持 gradient_checkpointing
+    # gradient checkpointing support
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     else:
         def make_inputs_require_grad(module, input, output):
             output.requires_grad_(True)
-
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    # --------- 5) 应用 PEFT / LoRA ----------
+    # --------- PEFT / LoRA ----------
     if is_adapter:
         print(f"[Build Model] Loading existing adapter: {model_args.model_name_or_path}")
         model = PeftModel.from_pretrained(
@@ -280,29 +293,203 @@ def build_model_and_tokenizer(model_args):
         )
     else:
         print(f"[Build Model] Initializing new LoRA adapter (r={model_args.lora_dim})")
+
+        # T5 保持旧逻辑；LLaMA/Qwen 都显式打在 q/v projection 上
+        target_modules = ["q_proj", "v_proj"] if (is_llama or is_qwen) else None
+
         peft_config = LoraConfig(
             task_type=lora_task_type,
             inference_mode=False,
             r=model_args.lora_dim,
             lora_alpha=32,
             lora_dropout=0.1,
-            # Llama 需要指定 target_modules，T5 通常不需要(默认q,v)
-            target_modules=["q_proj", "v_proj"] if is_llama else None
+            target_modules=target_modules,
         )
         model = get_peft_model(model, peft_config)
 
-    # --------- 6) 后处理 ----------
-    # 调整 Embedding 大小以匹配 Tokenizer (防止 special tokens 越界)
     model.resize_token_embeddings(len(tokenizer))
 
-    # 确保 LoRA 参数可训练 (双重保险)
     for name, param in model.named_parameters():
-        if 'lora_' in name:
+        if "lora_" in name:
             param.requires_grad = True
 
-    # 打印可训练参数
     model.print_trainable_parameters()
+
+    # print("tokenizer.name_or_path =", tokenizer.name_or_path)
+    # print("tokenizer.bos/eos/pad =", tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id)
+    # print("tokenizer.padding_side =", tokenizer.padding_side)
+    # print("config.is_encoder_decoder =", getattr(config, "is_encoder_decoder", None))
+
     return model, tokenizer
+
+
+# def build_model_and_tokenizer(model_args):
+#     """
+#     Unified loader for T5 and Llama in Federated Learning.
+#     - T5: Uses standard loading.
+#     - Llama: Uses Flash Attention 2 + BF16 + Custom Tokenizer Settings.
+#     """
+#
+#     # --------- 1) 判别模型族 ----------
+#     name_lower = model_args.model_name_or_path.lower()
+#     is_adapter = ("adapter" in name_lower) or ("peft" in name_lower)
+#     # is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+#     if "t5" in name_lower:
+#         is_llama = False
+#     else:
+#         is_llama = ("llama" in name_lower) or ("vicuna" in name_lower)
+#     print(f"[Build Model] Loading: {model_args.model_name_or_path} | Is Llama: {is_llama} | Is Adapter: {is_adapter}")
+#
+#     # --------- 2) 准备 Config 和 Tokenizer ----------
+#     if is_adapter:
+#         peft_cfg = PeftConfig.from_pretrained(model_args.model_name_or_path)
+#         base_model_path = peft_cfg.base_model_name_or_path
+#     else:
+#         base_model_path = model_args.model_name_or_path
+#
+#     config = AutoConfig.from_pretrained(
+#         base_model_path,
+#         cache_dir=model_args.cache_dir,
+#         revision=model_args.model_revision,
+#         use_auth_token=True if model_args.use_auth_token else None,
+#     )
+#
+#     # [通用设置] 训练时关闭 cache 以节省显存
+#     config.use_cache = False
+#
+#     if is_llama:
+#         # Llama Tokenizer (新环境/旧环境都兼容)
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             base_model_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast_tokenizer,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#
+#         # 1. 补全 pad_token (如果缺失)
+#         # Llama 原生通常没有 pad_token，优先使用 unk_token (id=0)
+#         if tokenizer.pad_token is None:
+#             if tokenizer.unk_token_id is not None:
+#                 tokenizer.pad_token_id = tokenizer.unk_token_id
+#                 tokenizer.pad_token = tokenizer.unk_token
+#             else:
+#                 # 兜底策略
+#                 tokenizer.pad_token_id = 0
+#                 tokenizer.pad_token = "<unk>"
+#
+#         # 2. 强制修正 ID (避免 Pad=1 与 BOS=1 冲突)
+#         # 这是解决训练不收敛和预测乱码的关键
+#         tokenizer.bos_token_id = 1
+#         tokenizer.eos_token_id = 2
+#         tokenizer.pad_token_id = 0  # 必须是 0
+#
+#         # 3. 设置左填充 (Left Padding)
+#         # Decoder-only 模型做生成任务时必须左填充，否则输出不对齐
+#         tokenizer.padding_side = "left"
+#
+#         # 同步更新 Config，防止生成时报 Warning
+#         config.bos_token_id = tokenizer.bos_token_id
+#         config.eos_token_id = tokenizer.eos_token_id
+#         config.pad_token_id = tokenizer.pad_token_id
+#
+#     else:
+#         # [T5 路径] 标准加载，完全兼容旧环境
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             base_model_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast_tokenizer,
+#             revision=model_args.model_revision,
+#             use_auth_token=True if model_args.use_auth_token else None,
+#         )
+#         # T5 默认 pad_token_id=0, padding_side='right'，无需修改
+#
+#     # --------- 3) 准备模型加载参数 ----------
+#     model_load_kwargs = {
+#         "config": config,
+#         "cache_dir": model_args.cache_dir,
+#         "revision": model_args.model_revision,
+#         "use_auth_token": True if model_args.use_auth_token else None,
+#     }
+#
+#     # [Llama 专属优化]
+#     if is_llama:
+#         # 1. 精度选择: 优先 BF16
+#         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+#             model_load_kwargs["torch_dtype"] = torch.bfloat16
+#             print("[Build Model] Using bfloat16 for Llama.")
+#         else:
+#             model_load_kwargs["torch_dtype"] = torch.float16
+#             print("[Build Model] Using float16 for Llama.")
+#
+#         # 2. Flash Attention 2 加速 (如果安装了)
+#         if model_args.ues_flash_attention:
+#             try:
+#                 import flash_attn
+#                 config._attn_implementation = "flash_attention_2"
+#                 print("[Build Model] >>> USING FLASH ATTENTION 2 <<<")
+#             except ImportError:
+#                 print("[Build Model] Flash Attention 2 not found, using default attention.")
+#
+#     # --------- 4) 加载模型 ----------
+#     if is_llama:
+#         model_class = AutoModelForCausalLM
+#         lora_task_type = TaskType.CAUSAL_LM
+#     else:
+#         # T5 使用标准 Seq2Seq 类
+#         model_class = AutoModelForSeq2SeqLM
+#         lora_task_type = TaskType.SEQ_2_SEQ_LM
+#
+#     # 加载 Base Model
+#     model = model_class.from_pretrained(
+#         base_model_path,
+#         from_tf=bool(".ckpt" in base_model_path),
+#         **model_load_kwargs
+#     )
+#
+#     # [梯度检查点支持]
+#     # 开启 input_require_grads 以支持 gradient_checkpointing
+#     if hasattr(model, "enable_input_require_grads"):
+#         model.enable_input_require_grads()
+#     else:
+#         def make_inputs_require_grad(module, input, output):
+#             output.requires_grad_(True)
+#
+#         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+#
+#     # --------- 5) 应用 PEFT / LoRA ----------
+#     if is_adapter:
+#         print(f"[Build Model] Loading existing adapter: {model_args.model_name_or_path}")
+#         model = PeftModel.from_pretrained(
+#             model,
+#             model_args.model_name_or_path,
+#             torch_dtype=model_load_kwargs.get("torch_dtype", "auto")
+#         )
+#     else:
+#         print(f"[Build Model] Initializing new LoRA adapter (r={model_args.lora_dim})")
+#         peft_config = LoraConfig(
+#             task_type=lora_task_type,
+#             inference_mode=False,
+#             r=model_args.lora_dim,
+#             lora_alpha=32,
+#             lora_dropout=0.1,
+#             # Llama 需要指定 target_modules，T5 通常不需要(默认q,v)
+#             target_modules=["q_proj", "v_proj"] if is_llama else None
+#         )
+#         model = get_peft_model(model, peft_config)
+#
+#     # --------- 6) 后处理 ----------
+#     # 调整 Embedding 大小以匹配 Tokenizer (防止 special tokens 越界)
+#     model.resize_token_embeddings(len(tokenizer))
+#
+#     # 确保 LoRA 参数可训练 (双重保险)
+#     for name, param in model.named_parameters():
+#         if 'lora_' in name:
+#             param.requires_grad = True
+#
+#     # 打印可训练参数
+#     model.print_trainable_parameters()
+#     return model, tokenizer
 
 
 def compute_fisher_diag(model, dataloader):
@@ -334,10 +521,12 @@ def compute_fisher_diag(model, dataloader):
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
         # 2. [关键] Logits Shift (针对 Llama/GPT)
-        is_causal = False
-        if "llama" in getattr(model.config, "_name_or_path", "").lower() or getattr(model.config, "is_decoder", False):
-            if not getattr(model.config, "is_encoder_decoder", False):
-                is_causal = True
+        # is_causal = False
+        # if "llama" in getattr(model.config, "_name_or_path", "").lower() or getattr(model.config, "is_decoder", False):
+        #     if not getattr(model.config, "is_encoder_decoder", False):
+        #         is_causal = True
+        is_causal = not getattr(model.config, "is_encoder_decoder", False)
+
 
         if is_causal:
             logits = logits[..., :-1, :].contiguous()
@@ -521,6 +710,20 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
     data_cache_dir = gen_cache_path(training_args.output_dir, data_args)
+
+    print("data_args.data_dir =", data_args.data_dir)
+    print("data_args.task_config_dir =", data_args.task_config_dir)
+    print("data_args.instruction_file =", data_args.instruction_file)
+
+    assert data_args.data_dir is not None and os.path.exists(data_args.data_dir), data_args.data_dir
+    assert data_args.task_config_dir is not None and os.path.exists(
+        data_args.task_config_dir), data_args.task_config_dir
+
+    # instruction_file 对你这套脚本是可选的，不要强制 assert
+    if data_args.instruction_file is not None:
+        assert os.path.exists(data_args.instruction_file), data_args.instruction_file
+
+
     with training_args.main_process_first(desc="loading dataset"):
         raw_datasets = load_dataset(
             os.path.join(CURRENT_DIR, "uie_dataset_lora.py"),
@@ -531,7 +734,8 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             cache_dir=data_cache_dir,
             max_num_instances_per_task=data_args.max_num_instances_per_task,
             max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-            num_examples=data_args.num_examples
+            num_examples=data_args.num_examples,
+            trust_remote_code=True,
         )
     raw_datasets.cleanup_cache_files()
 
@@ -599,6 +803,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
     # ------------ build model --------------
     model, tokenizer = build_model_and_tokenizer(model_args)
+
+    # for n, p in model.named_parameters():
+    #     if p.requires_grad and "lora" in n:
+    #         print(n)
+
 
     # ------------ load checkpoint --------------
     if training_args.gradient_checkpointing:

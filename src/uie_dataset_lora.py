@@ -89,17 +89,14 @@ def save_ds(instances, file_name):
 
 
 class UIEConfig(datasets.BuilderConfig):
-    """
-    Config dataset load procedure.
-
-    Args:
-        data_dir: task data dir, which contains the corresponding dataset dirs
-        prompt_path: prompt json file, which saves task and its prompts map
-        task_file: task config file, save training and testing split config, and sampling strategies.
-         Support two sampling strategies: 'random' indicates random sampling, while 'full' means to return all samples.
-        max_num_instances_per_task: max training sample size of each task
-        max_num_instances_per_eval_task: max eval sample size of each task
-    """
+    task_config_dir = None
+    instruction_file = None
+    instruction_strategy = None
+    data_dir = None
+    num_examples = None
+    max_num_instances_per_task = None
+    max_num_instances_per_eval_task = None
+    over_sampling = None
 
     def __init__(
             self,
@@ -116,13 +113,16 @@ class UIEConfig(datasets.BuilderConfig):
     ):
         super().__init__(*args, **kwargs)
         self.data_dir = data_dir
-        self.num_examples = num_examples
-        self.over_sampling = over_sampling
-        self.instructions = self._parse_instruction(instruction_file)
-        self.task_configs = self._parse_task_config(task_config_dir)
+        self.instruction_file = instruction_file
         self.instruction_strategy = instruction_strategy
+        self.task_config_dir = task_config_dir
+        self.num_examples = num_examples
         self.max_num_instances_per_task = max_num_instances_per_task
         self.max_num_instances_per_eval_task = max_num_instances_per_eval_task
+        self.over_sampling = over_sampling
+
+        self.instructions = None
+        self.task_configs = None
 
 
     def _parse_instruction(self, instruction_file):
@@ -236,13 +236,22 @@ class UIEInstructions(datasets.GeneratorBasedBuilder):
 
     def _split_generators(self, dl_manager):
         """Returns SplitGenerators."""
-        if self.config.data_dir is None or self.config.task_configs is None:
-            logger.error("Please provide right input: data_dir or task_config_dir!")
-
-        # split dir save datasets
-        # task config to specify train,dev,test
         split_dir = self.config.data_dir
-        task_configs = self.config.task_configs
+        task_config_dir = getattr(self.config, "task_config_dir", None)
+
+        if split_dir is None:
+            raise ValueError(f"Invalid dataset config: data_dir={split_dir}")
+
+        task_configs = self.config._parse_task_config(task_config_dir)
+        self.config.task_configs = task_configs
+
+        if task_configs is None:
+            raise ValueError(
+                f"Invalid dataset config: "
+                f"data_dir={split_dir}, "
+                f"task_config_dir={task_config_dir}, "
+                f"task_configs_is_none=True"
+            )
 
         return [
             datasets.SplitGenerator(
@@ -281,13 +290,17 @@ class UIEInstructions(datasets.GeneratorBasedBuilder):
 
         return instances, labels
 
-
     def _get_instruction(self, task):
         assert self.config.instruction_strategy in INSTRUCTION_STRATEGIES
+
+        if self.config.instructions is None and self.config.instruction_file:
+            self.config.instructions = self.config._parse_instruction(self.config.instruction_file)
+
         if self.config.num_examples is not None and self.config.num_examples > 0:
             task_instructions = self.config.instructions['few-shot'][task]
         else:
             task_instructions = self.config.instructions['zero-shot'][task]
+
         if self.config.instruction_strategy == "single":
             return task_instructions[0]
         else:
