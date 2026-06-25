@@ -45,6 +45,7 @@ from pilora_utils import (
     extract_pilora_ref_from_model,
 )
 from gsm8k.gsm8k_metrics import compute_gsm8k_metrics, extract_gsm8k_final_answer
+from baseline_compressors import BaselineCompressor, apply_residual_to_lora_state
 
 
 os.environ['WANDB_DISABLED'] = "True"
@@ -277,23 +278,52 @@ def build_model_and_tokenizer(model_args):
     if is_t5:
         pass
 
-    # ===== LLaMA: 保持你原来的旧逻辑 =====
+    # ===== LLaMA / Vicuna =====
     elif is_llama:
-        if tokenizer.pad_token is None:
-            if tokenizer.unk_token_id is not None:
-                tokenizer.pad_token_id = tokenizer.unk_token_id
+        # Do NOT hard-code LLaMA-2 token ids (1/2/0).
+        # Llama-3.x uses a different special-token space, and its EOS can be a list
+        # in the model/generation config.  Keep model-native BOS/EOS and choose a
+        # PAD token that is distinct from EOS whenever possible.
+        eos_ids = getattr(config, "eos_token_id", None)
+        if isinstance(eos_ids, (list, tuple, set)):
+            eos_id_set = set(int(x) for x in eos_ids)
+        elif eos_ids is not None:
+            eos_id_set = {int(eos_ids)}
+        else:
+            eos_id_set = set()
+
+        def _valid_existing_token(tok: str) -> bool:
+            try:
+                tid = tokenizer.convert_tokens_to_ids(tok)
+            except Exception:
+                return False
+            if tid is None:
+                return False
+            if tokenizer.unk_token_id is not None and tid == tokenizer.unk_token_id:
+                return False
+            return int(tid) >= 0 and int(tid) not in eos_id_set
+
+        if tokenizer.pad_token is None or (tokenizer.pad_token_id is not None and int(tokenizer.pad_token_id) in eos_id_set):
+            chosen_pad = None
+            for cand in ("<|finetune_right_pad_id|>", "<|reserved_special_token_0|>", "<|pad|>"):
+                if _valid_existing_token(cand):
+                    chosen_pad = cand
+                    break
+            if chosen_pad is not None:
+                tokenizer.pad_token = chosen_pad
+            elif tokenizer.unk_token is not None and (tokenizer.unk_token_id is None or int(tokenizer.unk_token_id) not in eos_id_set):
                 tokenizer.pad_token = tokenizer.unk_token
             else:
-                tokenizer.pad_token_id = 0
-                tokenizer.pad_token = "<unk>"
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-        tokenizer.bos_token_id = 1
-        tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 0
         tokenizer.padding_side = "left"
 
-        config.bos_token_id = tokenizer.bos_token_id
-        config.eos_token_id = tokenizer.eos_token_id
+        # Preserve config.bos/eos when the model provides them, especially list EOS
+        # for Llama-3.x.  Only fill missing values from the tokenizer.
+        if getattr(config, "bos_token_id", None) is None and tokenizer.bos_token_id is not None:
+            config.bos_token_id = tokenizer.bos_token_id
+        if getattr(config, "eos_token_id", None) is None and tokenizer.eos_token_id is not None:
+            config.eos_token_id = tokenizer.eos_token_id
         config.pad_token_id = tokenizer.pad_token_id
 
     # ===== Qwen: 新增逻辑，只对 Qwen 生效 =====
@@ -356,6 +386,20 @@ def build_model_and_tokenizer(model_args):
         # 若你的 transformers 较老、Qwen 报错，再打开这一行
         # trust_remote_code=True,
     )
+
+    # Keep generation_config consistent with model/tokenizer native special tokens.
+    # This is required for Llama-3.x, whose EOS ids are not the Llama-2 ids 1/2.
+    if not is_t5 and hasattr(model, "generation_config"):
+        if getattr(model.generation_config, "bos_token_id", None) is None:
+            model.generation_config.bos_token_id = getattr(config, "bos_token_id", None) or tokenizer.bos_token_id
+        if getattr(model.generation_config, "eos_token_id", None) is None:
+            model.generation_config.eos_token_id = getattr(config, "eos_token_id", None) or tokenizer.eos_token_id
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+    print("[Build Model] tokenizer.bos/eos/pad =", tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id)
+    print("[Build Model] config.bos/eos/pad =", getattr(config, "bos_token_id", None), getattr(config, "eos_token_id", None), getattr(config, "pad_token_id", None))
+    if hasattr(model, "generation_config"):
+        print("[Build Model] generation.bos/eos/pad =", getattr(model.generation_config, "bos_token_id", None), getattr(model.generation_config, "eos_token_id", None), getattr(model.generation_config, "pad_token_id", None))
 
     # gradient checkpointing support
     if hasattr(model, "enable_input_require_grads"):
@@ -1392,8 +1436,16 @@ def _run_signal_noise_p1_p2_schedule(
             q_vals.append(q_total)
 
         gram = np.zeros((K, K), dtype=np.float64)
+        # Per-pair dimension normalization factors (for GQA: q dominates v otherwise)
+        pair_norms = []
+        for pair_idx, (a_key, b_key) in enumerate(u["pairs"]):
+            d_out = global_state_cpu[b_key].shape[0]  # B rows
+            d_in = global_state_cpu[a_key].shape[1]   # A cols
+            pair_norms.append(float(d_out * d_in))
+        total_norm = sum(pair_norms)
+        # Normalize by total dimension product so q/v contribute equally per-element
         for i in range(K):
-            gram[i, i] = float(q_vals[i])
+            gram[i, i] = float(q_vals[i]) / total_norm
         for i in range(K):
             for j in range(i + 1, K):
                 val = 0.0
@@ -1402,8 +1454,8 @@ def _run_signal_noise_p1_p2_schedule(
                         group_parts[i][pair_idx][0], group_parts[i][pair_idx][1],
                         group_parts[j][pair_idx][0], group_parts[j][pair_idx][1],
                     )
-                gram[i, j] = val
-                gram[j, i] = val
+                gram[i, j] = val / total_norm
+                gram[j, i] = val / total_norm
 
         if K > 1:
             a_hat = float((gram.sum() - np.trace(gram)) / (K * (K - 1)))
@@ -2407,6 +2459,32 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     SN_P1_NORM_MODE = str(getattr(training_args, "sn_p1_norm_mode", "raw") or "raw")
     SN_DEPTH_GROUP_RATIOS = str(getattr(training_args, "sn_depth_group_ratios", "1,1,2") or "1,1,2")
 
+    # Ours + encoding: run SN-P1P2 as a candidate scheduler, then encode
+    # inside selected candidates under the original packet budget.
+    SN_ENCODER_MODE = str(getattr(training_args, "sn_encoder_mode", "none") or "none").lower()
+    SN_ENCODER_ALIASES = {
+        "none": "none", "raw": "none",
+        "compeft": "compeft", "topk_pq": "compeft", "pq": "compeft",
+        "flasc": "flasc", "topk": "flasc",
+    }
+    SN_ENCODER_MODE = SN_ENCODER_ALIASES.get(SN_ENCODER_MODE, SN_ENCODER_MODE)
+    if SN_ENCODER_MODE not in ("none", "compeft", "flasc"):
+        raise ValueError("sn_encoder_mode must be one of: none/raw, compeft/topk_pq, flasc/topk")
+    SN_CANDIDATE_BUDGET_MULTIPLIER = float(getattr(training_args, "sn_candidate_budget_multiplier", 1.0) or 1.0)
+    SN_CANDIDATE_BUDGET_OVERRIDE = int(getattr(training_args, "sn_candidate_budget", 0) or 0)
+    SN_ENCODER_PACKET_NUM = int(getattr(training_args, "sn_encoder_packet_num", 0) or 0)
+
+    if SERVER_SN_UPLOAD and SN_ENCODER_MODE != "none":
+        # effective_comm_budget is defined later after layer_costs/full_upload_cost are known.
+        # At this configuration stage, use fed_args.comm_budget as the intended per-client
+        # packet budget for the encoder. This fixes an early UnboundLocalError while keeping
+        # the same budget semantics in the normal sparse-upload setting.
+        _initial_comm_budget = getattr(fed_args, "comm_budget", None)
+        if _initial_comm_budget is None or int(_initial_comm_budget) <= 0:
+            raise ValueError("sn_encoder_mode requires a positive comm_budget.")
+        if SN_ENCODER_PACKET_NUM <= 0:
+            SN_ENCODER_PACKET_NUM = int(_initial_comm_budget)
+
     if SERVER_SN_UPLOAD:
         if UPLOAD_ATOMIC_MODE not in ("ab_pair", "qv_block"):
             raise ValueError("upload_score_mode=sn_p1p2 requires upload_atomic_mode=ab_pair or qv_block.")
@@ -2419,7 +2497,9 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         logger.info(
             f"[SignalNoiseUpload] enabled={SERVER_SN_UPLOAD}, "
             f"gap_eta={SN_GAP_ETA}, force_full_budget={SN_FORCE_FULL_BUDGET}, "
-            f"min_eps={SN_MIN_SIGNAL_EPS}, save_diag={SN_SAVE_DIAGNOSTICS}"
+            f"min_eps={SN_MIN_SIGNAL_EPS}, save_diag={SN_SAVE_DIAGNOSTICS}, "
+            f"encoder={SN_ENCODER_MODE}, candidate_budget_multiplier={SN_CANDIDATE_BUDGET_MULTIPLIER}, "
+            f"candidate_budget_override={SN_CANDIDATE_BUDGET_OVERRIDE}, encoder_packet_num={SN_ENCODER_PACKET_NUM}"
         )
 
     # Pair-saliency diagnostics for A/B pair Top-K. This does not affect training.
@@ -2718,15 +2798,35 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     #         print(n)
 
 
-    # ------------ load checkpoint --------------
+    # ------------ gradient checkpointing --------------
+    # Qwen/Llama + LoRA + DDP may fail with the default re-entrant checkpointing:
+    #   RuntimeError: Expected to mark a variable ready only once.
+    # Use non-reentrant checkpointing when the Transformers version supports it.
     if training_args.gradient_checkpointing:
         logger.info("Gradient Checkpointing enabled.")
 
-        # Open GC
+        # Keep Trainer-side arguments consistent as well. Some Transformers versions
+        # read this field in Trainer._inner_training_loop.
+        try:
+            training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
+            logger.info("Set training_args.gradient_checkpointing_kwargs={'use_reentrant': False}.")
+        except Exception as exc:
+            logger.info(f"Could not set gradient_checkpointing_kwargs on training_args: {exc}")
+
         if hasattr(model, "gradient_checkpointing_enable"):
-            # [修改] 旧版 API 不接受参数，直接调用
-            model.gradient_checkpointing_enable()
-            logger.info("Gradient Checkpointing enabled (Legacy Mode).")
+            try:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                logger.info("Gradient Checkpointing enabled with use_reentrant=False.")
+            except TypeError:
+                # Older Transformers API: no kwargs support. Fall back to legacy mode.
+                # If this branch is used and DDP still reports 'mark ready twice',
+                # rerun with --gradient_checkpointing False.
+                model.gradient_checkpointing_enable()
+                logger.warning(
+                    "Gradient Checkpointing enabled in legacy re-entrant mode because this "
+                    "Transformers version does not accept gradient_checkpointing_kwargs. "
+                    "If DDP fails with 'mark ready twice', disable gradient_checkpointing."
+                )
 
         # Solve "does not have a grad_fn" error
         if hasattr(model, "enable_input_require_grads"):
@@ -2755,8 +2855,22 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
     base_args.do_eval = False
     base_args.do_predict = False
     method = base_args.method
+    BASELINE_METHOD_ALIASES = {
+        "topk": "flasc",
+        "flasc": "flasc",
+        "topk_pq": "compeft",
+        "compeft": "compeft",
+        "fedcomp": "fedcomp",
+        "block_opt": "flm_topk",
+        "flm_topk": "flm_topk",
+        "flm-topk": "flm_topk",
+    }
+    COMPRESSION_BASELINE_METHODS = set(BASELINE_METHOD_ALIASES.keys())
+    baseline_method = BASELINE_METHOD_ALIASES.get(str(method).lower(), str(method).lower())
     if _is_main():
         logger.info("Use method: {}".format(method))
+        if str(method).lower() in COMPRESSION_BASELINE_METHODS:
+            logger.info(f"[MigratedBaseline] normalized_method={baseline_method}")
     global_model = model
     global_model.to("cpu")
     device = next(global_model.parameters()).device
@@ -2929,6 +3043,61 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
             )
 
 
+    baseline_compressor = None
+    client_compression_residuals = defaultdict(dict)
+    baseline_compression_history = []
+    if str(method).lower() in COMPRESSION_BASELINE_METHODS:
+        baseline_packet_num = int(getattr(training_args, "baseline_packet_num", 0) or 0)
+        if baseline_packet_num <= 0:
+            if effective_comm_budget is None or effective_comm_budget <= 0:
+                raise ValueError(
+                    "Migrated compression baselines need a positive packet budget. "
+                    "Set --comm_budget or --baseline_packet_num."
+                )
+            baseline_packet_num = int(effective_comm_budget)
+
+        baseline_compressor = BaselineCompressor(
+            packet_num=baseline_packet_num,
+            packet_bytes=int(getattr(training_args, "packet_bytes", 1500)),
+            blocks=int(getattr(training_args, "baseline_blocks", 1024)),
+            bit=int(getattr(training_args, "baseline_bit", 18)),
+            min_bit=int(getattr(training_args, "baseline_min_bit", 4)),
+            topk_method=str(getattr(training_args, "baseline_topk_method", "gradient")),
+            lora_rank=int(getattr(model_args, "lora_dim", 8)),
+            flm_opt_max_iter=int(getattr(training_args, "baseline_flm_opt_max_iter", 40)),
+            flm_max_blocks=int(getattr(training_args, "baseline_flm_max_blocks", 256)),
+            flm_disable_optim=bool(getattr(training_args, "baseline_flm_disable_optim", False)),
+        )
+        if _is_main():
+            logger.info(
+                f"[MigratedBaseline] method={method}->{baseline_method}, "
+                f"packet_num={baseline_packet_num}, "
+                f"blocks={getattr(training_args, 'baseline_blocks', 1024)}, "
+                f"bit={getattr(training_args, 'baseline_bit', 18)}"
+            )
+
+
+    sn_encoder_compressor = None
+    sn_encoder_compression_history = []
+    if SERVER_SN_UPLOAD and SN_ENCODER_MODE != "none":
+        sn_encoder_compressor = BaselineCompressor(
+            packet_num=int(SN_ENCODER_PACKET_NUM),
+            packet_bytes=int(getattr(training_args, "packet_bytes", 1500)),
+            blocks=int(getattr(training_args, "sn_encoder_blocks", 192)),
+            bit=int(getattr(training_args, "sn_encoder_bit", 18)),
+            min_bit=int(getattr(training_args, "sn_encoder_min_bit", 4)),
+            topk_method=str(getattr(training_args, "baseline_topk_method", "gradient")),
+            lora_rank=int(getattr(model_args, "lora_dim", 8)),
+            flm_opt_max_iter=int(getattr(training_args, "baseline_flm_opt_max_iter", 40)),
+            flm_max_blocks=int(getattr(training_args, "baseline_flm_max_blocks", 256)),
+            flm_disable_optim=bool(getattr(training_args, "baseline_flm_disable_optim", False)),
+        )
+        if _is_main():
+            logger.info(
+                f"[SNEncoder] mode={SN_ENCODER_MODE}, packet_num={SN_ENCODER_PACKET_NUM}, "
+                f"candidate_budget_multiplier={SN_CANDIDATE_BUDGET_MULTIPLIER}, "
+                f"candidate_budget_override={SN_CANDIDATE_BUDGET_OVERRIDE}"
+            )
 
     base_args.num_train_epochs = fed_args.local_epochs
     base_args.save_strategy = "no"
@@ -3070,7 +3239,23 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 logger.info(f"Client ID: {cid}")
                 logger.info(f"Client {cid}: Resetting persistent trainer...")
 
-            trainer.model.load_state_dict(global_state_gpu, strict=False)
+            if (
+                    baseline_method == "fedcomp"
+                    and bool(getattr(training_args, "fedcomp_use_residual", True))
+                    and len(client_compression_residuals.get(cid, {})) > 0
+            ):
+                # Old FedComp replays the previous unuploaded residual by initializing
+                # the local client from global - residual before local training.
+                client_init_state_cpu = apply_residual_to_lora_state(
+                    global_state_cpu,
+                    client_compression_residuals[cid],
+                    lora_keys,
+                )
+                client_init_state_gpu = {k: v.to(device) for k, v in client_init_state_cpu.items()}
+                trainer.model.load_state_dict(client_init_state_gpu, strict=False)
+            else:
+                trainer.model.load_state_dict(global_state_gpu, strict=False)
+
             trainer.train_dataset = client_datasets[cid]
 
             if method == "lorm":
@@ -3185,7 +3370,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
                 continue
 
-            if method in ["lora_origin", "ewc", "replay", "gem", "pilora"]:
+            if method in ["lora_origin", "ewc", "replay", "gem", "pilora"] or str(method).lower() in COMPRESSION_BASELINE_METHODS:
                 if _is_main():
                     logger.info(f"Client {cid}: Starting training {method}...")
 
@@ -3400,11 +3585,81 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     for k in upload_candidate_update
                 }
 
+                baseline_compressed_this_client = False
+                if str(method).lower() in COMPRESSION_BASELINE_METHODS:
+                    if baseline_compressor is None:
+                        raise RuntimeError("baseline_compressor is not initialized")
+                    param_for_compress = {
+                        k: name_to_param[k].detach().cpu()
+                        for k in lora_keys
+                        if k in name_to_param
+                    }
+                    compressed_delta, residual_delta, comp_stats = baseline_compressor.compress(
+                        baseline_method,
+                        delta,
+                        param_for_compress,
+                        lora_keys,
+                    )
+                    delta = compressed_delta
+                    baseline_compressed_this_client = True
+
+                    if baseline_method == "fedcomp" and residual_delta is not None:
+                        client_compression_residuals[cid] = residual_delta
+
+                    # For logs/overlap diagnostics, record tensors that still contain non-zero entries.
+                    round_selected_layers[cid] = sorted([
+                        k for k, v in delta.items()
+                        if torch.count_nonzero(v).item() > 0
+                    ])
+
+                    if _is_main():
+                        residual_nonzero = None
+                        residual_norm = None
+                        residual_tensor_count = None
+                        if residual_delta is not None:
+                            residual_nonzero = int(sum(torch.count_nonzero(v).item() for v in residual_delta.values()))
+                            residual_norm = float(math.sqrt(sum(torch.norm(v.float()).item() ** 2 for v in residual_delta.values())))
+                            residual_tensor_count = int(sum(1 for v in residual_delta.values() if torch.count_nonzero(v).item() > 0))
+
+                        compression_entry = {
+                            "global_round": int(rnd + 1),
+                            "client_order": int(client_order),
+                            "cid": int(cid),
+                            "method_arg": str(method),
+                            "normalized_method": str(baseline_method),
+                            "packet_num": int(comp_stats.packet_num),
+                            "packet_bytes": int(getattr(training_args, "packet_bytes", 1500)),
+                            "comm_budget": int(effective_comm_budget) if effective_comm_budget is not None else None,
+                            "full_upload_cost": int(full_upload_cost),
+                            "nonzero": int(comp_stats.nonzero),
+                            "total_numel": int(comp_stats.total_numel),
+                            "density": float(comp_stats.nonzero / comp_stats.total_numel) if comp_stats.total_numel > 0 else 0.0,
+                            "nonzero_tensor_count": int(len(round_selected_layers[cid])),
+                            "total_lora_tensor_count": int(len(lora_keys)),
+                            "selected_tensor_names": list(round_selected_layers[cid]),
+                            "residual_nonzero": residual_nonzero,
+                            "residual_norm": residual_norm,
+                            "residual_tensor_count": residual_tensor_count,
+                            "fedcomp_use_residual": bool(getattr(training_args, "fedcomp_use_residual", True)),
+                            "baseline_blocks": int(getattr(training_args, "baseline_blocks", 1024)),
+                            "baseline_bit": int(getattr(training_args, "baseline_bit", 18)),
+                            "baseline_min_bit": int(getattr(training_args, "baseline_min_bit", 4)),
+                            "baseline_topk_method": str(getattr(training_args, "baseline_topk_method", "gradient")),
+                            "extra": dict(comp_stats.extra),
+                        }
+                        baseline_compression_history.append(compression_entry)
+
+                        logger.info(
+                            f"Client {cid} [MigratedBaseline/{baseline_method}]: "
+                            f"nnz={comp_stats.nonzero}/{comp_stats.total_numel}, "
+                            f"packet_num={comp_stats.packet_num}, extra={comp_stats.extra}"
+                        )
+
                 # ===== Server-side signal-noise scheduling path =====
                 # For upload_score_mode=sn_p1p2, we first collect every selected client's
                 # full A/B-pair candidate update, and only after all local training is done
                 # let the server solve P1+gap-aware P2-L for the whole round.
-                if SERVER_SN_UPLOAD and method == "lora_origin":
+                if (not baseline_compressed_this_client) and SERVER_SN_UPLOAD and method == "lora_origin":
                     round_server_sn_records.append({
                         "cid": int(cid),
                         "weight": int(len(client_datasets[cid])),
@@ -3465,7 +3720,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
                 # 2. Apply Selection Strategy (Compressed Upload)
-                if effective_comm_budget is not None and effective_comm_budget > 0:
+                if (not baseline_compressed_this_client) and effective_comm_budget is not None and effective_comm_budget > 0:
                     selected_layers = set()
                     selection_cost = 0
 
@@ -3706,7 +3961,7 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                         for uid in selected_units:
                             round_unit_coverage_counts[uid] += 1
 
-                elif method == "lora_origin":
+                elif (not baseline_compressed_this_client) and method == "lora_origin":
                     round_selected_layers[cid] = sorted(lora_keys)
                     # Dense upload: every atomic unit is selected by this client.
                     for uid in build_atomic_units(lora_keys, UPLOAD_ATOMIC_MODE).keys():
@@ -3868,12 +4123,18 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
 
 
         if SERVER_SN_UPLOAD and len(round_server_sn_records) > 0:
+            if SN_CANDIDATE_BUDGET_OVERRIDE > 0:
+                sn_schedule_budget = int(SN_CANDIDATE_BUDGET_OVERRIDE)
+            else:
+                sn_schedule_budget = int(round(float(effective_comm_budget) * float(SN_CANDIDATE_BUDGET_MULTIPLIER)))
+            sn_schedule_budget = max(1, sn_schedule_budget)
+
             selected_by_client, sn_diag = _run_signal_noise_p1_p2_schedule(
                 client_records=round_server_sn_records,
                 global_state_cpu=global_state_cpu,
                 lora_keys=lora_keys,
                 layer_costs=layer_costs,
-                budget=effective_comm_budget,
+                budget=sn_schedule_budget,
                 atomic_mode=UPLOAD_ATOMIC_MODE,
                 gap_eta=SN_GAP_ETA,
                 force_full_budget=SN_FORCE_FULL_BUDGET,
@@ -3882,6 +4143,11 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 depth_group_ratios=SN_DEPTH_GROUP_RATIOS,
             )
             sn_diag["global_round"] = int(rnd + 1)
+            sn_diag["actual_comm_budget"] = int(effective_comm_budget) if effective_comm_budget is not None else None
+            sn_diag["candidate_schedule_budget"] = int(sn_schedule_budget)
+            sn_diag["sn_encoder_mode"] = str(SN_ENCODER_MODE)
+            sn_diag["sn_candidate_budget_multiplier"] = float(SN_CANDIDATE_BUDGET_MULTIPLIER)
+            sn_diag["sn_candidate_budget_override"] = int(SN_CANDIDATE_BUDGET_OVERRIDE)
             if SN_SAVE_DIAGNOSTICS and _is_main():
                 sn_schedule_history.append(sn_diag)
                 logger.info(
@@ -3899,10 +4165,33 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                 selected_units = set(selected_by_client[cid]["selected_units"])
                 selection_cost = int(selected_by_client[cid]["selection_cost"])
                 delta = rec["delta"]
+                raw_candidate_layers = set(selected_layers)
+                encoded = False
+                encoder_stats = None
 
-                for k in delta:
-                    if k not in selected_layers:
-                        delta[k] = torch.zeros_like(delta[k])
+                if SN_ENCODER_MODE != "none":
+                    if sn_encoder_compressor is None:
+                        raise RuntimeError("sn_encoder_compressor is not initialized")
+                    # Gate the compressor to SN-selected candidate tensors only.
+                    # The compressor uses the actual packet budget, not the enlarged candidate budget.
+                    encode_keys = [k for k in lora_keys if k in raw_candidate_layers]
+                    compressed_delta, _, encoder_stats = sn_encoder_compressor.compress(
+                        SN_ENCODER_MODE,
+                        delta,
+                        rec.get("params", None),
+                        encode_keys,
+                    )
+                    new_delta = {k: torch.zeros_like(delta[k]) for k in lora_keys}
+                    for k, v in compressed_delta.items():
+                        new_delta[k] = v
+                    delta = new_delta
+                    encoded = True
+                    # After encoding, selected_layers should reflect actually nonzero tensors.
+                    selected_layers = set(k for k in lora_keys if torch.count_nonzero(delta[k]).item() > 0)
+                else:
+                    for k in delta:
+                        if k not in selected_layers:
+                            delta[k] = torch.zeros_like(delta[k])
 
                 round_selected_layers[cid] = sorted(selected_layers)
                 for uid in selected_units:
@@ -3913,11 +4202,41 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
                     aggregated[k] += delta[k] * w
                 total += w
 
+                if _is_main() and encoded and encoder_stats is not None:
+                    nonzero_tensor_names = sorted([k for k in lora_keys if torch.count_nonzero(delta[k]).item() > 0])
+                    candidate_tensor_count = int(len(raw_candidate_layers))
+                    compression_entry = {
+                        "global_round": int(rnd + 1),
+                        "cid": int(cid),
+                        "method_arg": "lora_origin",
+                        "upload_score_mode": str(UPLOAD_SCORE_MODE),
+                        "upload_atomic_mode": str(UPLOAD_ATOMIC_MODE),
+                        "sn_encoder_mode": str(SN_ENCODER_MODE),
+                        "normalized_encoder_method": str(encoder_stats.method),
+                        "packet_num": int(encoder_stats.packet_num),
+                        "comm_budget": int(effective_comm_budget) if effective_comm_budget is not None else None,
+                        "candidate_schedule_budget": int(sn_schedule_budget),
+                        "candidate_budget_multiplier": float(SN_CANDIDATE_BUDGET_MULTIPLIER),
+                        "candidate_selection_cost": int(selection_cost),
+                        "candidate_unit_count": int(len(selected_units)),
+                        "candidate_tensor_count": candidate_tensor_count,
+                        "nonzero": int(encoder_stats.nonzero),
+                        "total_numel": int(encoder_stats.total_numel),
+                        "density": float(encoder_stats.nonzero / encoder_stats.total_numel) if encoder_stats.total_numel else 0.0,
+                        "nonzero_tensor_count": int(len(nonzero_tensor_names)),
+                        "selected_tensor_names": nonzero_tensor_names,
+                        "candidate_tensor_names": sorted(raw_candidate_layers),
+                        "extra": dict(encoder_stats.extra),
+                    }
+                    sn_encoder_compression_history.append(compression_entry)
+
                 if _is_main():
+                    enc_msg = f", encoder={SN_ENCODER_MODE}, nnz={encoder_stats.nonzero if encoder_stats is not None else 'raw'}"
                     logger.info(
-                        f"Client {cid} [SN-P1P2/ab_pair]: "
-                        f"Selected {len(selected_units)} units, "
-                        f"{len(selected_layers)} tensors, cost {selection_cost}/{effective_comm_budget}"
+                        f"Client {cid} [SN-P1P2/{UPLOAD_ATOMIC_MODE}]: "
+                        f"Candidate {len(selected_units)} units, "
+                        f"{len(raw_candidate_layers)} tensors, candidate_cost {selection_cost}/{sn_schedule_budget}, "
+                        f"actual_budget={effective_comm_budget}{enc_msg}"
                     )
 
         for cid in selected:
@@ -4414,6 +4733,70 @@ def run_federated_training(model_args: ModelArguments, data_args: DataTrainingAr
         with open(pair_summary_path, "w", encoding="utf-8") as fout:
             json.dump(pair_summary, fout, ensure_ascii=False, indent=2)
         logger.info(f"Saved pair-saliency diagnostics summary to {pair_summary_path}")
+
+
+    if _is_main() and len(sn_encoder_compression_history) > 0:
+        sn_enc_history_path = os.path.join(training_args.output_dir, "sn_encoder_compression_history.json")
+        with open(sn_enc_history_path, "w", encoding="utf-8") as fout:
+            json.dump(sn_encoder_compression_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved SN-encoder compression history to {sn_enc_history_path}")
+
+        enc_groups = defaultdict(list)
+        for row in sn_encoder_compression_history:
+            enc_groups[row.get("sn_encoder_mode", "unknown")].append(row)
+        sn_enc_summary = {
+            "num_records": int(len(sn_encoder_compression_history)),
+            "encoders": {},
+        }
+        for enc_name, rows in sorted(enc_groups.items()):
+            sn_enc_summary["encoders"][enc_name] = {
+                "num_records": int(len(rows)),
+                "mean_density": float(np.mean([float(r.get("density", 0.0)) for r in rows])),
+                "mean_nonzero": float(np.mean([int(r.get("nonzero", 0)) for r in rows])),
+                "mean_nonzero_tensor_count": float(np.mean([int(r.get("nonzero_tensor_count", 0)) for r in rows])),
+                "mean_candidate_tensor_count": float(np.mean([int(r.get("candidate_tensor_count", 0)) for r in rows])),
+                "mean_candidate_unit_count": float(np.mean([int(r.get("candidate_unit_count", 0)) for r in rows])),
+                "mean_candidate_selection_cost": float(np.mean([int(r.get("candidate_selection_cost", 0)) for r in rows])),
+                "mean_packet_num": float(np.mean([int(r.get("packet_num", 0)) for r in rows])),
+            }
+        sn_enc_summary_path = os.path.join(training_args.output_dir, "sn_encoder_compression_summary.json")
+        with open(sn_enc_summary_path, "w", encoding="utf-8") as fout:
+            json.dump(sn_enc_summary, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved SN-encoder compression summary to {sn_enc_summary_path}")
+
+    if _is_main() and len(baseline_compression_history) > 0:
+        baseline_history_path = os.path.join(training_args.output_dir, "baseline_compression_history.json")
+        with open(baseline_history_path, "w", encoding="utf-8") as fout:
+            json.dump(baseline_compression_history, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved migrated-baseline compression history to {baseline_history_path}")
+
+        method_groups = defaultdict(list)
+        for row in baseline_compression_history:
+            method_groups[row.get("normalized_method", "unknown")].append(row)
+
+        baseline_summary = {
+            "num_records": int(len(baseline_compression_history)),
+            "methods": {},
+        }
+        for m_name, rows in sorted(method_groups.items()):
+            densities = [float(r.get("density", 0.0)) for r in rows]
+            nnzs = [int(r.get("nonzero", 0)) for r in rows]
+            tensor_counts = [int(r.get("nonzero_tensor_count", 0)) for r in rows]
+            packets = [int(r.get("packet_num", 0)) for r in rows]
+            residual_norms = [float(r["residual_norm"]) for r in rows if r.get("residual_norm") is not None]
+            baseline_summary["methods"][m_name] = {
+                "num_records": int(len(rows)),
+                "mean_density": float(np.mean(densities)) if densities else 0.0,
+                "mean_nonzero": float(np.mean(nnzs)) if nnzs else 0.0,
+                "mean_nonzero_tensor_count": float(np.mean(tensor_counts)) if tensor_counts else 0.0,
+                "mean_packet_num": float(np.mean(packets)) if packets else 0.0,
+                "mean_residual_norm": float(np.mean(residual_norms)) if residual_norms else None,
+            }
+
+        baseline_summary_path = os.path.join(training_args.output_dir, "baseline_compression_summary.json")
+        with open(baseline_summary_path, "w", encoding="utf-8") as fout:
+            json.dump(baseline_summary, fout, ensure_ascii=False, indent=2)
+        logger.info(f"Saved migrated-baseline compression summary to {baseline_summary_path}")
 
 
     # ========== 保存 Adapter ==========

@@ -43,6 +43,14 @@ from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel, PeftConfig
 
+# ===== Compatibility: transformers 4.51+ renamed evaluation_strategy → eval_strategy =====
+_TRANSFORMERS_VERSION = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+_TRANSFORMERS_NEW_EVAL = _TRANSFORMERS_VERSION >= (4, 51)
+if _TRANSFORMERS_NEW_EVAL:
+    for _i, _arg in enumerate(sys.argv):
+        if _arg == "--evaluation_strategy":
+            sys.argv[_i] = "--eval_strategy"
+
 # privacy
 from uie_collator import DataCollatorForUIE
 from uie_dataset_lora import gen_cache_path
@@ -55,6 +63,64 @@ from model.llama import LlamaForCausalLM_with_lossmask
 os.environ['WANDB_DISABLED'] = "True"
 logger = logging.getLogger(__name__)
 CURRENT_DIR = os.path.dirname(__file__)
+
+
+def _configure_decoder_tokenizer_and_config(tokenizer, config):
+    """Use model-native BOS/EOS and add a safe PAD token for decoder-only models.
+
+    This avoids the old LLaMA-2-only hard-code bos=1/eos=2/pad=1.  For
+    Llama-3.x, prefer an existing reserved padding token that is distinct
+    from all native EOS ids, so generation can use a reliable attention mask.
+    """
+    eos_ids = getattr(config, "eos_token_id", None)
+    if isinstance(eos_ids, (list, tuple, set)):
+        eos_id_set = set(int(x) for x in eos_ids)
+    elif eos_ids is not None:
+        eos_id_set = {int(eos_ids)}
+    else:
+        eos_id_set = set()
+
+    def _valid_existing_token(tok: str) -> bool:
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+        except Exception:
+            return False
+        if tid is None:
+            return False
+        if tokenizer.unk_token_id is not None and tid == tokenizer.unk_token_id:
+            return False
+        return int(tid) >= 0 and int(tid) not in eos_id_set
+
+    if tokenizer.pad_token is None or (tokenizer.pad_token_id is not None and int(tokenizer.pad_token_id) in eos_id_set):
+        chosen_pad = None
+        for cand in ("<|finetune_right_pad_id|>", "<|reserved_special_token_0|>", "<|pad|>"):
+            if _valid_existing_token(cand):
+                chosen_pad = cand
+                break
+        if chosen_pad is not None:
+            tokenizer.pad_token = chosen_pad
+        elif tokenizer.unk_token is not None and (tokenizer.unk_token_id is None or int(tokenizer.unk_token_id) not in eos_id_set):
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    tokenizer.padding_side = "left"
+
+    if getattr(config, "bos_token_id", None) is None and tokenizer.bos_token_id is not None:
+        config.bos_token_id = tokenizer.bos_token_id
+    if getattr(config, "eos_token_id", None) is None and tokenizer.eos_token_id is not None:
+        config.eos_token_id = tokenizer.eos_token_id
+    config.pad_token_id = tokenizer.pad_token_id
+
+
+def _sync_generation_special_tokens(model, tokenizer, config):
+    if not hasattr(model, "generation_config"):
+        return
+    if getattr(model.generation_config, "bos_token_id", None) is None:
+        model.generation_config.bos_token_id = getattr(config, "bos_token_id", None) or tokenizer.bos_token_id
+    if getattr(model.generation_config, "eos_token_id", None) is None:
+        model.generation_config.eos_token_id = getattr(config, "eos_token_id", None) or tokenizer.eos_token_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
 
 try:
     nltk.data.find("tokenizers/punkt")
@@ -248,9 +314,72 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
         metadata={"help": "If specifid, the model will do more evaluation at the beginning of training."}
     )
     do_demo: bool = field(default=False, metadata={"help": "Whether to run the model as a demo in the terminal."})
+
+    # Compatibility: transformers 4.51+ removed evaluation_strategy, renamed to eval_strategy.
+    # This property bridges the two so existing code (args.evaluation_strategy) continues to work.
+    @property
+    def evaluation_strategy(self):
+        return self.eval_strategy
+
+    @evaluation_strategy.setter
+    def evaluation_strategy(self, value):
+        self.eval_strategy = value
+
     lamda_1: float = field(default=0.5)
     lamda_2: float = field(default=0)
-    method: str = field(default="lora_origin", metadata={"help": "The method for CL: [lora_origin, adaptive]."})
+    method: str = field(
+        default="lora_origin",
+        metadata={
+            "help": (
+                "Training/compression method. Continual methods: lora_origin, adaptive, ewc, replay, gem, pilora, lorm. "
+                "Migrated FLM-TopK baselines: flasc/topk, compeft/topk_pq, fedcomp, flm_topk/block_opt."
+            )
+        },
+    )
+
+    # ===== Migrated compression baselines from the old FLM-TopK framework =====
+    baseline_packet_num: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of 1500-byte packets used by migrated compression baselines. "
+                "0 means reuse federated_args.comm_budget as the per-client packet budget."
+            )
+        },
+    )
+    baseline_blocks: int = field(
+        default=1024,
+        metadata={"help": "Initial interval/block number for FLM-TopK/block_opt. ComPEFT uses global TopK+PQ and does not use blocks."},
+    )
+    baseline_bit: int = field(
+        default=18,
+        metadata={"help": "Maximum value bit length used by ComPEFT/FLM-TopK quantization."},
+    )
+    baseline_min_bit: int = field(
+        default=4,
+        metadata={"help": "Minimum value bit length used by FLM-TopK packet optimization."},
+    )
+    baseline_topk_method: str = field(
+        default="gradient",
+        metadata={"help": "TopK score used by old framework: gradient, graproduct, graproduct_2, or adalora."},
+    )
+    baseline_flm_opt_max_iter: int = field(
+        default=40,
+        metadata={"help": "Maximum optimization iterations for FLM-TopK/block_opt block-size search. Old slow behavior used about 1000."},
+    )
+    baseline_flm_max_blocks: int = field(
+        default=256,
+        metadata={"help": "Cap optimized block count for FLM-TopK/block_opt. <=0 disables the cap."},
+    )
+    baseline_flm_disable_optim: bool = field(
+        default=False,
+        metadata={"help": "If True, skip FLM-TopK block-size optimization and use baseline_blocks directly."},
+    )
+    fedcomp_use_residual: bool = field(
+        default=True,
+        metadata={"help": "If True, mimic old FedComp residual replay: local init = global - previous residual."},
+    )
+
     uplink_mbps: str = field(default="10,100", metadata={"help": "逗号分隔的上行带宽(Mbps)，用于计算通信节省时间下界"})
     packet_bytes: int = field(default=1500, metadata={"help": "每个传输包的有效负载字节数"})
     radius: float = field(default=1.0, metadata={"help": "Constraint radius for adaptive optimizer."})
@@ -376,6 +505,39 @@ class UIETrainingArguments(Seq2SeqTrainingArguments):
                 "sn_p1_norm_mode=depth_balanced. Default 1,1,2."
             )
         }
+    )
+
+    # ===== Ours + fine-grained encoding variants =====
+    # The original Ours uploads selected qv-blocks as raw LoRA tensors. These knobs
+    # let SN-P1P2 first choose a larger candidate set, then apply value-level
+    # encoding inside the selected candidates under the original packet budget.
+    sn_encoder_mode: str = field(
+        default="none",
+        metadata={"help": "Encoding inside SN-P1P2 selected candidates: none/raw, compeft/topk_pq, or flasc/topk."},
+    )
+    sn_candidate_budget_multiplier: float = field(
+        default=1.0,
+        metadata={"help": "Multiplier applied to comm_budget only for SN-P1P2 candidate scheduling before encoding."},
+    )
+    sn_candidate_budget: int = field(
+        default=0,
+        metadata={"help": "Absolute candidate scheduling budget for SN-P1P2. If >0, overrides multiplier."},
+    )
+    sn_encoder_packet_num: int = field(
+        default=0,
+        metadata={"help": "Packet budget for SN encoder. 0 means reuse comm_budget."},
+    )
+    sn_encoder_bit: int = field(
+        default=18,
+        metadata={"help": "Value bit length used by SN encoder when mode=compeft/topk_pq."},
+    )
+    sn_encoder_min_bit: int = field(
+        default=4,
+        metadata={"help": "Minimum bit length reserved for compatibility with BaselineCompressor."},
+    )
+    sn_encoder_blocks: int = field(
+        default=192,
+        metadata={"help": "Reserved for future block encoders; ComPEFT/FLASC encoder variants ignore it."},
     )
 
     upload_diversity_mode: str = field(
@@ -621,7 +783,21 @@ def main():
     else:
         model_args, data_args, training_args, federated_args = parser.parse_args_into_dataclasses()
 
-    # T5 / LLama
+    # DDP + LoRA + gradient checkpointing is safer with non-reentrant checkpointing.
+    # This mirrors the explicit call inside federated_uie_lora.py and also helps
+    # Transformers Trainer versions that read TrainingArguments directly.
+    if getattr(training_args, "gradient_checkpointing", False):
+        try:
+            training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
+        except Exception:
+            pass
+        if getattr(training_args, "ddp_find_unused_parameters", None) is None:
+            try:
+                training_args.ddp_find_unused_parameters = False
+            except Exception:
+                pass
+
+    # T5 / LLama / Qwen federated path
     if federated_args.mode == "federated":
         from federated_uie_lora import run_federated_training
         run_federated_training(model_args, data_args, training_args, federated_args)
@@ -691,13 +867,8 @@ def main():
     if 'adapter' in model_args.model_name_or_path:  # load lora-config
         config = PeftConfig.from_pretrained(model_args.model_name_or_path)
         if 'llama' in model_args.model_name_or_path.lower():
-            tokenizer = transformers.LlamaTokenizer.from_pretrained(config.base_model_name_or_path)
-            config.bos_token_id = 1
-            config.eos_token_id = 2
-            config.pad_token_id = 1
-            tokenizer.bos_token_id = 1
-            tokenizer.eos_token_id = 2
-            tokenizer.pad_token_id = 1
+            tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
+            _configure_decoder_tokenizer_and_config(tokenizer, config)
         else:
             tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path)
     elif 'llama' in model_args.model_name_or_path.lower():
@@ -707,19 +878,14 @@ def main():
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        config.bos_token_id = 1
-        config.eos_token_id = 2
-        config.pad_token_id = 1
-        tokenizer = transformers.LlamaTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
-        tokenizer.bos_token_id = 1
-        tokenizer.eos_token_id = 2
-        tokenizer.pad_token_id = 1
+        _configure_decoder_tokenizer_and_config(tokenizer, config)
     else:  # load original config
         config = AutoConfig.from_pretrained(
             model_args.config_name if model_args.config_name else model_args.model_name_or_path,
@@ -793,9 +959,10 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
 
     if 'llama' in model_args.model_name_or_path.lower():
-        model.generation_config.bos_token_id = 1
-        model.generation_config.eos_token_id = 2
-        model.generation_config.pad_token_id = 1
+        _sync_generation_special_tokens(model, tokenizer, config)
+        print("[run_uie_lora] tokenizer.bos/eos/pad =", tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id)
+        print("[run_uie_lora] config.bos/eos/pad =", getattr(config, "bos_token_id", None), getattr(config, "eos_token_id", None), getattr(config, "pad_token_id", None))
+        print("[run_uie_lora] generation.bos/eos/pad =", getattr(model.generation_config, "bos_token_id", None), getattr(model.generation_config, "eos_token_id", None), getattr(model.generation_config, "pad_token_id", None))
 
     # fix lora_A/B (bases of previous LoRA parameters, loaded in "load_adapter"[peft_momdel.py])
     # fine-tune loranew_A/B (initialized in "update_layer"[lora.py])

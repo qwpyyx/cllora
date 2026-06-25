@@ -736,9 +736,10 @@ class UIETrainer(Seq2SeqTrainer):
             num_items_in_batch=None,
     ):
         # 兼容 decoder-only 多出来的字段，避免 model(**inputs) 报错
-        if "input_ids_wo_label" in inputs:
+        if "input_ids_wo_label" in inputs or "attention_mask_wo_label" in inputs:
             inputs = dict(inputs)
             inputs.pop("input_ids_wo_label", None)
+            inputs.pop("attention_mask_wo_label", None)
 
         # 兼容不同 transformers 版本
         try:
@@ -787,9 +788,10 @@ class UIETrainer(Seq2SeqTrainer):
         """
 
         # 1) 兼容 decoder-only 多出来的字段，防止 model(**inputs) 报错
-        if "input_ids_wo_label" in inputs:
+        if "input_ids_wo_label" in inputs or "attention_mask_wo_label" in inputs:
             inputs = dict(inputs)
             inputs.pop("input_ids_wo_label", None)
+            inputs.pop("attention_mask_wo_label", None)
 
         # 2) 交给父类做真正的前向 + 反向（包括 Deepspeed / Accelerate 逻辑）
         try:
@@ -1145,7 +1147,20 @@ class UIETrainer(Seq2SeqTrainer):
             return train_output
 
 
-        if self.method in ["lora_origin", "ewc", "replay", "gem", "pilora"] or (self.method == "adaptive" and task_id == 1):
+        # Compression baselines are implemented outside the Trainer: the Trainer only
+        # needs to perform normal local LoRA training, and federated_uie_lora.py will
+        # compress the resulting LoRA delta afterwards.  If we do not include these
+        # methods here, UIETrainer.train() falls through without calling super().train(),
+        # producing zero local deltas and zero nonzero compressed updates.
+        standard_local_train_methods = {
+            "lora_origin", "ewc", "replay", "gem", "pilora",
+            "topk", "flasc",
+            "topk_pq", "compeft",
+            "block_opt", "flm_topk", "flm-topk",
+            "fedcomp",
+        }
+        method_name = str(self.method).lower()
+        if method_name in standard_local_train_methods or (method_name == "adaptive" and task_id == 1):
             logger.info(f"[Task {task_id}] Method '{self.method}': 调用标准 super().train()")
             return super().train(**kwargs)
 
@@ -1719,6 +1734,8 @@ class UIETrainer(Seq2SeqTrainer):
             # 移除不兼容参数，防止调用 super().forward 报错
             if "input_ids_wo_label" in inputs:
                 inputs.pop("input_ids_wo_label")
+            if "attention_mask_wo_label" in inputs:
+                inputs.pop("attention_mask_wo_label")
             return super().prediction_step(
                 model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
             )
@@ -1763,45 +1780,39 @@ class UIETrainer(Seq2SeqTrainer):
         is_enc_dec = bool(getattr(model.config, "is_encoder_decoder", False))
 
         if not is_enc_dec:
-            # decoder-only: LLaMA / Qwen
-            if is_llama:
-                # 保持你原来的 LLaMA 行为
-                gen_kwargs.update({
-                    "bos_token_id": 1,
-                    "eos_token_id": 2,
-                    "pad_token_id": 0,
-                })
-            elif is_qwen:
-                # Qwen: 用模型/分词器自身 special token
+            # decoder-only: LLaMA / Qwen / other CausalLM.
+            # Never hard-code LLaMA-2 ids here.  Llama-3.x uses native BOS/EOS
+            # ids such as 128000/128001 and may expose multiple EOS ids.
+            gen_cfg = getattr(model, "generation_config", None)
+
+            bos_id = getattr(gen_cfg, "bos_token_id", None) if gen_cfg is not None else None
+            eos_id = getattr(gen_cfg, "eos_token_id", None) if gen_cfg is not None else None
+            pad_id = getattr(gen_cfg, "pad_token_id", None) if gen_cfg is not None else None
+
+            if bos_id is None:
                 bos_id = getattr(model.config, "bos_token_id", None)
+            if eos_id is None:
                 eos_id = getattr(model.config, "eos_token_id", None)
+            if pad_id is None:
                 pad_id = getattr(model.config, "pad_token_id", None)
 
-                if bos_id is None:
-                    bos_id = getattr(self.tokenizer, "bos_token_id", None)
-                if eos_id is None:
-                    eos_id = getattr(self.tokenizer, "eos_token_id", None)
-                if pad_id is None:
-                    pad_id = getattr(self.tokenizer, "pad_token_id", None)
+            if bos_id is None:
+                bos_id = getattr(self.tokenizer, "bos_token_id", None)
+            if eos_id is None:
+                eos_id = getattr(self.tokenizer, "eos_token_id", None)
+            if pad_id is None:
+                pad_id = getattr(self.tokenizer, "pad_token_id", None)
 
-                if bos_id is not None:
-                    gen_kwargs["bos_token_id"] = bos_id
-                if eos_id is not None:
-                    gen_kwargs["eos_token_id"] = eos_id
-                if pad_id is not None:
-                    gen_kwargs["pad_token_id"] = pad_id
-            else:
-                # 兜底 decoder-only：尽量不写死
-                bos_id = getattr(model.config, "bos_token_id", None)
-                eos_id = getattr(model.config, "eos_token_id", None)
-                pad_id = getattr(model.config, "pad_token_id", None)
+            # Last-resort pad fallback: use the first EOS id if EOS is a list.
+            if pad_id is None and eos_id is not None:
+                pad_id = eos_id[0] if isinstance(eos_id, (list, tuple)) else eos_id
 
-                if bos_id is not None:
-                    gen_kwargs["bos_token_id"] = bos_id
-                if eos_id is not None:
-                    gen_kwargs["eos_token_id"] = eos_id
-                if pad_id is not None:
-                    gen_kwargs["pad_token_id"] = pad_id
+            if bos_id is not None:
+                gen_kwargs["bos_token_id"] = bos_id
+            if eos_id is not None:
+                gen_kwargs["eos_token_id"] = eos_id
+            if pad_id is not None:
+                gen_kwargs["pad_token_id"] = pad_id
         else:
             # T5: 保持旧逻辑
             gen_kwargs.update({
@@ -1811,6 +1822,20 @@ class UIETrainer(Seq2SeqTrainer):
             })
 
         generation_config = GenerationConfig(**gen_kwargs)
+
+        # transformers 4.51+ may silently override our gen_kwargs with model-native
+        # defaults (e.g. Qwen3 sets do_sample=True, temperature=0.6). Force greedy
+        # decoding for deterministic evaluation across all models and all GPUs.
+        # Strategy: nuke the model's generation_config AND our passed config.
+        _model_gen_cfg = getattr(model, "generation_config", None)
+        if _model_gen_cfg is not None:
+            _model_gen_cfg.do_sample = False
+        generation_config.do_sample = False
+        generation_config.temperature = None
+        generation_config.top_p = None
+        generation_config.top_k = None
+        if hasattr(generation_config, 'temperature'):
+            generation_config.temperature = 1.0  # ignored when do_sample=False, but clean
 
 
         is_enc_dec = bool(getattr(model.config, "is_encoder_decoder", False))
@@ -1824,11 +1849,17 @@ class UIETrainer(Seq2SeqTrainer):
                 generation_config=generation_config,
             )
         else:
-            # [Llama] 使用 input_ids_wo_label 进行生成
+            # [Llama/Qwen] 使用纯 prompt 进行生成，并显式传入对应 attention_mask。
+            # This is important for Llama-3.x because pad/eos may be close in the
+            # native tokenizer space and generate() cannot reliably infer the mask.
             input_ids_wo_label = inputs.get("input_ids_wo_label", inputs[self.model.main_input_name])
+            attention_mask_wo_label = inputs.get("attention_mask_wo_label", None)
+            if attention_mask_wo_label is None and "attention_mask" in inputs:
+                attention_mask_wo_label = (input_ids_wo_label != gen_kwargs.get("pad_token_id")).long()
 
             generated_tokens = self.model.generate(
                 input_ids=input_ids_wo_label,
+                attention_mask=attention_mask_wo_label,
                 generation_config=generation_config,
             )
 
@@ -1844,6 +1875,8 @@ class UIETrainer(Seq2SeqTrainer):
         # 在计算 Loss 前必须把 input_ids_wo_label 移除，否则标准模型会报错
         if "input_ids_wo_label" in inputs:
             inputs.pop("input_ids_wo_label")
+        if "attention_mask_wo_label" in inputs:
+            inputs.pop("attention_mask_wo_label")
 
         with torch.no_grad():
             if has_labels:

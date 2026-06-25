@@ -206,6 +206,7 @@ class DataCollatorForUIE:
         final_labels = []
         final_att_mask = []
         final_input_ids_wo_label = []
+        final_att_mask_wo_label = []
 
         for i in range(len(input_ids_list)):
             inp = input_ids_list[i]
@@ -221,17 +222,22 @@ class DataCollatorForUIE:
             # Pad Input Without Label
             pad_len_wo = max_batch_len_wo - len(inp_wo)
             padded_inp_wo = [pad_token_id] * pad_len_wo + inp_wo
+            padded_mask_wo = [0] * pad_len_wo + [1] * len(inp_wo)
 
             final_input_ids.append(padded_inp)
             final_labels.append(padded_lbl)
             final_att_mask.append(padded_mask)
             final_input_ids_wo_label.append(padded_inp_wo)
+            final_att_mask_wo_label.append(padded_mask_wo)
 
         model_inputs = {
             'input_ids': torch.tensor(final_input_ids, dtype=torch.long),
             'attention_mask': torch.tensor(final_att_mask, dtype=torch.long),
             'labels': torch.tensor(final_labels, dtype=torch.long),
-            'input_ids_wo_label': torch.tensor(final_input_ids_wo_label, dtype=torch.long)
+            'input_ids_wo_label': torch.tensor(final_input_ids_wo_label, dtype=torch.long),
+            # Required for decoder-only generation with left padding.  In Llama-3.x
+            # pad/eos can otherwise be ambiguous and generate() cannot infer masks.
+            'attention_mask_wo_label': torch.tensor(final_att_mask_wo_label, dtype=torch.long)
         }
 
         # [删除] model_inputs['loss_mask'] = ... (不再需要)

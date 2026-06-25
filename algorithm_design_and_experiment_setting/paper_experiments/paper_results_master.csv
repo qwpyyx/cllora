@@ -1,0 +1,49 @@
+model,dataset,method,seed,alpha,partition,budget,budget_ratio,primary_metric,primary_value,secondary_metric,secondary_value,gen_len,data_type,notes,source_dir
+Qwen3-14B,GSM8K,Dense FedAvg-LoRA,28,10,quantity,0,0%,EM,37.91,-,-,3.31,main_table,Full-upload reference,results/Qwen3_phase1_main/dense_full_K10_seed28
+Qwen3-14B,GSM8K,Dense FedAvg-LoRA,42,10,quantity,0,0%,EM,38.36,-,-,3.31,main_table,,results/Qwen3_phase1_main/dense_full_K10_seed42
+Qwen3-14B,GSM8K,Dense FedAvg-LoRA,45,10,quantity,0,0%,EM,38.21,-,-,3.30,main_table,,results/Qwen3_phase1_main/dense_full_K10_seed45
+Qwen3-14B,GSM8K,FLASC,28,10,quantity,1760,12.5%,EM,36.77,-,-,50.0,main_table,Global TopK,results/Qwen3_phase1_fix1/flasc_seed28
+Qwen3-14B,GSM8K,FLASC,42,10,quantity,1760,12.5%,EM,36.62,-,-,50.0,main_table,,results/Qwen3_phase1_final/flasc_s42
+Qwen3-14B,GSM8K,FLASC,45,10,quantity,1760,12.5%,EM,37.38,-,-,50.0,main_table,,results/Qwen3_phase1_final/flasc_s45
+Qwen3-14B,GSM8K,ComPEFT,28,10,quantity,1760,12.5%,EM,34.57,-,-,49.89,main_table,TopK+PQ,results/Qwen3_phase1_fix1/compeft_seed28
+Qwen3-14B,GSM8K,ComPEFT,42,10,quantity,1760,12.5%,EM,36.39,-,-,50.0,main_table,,results/Qwen3_phase1_final/compeft_s42
+Qwen3-14B,GSM8K,ComPEFT,45,10,quantity,1760,12.5%,EM,34.34,-,-,50.0,main_table,,results/Qwen3_phase1_final/compeft_s45
+Qwen3-14B,GSM8K,FLM-TopK,28,10,quantity,1760,12.5%,EM,33.97,-,-,3.43,main_table,Block opt TopK,results/Qwen3_phase1_main/flm_topk_budget1760_K10_seed28
+Qwen3-14B,GSM8K,FLM-TopK,42,10,quantity,1760,12.5%,EM,33.21,-,-,3.48,main_table,,results/Qwen3_phase1_main/flm_topk_budget1760_K10_seed42
+Qwen3-14B,GSM8K,FLM-TopK,45,10,quantity,1760,12.5%,EM,34.04,-,-,3.39,main_table,,results/Qwen3_phase1_main/flm_topk_budget1760_K10_seed45
+Qwen3-14B,GSM8K,FedComp,28,10,quantity,1760,12.5%,EM,32.07,-,-,3.93,main_table,Row-vector compression,results/Qwen3_phase1_main/fedcomp_budget1760_K10_seed28
+Qwen3-14B,GSM8K,FedComp,42,10,quantity,1760,12.5%,EM,29.04,-,-,4.36,main_table,,results/Qwen3_phase1_main/fedcomp_budget1760_K10_seed42
+Qwen3-14B,GSM8K,FedComp,45,10,quantity,1760,12.5%,EM,33.28,-,-,3.63,main_table,,results/Qwen3_phase1_main/fedcomp_budget1760_K10_seed45
+Qwen3-14B,GSM8K,FedSP-LoRA,28,10,quantity,1760,12.5%,EM,37.00,-,-,50.0,main_table,qv-block+SN+Gram-norm+dr,results/Qwen3_sn_balance/qv_dr_a10
+Qwen3-14B,GSM8K,FedSP-LoRA,42,10,quantity,1760,12.5%,EM,36.24,-,-,50.0,main_table,,results/Qwen3_sn_balance_seeds/seed42
+Qwen3-14B,GSM8K,FedSP-LoRA,45,10,quantity,1760,12.5%,EM,36.09,-,-,50.0,main_table,,results/Qwen3_sn_balance_seeds/seed45
+Qwen3-14B,Dolly-15K,Dense FedAvg-LoRA,28,0.5,label-skew,2200,12.5%,ROUGE-L,34.34,ROUGE-1,42.54,55.22,main_table,,results/Qwen3_dolly_full/dense_s28
+Qwen3-14B,Dolly-15K,Dense FedAvg-LoRA,42,0.5,label-skew,2200,12.5%,ROUGE-L,33.56,ROUGE-1,41.47,56.82,main_table,,results/Qwen3_dolly_full/dense_s42
+Qwen3-14B,Dolly-15K,Dense FedAvg-LoRA,45,0.5,label-skew,2200,12.5%,ROUGE-L,34.27,ROUGE-1,42.45,57.87,main_table,,results/Qwen3_dolly_full/dense_s45
+Qwen3-14B,Dolly-15K,FLASC,28,0.5,label-skew,2200,12.5%,ROUGE-L,20.09,ROUGE-1,27.96,126.85,main_table,Gen Len at limit - catastrophic,results/Qwen3_dolly_full/flasc_s28
+Qwen3-14B,Dolly-15K,FLASC,42,0.5,label-skew,2200,12.5%,ROUGE-L,20.39,ROUGE-1,28.35,125.33,main_table,,results/Qwen3_dolly_full/flasc_s42
+Qwen3-14B,Dolly-15K,FLASC,45,0.5,label-skew,2200,12.5%,ROUGE-L,20.19,ROUGE-1,28.28,126.26,main_table,,results/Qwen3_dolly_full/flasc_s45
+Qwen3-14B,Dolly-15K,ComPEFT,28,0.5,label-skew,2200,12.5%,ROUGE-L,26.48,ROUGE-1,34.37,87.85,main_table,,results/Qwen3_dolly_full/compeft_s28
+Qwen3-14B,Dolly-15K,ComPEFT,42,0.5,label-skew,2200,12.5%,ROUGE-L,31.11,ROUGE-1,40.48,73.24,main_table,,results/Qwen3_dolly_full/compeft_s42
+Qwen3-14B,Dolly-15K,ComPEFT,45,0.5,label-skew,2200,12.5%,ROUGE-L,27.24,ROUGE-1,35.70,86.99,main_table,,results/Qwen3_dolly_full/compeft_s45
+Qwen3-14B,Dolly-15K,FLM-TopK,28,0.5,label-skew,2200,12.5%,ROUGE-L,33.81,ROUGE-1,42.65,58.47,main_table,,results/Qwen3_dolly_full/flmtopk_s28
+Qwen3-14B,Dolly-15K,FLM-TopK,42,0.5,label-skew,2200,12.5%,ROUGE-L,33.79,ROUGE-1,42.34,54.98,main_table,,results/Qwen3_dolly_full/flmtopk_s42
+Qwen3-14B,Dolly-15K,FLM-TopK,45,0.5,label-skew,2200,12.5%,ROUGE-L,34.30,ROUGE-1,43.04,55.36,main_table,,results/Qwen3_dolly_full/flmtopk_s45
+Qwen3-14B,Dolly-15K,FedComp,28,0.5,label-skew,2200,12.5%,ROUGE-L,34.08,ROUGE-1,43.13,59.15,main_table,,results/Qwen3_dolly_full/fedcomp_s28
+Qwen3-14B,Dolly-15K,FedComp,42,0.5,label-skew,2200,12.5%,ROUGE-L,34.06,ROUGE-1,43.31,56.52,main_table,,results/Qwen3_dolly_full/fedcomp_s42
+Qwen3-14B,Dolly-15K,FedComp,45,0.5,label-skew,2200,12.5%,ROUGE-L,34.07,ROUGE-1,43.47,55.61,main_table,,results/Qwen3_dolly_full/fedcomp_s45
+Qwen3-14B,Dolly-15K,FedSP-LoRA,28,0.5,label-skew,2200,12.5%,ROUGE-L,34.16,ROUGE-1,42.98,52.56,main_table,qv-block+SN+Gram-norm+dr,results/Qwen3_dolly_full/ours_s28
+Qwen3-14B,Dolly-15K,FedSP-LoRA,42,0.5,label-skew,2200,12.5%,ROUGE-L,33.96,ROUGE-1,42.83,59.02,main_table,,results/Qwen3_dolly_full/ours_s42
+Qwen3-14B,Dolly-15K,FedSP-LoRA,45,0.5,label-skew,2200,12.5%,ROUGE-L,33.35,ROUGE-1,41.99,53.47,main_table,,results/Qwen3_dolly_full/ours_s45
+Qwen3-14B,GSM8K,FedSP-LoRA,28,10,quantity,440,3.1%,EM,35.71,-,-,-,budget_curve,Budget curve low,results/Qwen3_phase2/bud440_ours
+Qwen3-14B,GSM8K,FLASC,28,10,quantity,440,3.1%,EM,35.41,-,-,-,budget_curve,,results/Qwen3_phase2/bud440_flasc
+Qwen3-14B,GSM8K,FedSP-LoRA,28,10,quantity,880,6.25%,EM,36.32,-,-,-,budget_curve,,results/Qwen3_lowbudget/ours
+Qwen3-14B,GSM8K,FLASC,28,10,quantity,880,6.25%,EM,36.09,-,-,-,budget_curve,,results/Qwen3_lowbudget/flasc
+Qwen3-14B,GSM8K,FedSP-LoRA,28,10,quantity,1760,12.5%,EM,37.00,-,-,50.0,budget_curve,Budget curve main (same as main_table s28),results/Qwen3_sn_balance/qv_dr_a10
+Qwen3-14B,GSM8K,FLASC,28,10,quantity,1760,12.5%,EM,36.77,-,-,50.0,budget_curve,Budget curve main,results/Qwen3_phase1_fix1/flasc_seed28
+Qwen3-14B,GSM8K,FedSP-LoRA w/o depth calibration,28,10,quantity,1760,12.5%,EM,36.47,-,-,50.0,ablation,SN raw,results/Qwen3_phase2/ab_sn_raw
+Qwen3-14B,GSM8K,FedSP-LoRA w/o P2,28,10,quantity,1760,12.5%,EM,37.00,-,-,50.0,ablation,gap_eta=0,results/Qwen3_push3/gap0
+Qwen3-14B,GSM8K,FedSP-LoRA w/ A/B-pair atom,28,10,quantity,1760,12.5%,EM,30.78,-,-,4.64,ablation,ab_pair,results/Qwen3_ab_sn/seed28
+Qwen3-14B,GSM8K,FedSP-LoRA,28,1,quantity,1760,12.5%,EM,36.92,-,-,50.0,robustness,alpha=1,results/Qwen3_sn_balance/qv_dr_a1
+Qwen3-14B,GSM8K,FLM-TopK,28,1,quantity,1760,12.5%,EM,37.00,-,-,-,robustness,alpha=1,results/Qwen3_flmtopk_a1/flmtopk_seed28
+Qwen3-14B,GSM8K,FLASC,28,1,quantity,1760,12.5%,EM,36.62,-,-,-,robustness,alpha=1,results/Qwen3_phase2/flasc_a1
